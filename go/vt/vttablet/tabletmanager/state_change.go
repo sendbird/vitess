@@ -212,12 +212,6 @@ func (agent *ActionAgent) changeCallback(ctx context.Context, oldTablet, newTabl
 			log.Errorf("Cannot read shard for this tablet %v, might have inaccurate SourceShards and TabletControls: %v", newTablet.Alias, err)
 			updateBlacklistedTables = false
 		} else {
-			if newTablet.Type == topodatapb.TabletType_MASTER {
-				if len(shardInfo.SourceShards) > 0 {
-					allowQuery = false
-					disallowQueryReason = "master tablet with filtered replication on"
-				}
-			}
 			srvKeyspace, err := agent.TopoServer.GetSrvKeyspace(ctx, newTablet.Alias.Cell, newTablet.Keyspace)
 			if err != nil {
 				log.Errorf("failed to get SrvKeyspace %v with: %v", newTablet.Keyspace, err)

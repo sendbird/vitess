@@ -34,6 +34,7 @@ import (
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/topotools"
@@ -159,7 +160,29 @@ func (wr *Wrangler) VerticalSplitClone(ctx context.Context, fromKeyspace, toKeys
 	if err != nil {
 		return vterrors.Wrapf(err, "GetOnlyShard(%s) failed", toKeyspace)
 	}
-	// TODO(sougou): validate from and to shards.
+	for _, si := range []*topo.ShardInfo{source, dest} {
+		if len(si.SourceShards) != 0 {
+			return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "a resharding is already in progress")
+		}
+	}
+
+	rules, err := wr.getRoutingRules(ctx)
+	if err != nil {
+		return err
+	}
+	for _, table := range tables {
+		if strings.HasPrefix(table, "/") {
+			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "regular expressions not allowed for tables: %v", tables)
+		}
+		rules[table] = []string{fromKeyspace + "." + table}
+		rules[toKeyspace+"."+table] = []string{fromKeyspace + "." + table}
+	}
+	if err := wr.saveRoutingRules(ctx, rules); err != nil {
+		return err
+	}
+	if err := topotools.RebuildVSchema(ctx, wr.logger, wr.ts, nil); err != nil {
+		return err
+	}
 
 	master, err := wr.ts.GetTablet(ctx, dest.MasterAlias)
 	if err != nil {
@@ -190,6 +213,29 @@ func (wr *Wrangler) VerticalSplitClone(ctx context.Context, fromKeyspace, toKeys
 		return vterrors.Wrapf(err, "VReplicationExec(%v, %s) failed", dest.MasterAlias, cmd)
 	}
 	return wr.refreshMasters(ctx, []*topo.ShardInfo{dest})
+}
+
+func (wr *Wrangler) getRoutingRules(ctx context.Context) (map[string][]string, error) {
+	rrs, err := wr.ts.GetRoutingRules(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rules := make(map[string][]string, len(rrs.Rules))
+	for _, rr := range rrs.Rules {
+		rules[rr.FromTable] = rr.ToTables
+	}
+	return rules, nil
+}
+
+func (wr *Wrangler) saveRoutingRules(ctx context.Context, rules map[string][]string) error {
+	rrs := &vschemapb.RoutingRules{Rules: make([]*vschemapb.RoutingRule, 0, len(rules))}
+	for from, to := range rules {
+		rrs.Rules = append(rrs.Rules, &vschemapb.RoutingRule{
+			FromTable: from,
+			ToTables:  to,
+		})
+	}
+	return wr.ts.SaveRoutingRules(ctx, rrs)
 }
 
 // ShowResharding shows all resharding related metadata for the keyspace/shard.
@@ -1080,79 +1126,19 @@ func (wr *Wrangler) cancelVerticalResharding(ctx context.Context, keyspace, shar
 
 // MigrateServedFrom is used during vertical splits to migrate a
 // served type from a keyspace to another.
-func (wr *Wrangler) MigrateServedFrom(ctx context.Context, keyspace, shard string, servedType topodatapb.TabletType, cells []string, reverse bool, filteredReplicationWaitTime time.Duration) (err error) {
-	// read the destination keyspace, check it
-	ki, err := wr.ts.GetKeyspace(ctx, keyspace)
+func (wr *Wrangler) MigrateServedFrom(ctx context.Context, keyspace, shard string, servedType topodatapb.TabletType, cells []string, reverse bool, filteredReplicationWaitTime time.Duration, reverseReplication bool) (err error) {
+	if servedType == topodatapb.TabletType_MASTER && reverse {
+		return fmt.Errorf("cannot migrate master back to %v/%v", keyspace, shard)
+	}
+	if servedType != topodatapb.TabletType_MASTER && reverseReplication {
+		return fmt.Errorf("cannot reverse replication for non-master migrate: %v/%v", keyspace, shard)
+	}
+	destinationShard, err := wr.ts.GetShard(ctx, keyspace, shard)
 	if err != nil {
 		return err
 	}
-	if len(ki.ServedFroms) == 0 {
-		return fmt.Errorf("destination keyspace %v is not a vertical split target", keyspace)
-	}
-
-	// read the destination shard, check it
-	si, err := wr.ts.GetShard(ctx, keyspace, shard)
-	if err != nil {
-		return err
-	}
-	if len(si.SourceShards) != 1 || len(si.SourceShards[0].Tables) == 0 {
-		return fmt.Errorf("destination shard %v/%v is not a vertical split target", keyspace, shard)
-	}
-
-	// check the migration is valid before locking (will also be checked
-	// after locking to be sure)
-	sourceKeyspace := si.SourceShards[0].Keyspace
-	if err := ki.CheckServedFromMigration(servedType, cells, sourceKeyspace, !reverse); err != nil {
-		return err
-	}
-
-	// lock the keyspaces, source first.
-	ctx, unlock, lockErr := wr.ts.LockKeyspace(ctx, sourceKeyspace, fmt.Sprintf("MigrateServedFrom(%v)", servedType))
-	if lockErr != nil {
-		return lockErr
-	}
-	defer unlock(&err)
-	ctx, unlock, lockErr = wr.ts.LockKeyspace(ctx, keyspace, fmt.Sprintf("MigrateServedFrom(%v)", servedType))
-	if lockErr != nil {
-		return lockErr
-	}
-	defer unlock(&err)
-
-	// execute the migration
-	err = wr.migrateServedFromLocked(ctx, ki, si, servedType, cells, reverse, filteredReplicationWaitTime)
-
-	// rebuild the keyspace serving graph if there was no error
-	if err == nil {
-		err = topotools.RebuildKeyspaceLocked(ctx, wr.logger, wr.ts, keyspace, cells)
-	}
-
-	return err
-}
-
-func (wr *Wrangler) migrateServedFromLocked(ctx context.Context, ki *topo.KeyspaceInfo, destinationShard *topo.ShardInfo, servedType topodatapb.TabletType, cells []string, reverse bool, filteredReplicationWaitTime time.Duration) (err error) {
-
-	// re-read and update keyspace info record
-	ki, err = wr.ts.GetKeyspace(ctx, ki.KeyspaceName())
-	if err != nil {
-		return err
-	}
-	if reverse {
-		ki.UpdateServedFromMap(servedType, cells, destinationShard.SourceShards[0].Keyspace, false, nil)
-	} else {
-		destinationShardcells, err := wr.ts.GetShardServingCells(ctx, destinationShard)
-		if err != nil {
-			return err
-		}
-		ki.UpdateServedFromMap(servedType, cells, destinationShard.SourceShards[0].Keyspace, true, destinationShardcells)
-	}
-
-	// re-read and check the destination shard
-	destinationShard, err = wr.ts.GetShard(ctx, destinationShard.Keyspace(), destinationShard.ShardName())
-	if err != nil {
-		return err
-	}
-	if len(destinationShard.SourceShards) != 1 {
-		return fmt.Errorf("destination shard %v/%v is not a vertical split target", destinationShard.Keyspace(), destinationShard.ShardName())
+	if len(destinationShard.SourceShards) != 1 || len(destinationShard.SourceShards[0].Tables) == 0 {
+		return fmt.Errorf("keyspace %v is not a vertical split target", keyspace)
 	}
 	tables := destinationShard.SourceShards[0].Tables
 
@@ -1165,7 +1151,7 @@ func (wr *Wrangler) migrateServedFromLocked(ctx context.Context, ki *topo.Keyspa
 	}
 
 	ev := &events.MigrateServedFrom{
-		KeyspaceName:     ki.KeyspaceName(),
+		KeyspaceName:     keyspace,
 		SourceShard:      *sourceShard,
 		DestinationShard: *destinationShard,
 		ServedType:       servedType,
@@ -1177,36 +1163,53 @@ func (wr *Wrangler) migrateServedFromLocked(ctx context.Context, ki *topo.Keyspa
 			event.DispatchUpdate(ev, "failed: "+err.Error())
 		}
 	}()
+	// lock the keyspaces, source first.
+	ctx, unlock, lockErr := wr.ts.LockKeyspace(ctx, sourceShard.Keyspace(), fmt.Sprintf("MigrateServedFrom(%v)", servedType))
+	if lockErr != nil {
+		return lockErr
+	}
+	defer unlock(&err)
+	ctx, unlock, lockErr = wr.ts.LockKeyspace(ctx, keyspace, fmt.Sprintf("MigrateServedFrom(%v)", servedType))
+	if lockErr != nil {
+		return lockErr
+	}
+	defer unlock(&err)
 
 	if servedType == topodatapb.TabletType_MASTER {
-		err = wr.masterMigrateServedFrom(ctx, ki, sourceShard, destinationShard, tables, ev, filteredReplicationWaitTime)
+		err = wr.masterMigrateServedFrom(ctx, sourceShard, destinationShard, tables, ev, filteredReplicationWaitTime, reverseReplication)
 	} else {
-		err = wr.replicaMigrateServedFrom(ctx, ki, sourceShard, destinationShard, servedType, cells, reverse, tables, ev)
+		err = wr.replicaMigrateServedFrom(ctx, sourceShard.Keyspace(), keyspace, servedType, cells, reverse, tables, ev)
 	}
 	event.DispatchUpdate(ev, "finished")
 	return
 }
 
 // replicaMigrateServedFrom handles the slave (replica, rdonly) migration.
-func (wr *Wrangler) replicaMigrateServedFrom(ctx context.Context, ki *topo.KeyspaceInfo, sourceShard *topo.ShardInfo, destinationShard *topo.ShardInfo, servedType topodatapb.TabletType, cells []string, reverse bool, tables []string, ev *events.MigrateServedFrom) error {
-	// Save the destination keyspace (its ServedFrom has been changed)
-	event.DispatchUpdate(ev, "updating keyspace")
-	if err := wr.ts.UpdateKeyspace(ctx, ki); err != nil {
+func (wr *Wrangler) replicaMigrateServedFrom(ctx context.Context, fromKeyspace, toKeyspace string, servedType topodatapb.TabletType, cells []string, reverse bool, tables []string, ev *events.MigrateServedFrom) error {
+	rules, err := wr.getRoutingRules(ctx)
+	if err != nil {
 		return err
 	}
-
-	// Save the source shard (its blacklisted tables field has changed)
-	event.DispatchUpdate(ev, "updating source shard")
-	if _, err := wr.ts.UpdateShardFields(ctx, sourceShard.Keyspace(), sourceShard.ShardName(), func(si *topo.ShardInfo) error {
-		return si.UpdateSourceBlacklistedTables(ctx, servedType, cells, reverse, tables)
-	}); err != nil {
+	tt := strings.ToLower(servedType.String())
+	for _, table := range tables {
+		for _, fromt := range []string{
+			table + tt,
+			fromKeyspace + "." + table + "@" + tt,
+			toKeyspace + "." + table + "@" + tt,
+		} {
+			if reverse {
+				delete(rules, fromt)
+			} else {
+				rules[fromt] = []string{toKeyspace + "." + table}
+			}
+		}
+		rules[table] = []string{fromKeyspace + "." + table}
+		rules[toKeyspace+"."+table] = []string{fromKeyspace + "." + table}
+	}
+	if err := wr.saveRoutingRules(ctx, rules); err != nil {
 		return err
 	}
-
-	// Now refresh the source servers so they reload their
-	// blacklisted table list
-	event.DispatchUpdate(ev, "refreshing sources tablets state so they update their blacklisted tables")
-	return wr.RefreshTabletsByShard(ctx, sourceShard, []topodatapb.TabletType{servedType}, cells)
+	return topotools.RebuildVSchema(ctx, wr.logger, wr.ts, cells)
 }
 
 // masterMigrateServedFrom handles the master migration. The ordering is
@@ -1219,7 +1222,10 @@ func (wr *Wrangler) replicaMigrateServedFrom(ctx context.Context, ki *topo.Keysp
 // - Clear SourceShard on the destination Shard
 // - Refresh the destination master, so its stops its filtered
 //   replication and starts accepting writes
-func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, ki *topo.KeyspaceInfo, sourceShard *topo.ShardInfo, destinationShard *topo.ShardInfo, tables []string, ev *events.MigrateServedFrom, filteredReplicationWaitTime time.Duration) error {
+func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, sourceShard, destinationShard *topo.ShardInfo, tables []string, ev *events.MigrateServedFrom, filteredReplicationWaitTime time.Duration, reverseReplication bool) error {
+	fromKeyspace := sourceShard.Keyspace()
+	toKeyspace := destinationShard.Keyspace()
+
 	// Read the data we need
 	ctx, cancel := context.WithTimeout(ctx, filteredReplicationWaitTime)
 	defer cancel()
@@ -1233,8 +1239,8 @@ func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, ki *topo.Keyspa
 	}
 
 	// Update source shard (more blacklisted tables)
-	event.DispatchUpdate(ev, "updating source shard")
-	if _, err := wr.ts.UpdateShardFields(ctx, sourceShard.Keyspace(), sourceShard.ShardName(), func(si *topo.ShardInfo) error {
+	event.DispatchUpdate(ev, "blacklisting tables on source shard")
+	if _, err := wr.ts.UpdateShardFields(ctx, fromKeyspace, sourceShard.ShardName(), func(si *topo.ShardInfo) error {
 		return si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_MASTER, nil, false, tables)
 	}); err != nil {
 		return err
@@ -1266,30 +1272,82 @@ func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, ki *topo.Keyspa
 		return err
 	}
 
-	// Update the destination keyspace (its ServedFrom has changed)
-	event.DispatchUpdate(ev, "updating keyspace")
-	if err = wr.ts.UpdateKeyspace(ctx, ki); err != nil {
+	// Reverse the split clone
+	wr.Logger().Infof("Getting master position of target %v", topoproto.TabletAliasString(destinationShard.MasterAlias))
+	targetMasterPos, err := wr.tmc.MasterPosition(ctx, destinationMasterTabletInfo.Tablet)
+	if err != nil {
 		return err
 	}
+	filter := &binlogdatapb.Filter{}
+	for _, table := range tables {
+		filter.Rules = append(filter.Rules, &binlogdatapb.Rule{
+			Match: table,
+		})
+	}
+	bls := &binlogdatapb.BinlogSource{
+		Keyspace: fromKeyspace,
+		Shard:    sourceShard.ShardName(),
+		Filter:   filter,
+	}
+	cmd := binlogplayer.CreateVReplicationState("ReverseSplitClone", bls, targetMasterPos, binlogplayer.BlpStopped, sourceMasterTabletInfo.DbName())
+	qr, err := wr.TabletManagerClient().VReplicationExec(ctx, sourceMasterTabletInfo.Tablet, cmd)
+	if err != nil {
+		return vterrors.Wrapf(err, "VReplicationExec(%v, %s) failed", destinationShard.MasterAlias, cmd)
+	}
+	if err := wr.SourceShardAdd(ctx, fromKeyspace, sourceShard.ShardName(), uint32(qr.InsertId), toKeyspace, destinationShard.ShardName(), nil, tables); err != nil {
+		return vterrors.Wrapf(err, "SourceShardAdd(%s, %s) failed", destinationShard.ShardName(), sourceShard.ShardName())
+	}
 
-	// Update the destination shard (no more source shard)
 	event.DispatchUpdate(ev, "updating destination shard")
-	destinationShard, err = wr.ts.UpdateShardFields(ctx, destinationShard.Keyspace(), destinationShard.ShardName(), func(si *topo.ShardInfo) error {
-		if len(si.SourceShards) != 1 {
-			return fmt.Errorf("unexpected concurrent access for destination shard %v/%v SourceShards array", si.Keyspace(), si.ShardName())
-		}
-		si.SourceShards = nil
+	sourceShard, err = wr.ts.UpdateShardFields(ctx, sourceShard.Keyspace(), sourceShard.ShardName(), func(si *topo.ShardInfo) error {
+		si.SourceShards = append(si.SourceShards, &topodatapb.Shard_SourceShard{
+			Uid:      uint32(qr.InsertId),
+			Keyspace: toKeyspace,
+			Shard:    destinationShard.ShardName(),
+			Tables:   tables,
+		})
 		return nil
 	})
 	if err != nil {
 		return err
 	}
+	if _, err := wr.ts.UpdateShardFields(ctx, destinationShard.Keyspace(), destinationShard.ShardName(), func(si *topo.ShardInfo) error {
+		si.SourceShards = nil
+		return si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_MASTER, nil, true, tables)
+	}); err != nil {
+		return err
+	}
+	if err := wr.refreshMasters(ctx, []*topo.ShardInfo{destinationShard}); err != nil {
+		return err
+	}
 
-	// Tell the new shards masters they can now be read-write.
-	// Invoking a remote action will also make the tablet stop filtered
-	// replication.
-	event.DispatchUpdate(ev, "setting destination shard masters read-write")
-	return wr.refreshMasters(ctx, []*topo.ShardInfo{destinationShard})
+	// Update routing rules
+	event.DispatchUpdate(ev, "updading routing rules")
+	rules, err := wr.getRoutingRules(ctx)
+	if err != nil {
+		return err
+	}
+	for _, table := range tables {
+		for _, tabletType := range []topodatapb.TabletType{topodatapb.TabletType_REPLICA, topodatapb.TabletType_RDONLY} {
+			tt := strings.ToLower(tabletType.String())
+			delete(rules, table+tt)
+			delete(rules, fromKeyspace+"."+table+"@"+tt)
+			delete(rules, toKeyspace+"."+table+"@"+tt)
+		}
+		delete(rules, toKeyspace+"."+table)
+		rules[table] = []string{toKeyspace + "." + table}
+		rules[fromKeyspace+"."+table] = []string{toKeyspace + "." + table}
+	}
+	if err := wr.saveRoutingRules(ctx, rules); err != nil {
+		return err
+	}
+	if err := topotools.RebuildVSchema(ctx, wr.logger, wr.ts, nil); err != nil {
+		return err
+	}
+	if reverseReplication {
+		return wr.startReverseReplication(ctx, []*topo.ShardInfo{sourceShard})
+	}
+	return nil
 }
 
 // SetKeyspaceServedFrom locks a keyspace and changes its ServerFromMap

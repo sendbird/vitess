@@ -27,12 +27,6 @@ script_root=$(dirname "${BASH_SOURCE}")
 source "$script_root/env.sh"
 
 # shellcheck disable=SC2086
-"$VTROOT"/bin/vtworker \
-    $TOPOLOGY_FLAGS \
-    -cell zone1 \
-    -log_dir "$VTDATAROOT"/tmp \
-    -alsologtostderr \
-    -use_v3_resharding_mode \
-    VerticalSplitClone -min_healthy_tablets=1 -tables=customer,corder customer/0
+./lvtctl.sh VerticalSplitClone commerce customer customer,corder
 
 disown -a

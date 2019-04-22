@@ -255,7 +255,9 @@ class BaseShardingTest(object):
                                           '-count', '1',
                                           tablet_obj.tablet_alias])
     logging.debug('Got health: %s', str(stream_health))
-    self.assertNotIn('serving', stream_health)
+    # don't check serving state. The vreplication based stream
+    # allows serving state during resharding.
+    # self.assertNotIn('serving', stream_health)
     self.assertIn('realtime_stats', stream_health)
     self.assertNotIn('health_error', stream_health['realtime_stats'])
     self.assertIn('binlog_players_count', stream_health['realtime_stats'])

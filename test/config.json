@@ -424,6 +424,17 @@
 				"worker_test"
 			]
 		},
+		"vrepl_vsc": {
+			"File": "vrepl_vsc.py",
+			"Args": [],
+			"Command": [],
+			"Manual": false,
+			"Shard": 1,
+			"RetryMax": 0,
+			"Tags": [
+				"resharding"
+			]
+		},
 		"vtctld": {
 			"File": "vtctld_test.py",
 			"Args": [],

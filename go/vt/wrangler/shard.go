@@ -67,7 +67,7 @@ func (wr *Wrangler) updateShardMaster(ctx context.Context, si *topo.ShardInfo, t
 // This is an emergency manual operation.
 func (wr *Wrangler) SetShardIsMasterServing(ctx context.Context, keyspace, shard string, isMasterServing bool) (err error) {
 	// lock the keyspace to not conflict with resharding operations
-	ctx, unlock, lockErr := wr.ts.LockKeyspace(ctx, keyspace, fmt.Sprintf("SetShardIsMasterServing(%v,%v,%v)", keyspace, shard, isMasterServing))
+	_, unlock, lockErr := wr.ts.LockKeyspace(ctx, keyspace, fmt.Sprintf("SetShardIsMasterServing(%v,%v,%v)", keyspace, shard, isMasterServing))
 	if lockErr != nil {
 		return lockErr
 	}
