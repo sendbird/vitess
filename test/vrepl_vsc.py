@@ -16,8 +16,11 @@
 
 import json
 import logging
+import socket
 import time
 import unittest
+
+import MySQLdb as db
 
 import base_sharding
 import environment
@@ -41,6 +44,23 @@ destination_rdonly = tablet.Tablet()
 
 all_tablets = [source_master, source_replica, source_rdonly,
                destination_master, destination_replica, destination_rdonly]
+
+vschema = {
+  'source_keyspace': '''{
+    "tables": {
+      "moving1": {},
+      "moving2": {},
+      "extra1": {},
+      "extra2": {}
+    }
+  }''',
+  'destination_keyspace': '''{
+    "tables": {
+      "moving1": {},
+      "moving2": {}
+    }
+  }''',
+}
 
 
 def setUpModule():
@@ -77,7 +97,8 @@ class TestVerticalSplit(unittest.TestCase, base_sharding.BaseShardingTest):
     self.insert_index = 0
 
     self._init_keyspaces_and_tablets()
-    utils.VtGate().start(cache_ttl='0s', tablets=[
+    utils.apply_vschema(vschema)
+    utils.VtGate(mysql_server=True).start(cache_ttl='0s', tablets=[
         source_master, source_replica, source_rdonly,
         destination_master, destination_replica, destination_rdonly])
 
@@ -212,23 +233,15 @@ index by_msg (msg)
     self._check_values(source_master, 'vt_source_keyspace', 'staying2',
                        staying2_first, 100)
 
-  def _vtdb_conn(self):
-    protocol, addr = utils.vtgate.rpc_endpoint(python=True)
-    return vtgate_client.connect(protocol, addr, 30.0)
-
   # insert some values in the source master db, return the first id used
   def _insert_values(self, table, count):
     result = self.insert_index
-    conn = self._vtdb_conn()
-    cursor = conn.cursor(
-        tablet_type='master', keyspace='source_keyspace',
-        keyranges=[keyrange.KeyRange(keyrange_constants.NON_PARTIAL_KEYRANGE)],
-        writable=True)
+    conn = db.connect(host=socket.gethostbyname('localhost'),
+                      port=utils.vtgate.mysql_port)
+    cursor = conn.cursor()
     for _ in xrange(count):
-      conn.begin()
-      cursor.execute("insert into %s (id, msg) values(%d, 'value %d')" % (
+      cursor.execute('insert into source_keyspace.%s (id, msg) values(%d, "value %d")' % (
           table, self.insert_index, self.insert_index), {})
-      conn.commit()
       self.insert_index += 1
     conn.close()
     return result
@@ -246,7 +259,7 @@ index by_msg (msg)
       self.assertEqual(first + i, rows[i][0], 'invalid id[%d]: %d != %d' %
                        (i, first + i, rows[i][0]))
       self.assertEqual('value %d' % (first + i), rows[i][1],
-                       "invalid msg[%d]: 'value %d' != '%s'" %
+                       'invalid msg[%d]: "value %d" != "%s"' %
                        (i, first + i, rows[i][1]))
 
   def _check_values_timeout(self, t, dbname, table, first, count,
@@ -287,6 +300,26 @@ index by_msg (msg)
         logging.debug('Got %s rows from table %s on tablet %s',
                       qr['rows'][0][0], table, t.tablet_alias)
 
+  def _verify_resharding(self, from_keyspace, to_keyspace, state):
+    rules = json.loads(utils.vtgate.get_vschema())['routing_rules']
+    self.assertEqual(rules['%s.moving1' % to_keyspace],
+                           ['%s.moving1' % from_keyspace])
+    self.assertEqual(rules['moving1'], ['%s.moving1' % from_keyspace])
+    shard_info = utils.run_vtctl(['GetShard', '%s/0' % to_keyspace],
+                    auto_log=True)
+    src = json.loads(shard_info[0])['source_shards'][0]
+    self.assertEqual(src['keyspace'], from_keyspace)
+    self.assertEqual(src['tables'], ['moving1', 'moving2'])
+    if from_keyspace == 'source_keyspace':
+      result = destination_master.mquery('_vt', 'select * from vreplication')
+    else:
+      result = source_master.mquery('_vt', 'select * from vreplication')
+    self.assertEqual(len(result), 1)
+    self.assertEqual(result[0][2],
+      'keyspace:"%s" shard:"0" filter:<rules:<match:"moving1" > '
+      'rules:<match:"moving2" > > ' % from_keyspace)
+    self.assertEqual(result[0][11], state)
+
   def test_vertical_split(self):
     utils.run_vtctl(['CopySchemaShard', '--tables',
                      'moving1,moving2',
@@ -302,31 +335,13 @@ index by_msg (msg)
     # thing.
     time.sleep(10)
 
+    self._verify_resharding('source_keyspace', 'destination_keyspace', 'Running')
+
     # check values are present
     self._check_values(destination_master, 'vt_destination_keyspace', 'moving1',
                        self.moving1_first, 100)
     self._check_values(destination_master, 'vt_destination_keyspace', 'moving2',
                        self.moving2_first, 100)
-
-    # Verify vreplication table entries
-    result = destination_master.mquery('_vt', 'select * from vreplication')
-    self.assertEqual(len(result), 1)
-    self.assertEqual(result[0][1], 'VSplitClone')
-    self.assertEqual(result[0][2],
-      'keyspace:"source_keyspace" shard:"0" filter:<rules:<match:"moving1" > '
-      'rules:<match:"moving2" > > ')
-    self.assertEqual(result[0][11], 'Running')
-
-    # check the binlog player is running and exporting vars
-    self.check_destination_master(destination_master, ['source_keyspace/0'])
-
-    # check that binlog server exported the stats vars
-    self.check_binlog_server_vars(source_replica, horizontal=False)
-
-    rules = json.loads(utils.vtgate.get_vschema())["routing_rules"]
-    self.assertEqual(rules["destination_keyspace.moving1"],
-                           ["source_keyspace.moving1"])
-    self.assertEqual(rules["moving1"], ["source_keyspace.moving1"])
 
     # add values to source, make sure they're replicated
     moving1_first_add1 = self._insert_values('moving1', 100)
@@ -336,8 +351,6 @@ index by_msg (msg)
                                'moving1', moving1_first_add1, 100)
     self._check_values_timeout(destination_master, 'vt_destination_keyspace',
                                'moving2', moving2_first_add1, 100)
-    self.check_binlog_player_vars(destination_master, ['source_keyspace/0'],
-                                  seconds_behind_master_max=30)
 
     # use vtworker to compare the data
     logging.debug('Running vtworker VerticalSplitDiff')
@@ -353,61 +366,46 @@ index by_msg (msg)
     # serve rdonly from the destination shards
     utils.run_vtctl(['MigrateServedFrom', 'destination_keyspace/0', 'rdonly'],
                     auto_log=True)
-    rules = json.loads(utils.vtgate.get_vschema())["routing_rules"]
-    self.assertEqual(rules["destination_keyspace.moving1@rdonly"],
-                           ["destination_keyspace.moving1"])
-    self.assertEqual(rules["source_keyspace.moving1@rdonly"],
-                           ["destination_keyspace.moving1"])
-    self.assertEqual(rules["moving1@rdonly"], ["destination_keyspace.moving1"])
+    rules = json.loads(utils.vtgate.get_vschema())['routing_rules']
+    self.assertEqual(rules['destination_keyspace.moving1@rdonly'],
+                           ['destination_keyspace.moving1'])
+    self.assertEqual(rules['source_keyspace.moving1@rdonly'],
+                           ['destination_keyspace.moving1'])
+    self.assertEqual(rules['moving1@rdonly'], ['destination_keyspace.moving1'])
 
     # then serve replica from the destination shards
     utils.run_vtctl(['MigrateServedFrom', 'destination_keyspace/0', 'replica'],
                     auto_log=True)
-    rules = json.loads(utils.vtgate.get_vschema())["routing_rules"]
-    self.assertEqual(rules["destination_keyspace.moving1@replica"],
-                           ["destination_keyspace.moving1"])
-    self.assertEqual(rules["source_keyspace.moving1@replica"],
-                           ["destination_keyspace.moving1"])
-    self.assertEqual(rules["moving1@replica"], ["destination_keyspace.moving1"])
+    rules = json.loads(utils.vtgate.get_vschema())['routing_rules']
+    self.assertEqual(rules['destination_keyspace.moving1@replica'],
+                           ['destination_keyspace.moving1'])
+    self.assertEqual(rules['source_keyspace.moving1@replica'],
+                           ['destination_keyspace.moving1'])
+    self.assertEqual(rules['moving1@replica'], ['destination_keyspace.moving1'])
 
     # move replica back and forth
     utils.run_vtctl(['MigrateServedFrom', '-reverse',
                      'destination_keyspace/0', 'replica'], auto_log=True)
-    rules = json.loads(utils.vtgate.get_vschema())["routing_rules"]
-    self.assertNotIn("destination_keyspace.moving1@replica", rules)
-    self.assertNotIn("source_keyspace.moving1@replica", rules)
-    self.assertNotIn("moving1@replica", rules)
+    rules = json.loads(utils.vtgate.get_vschema())['routing_rules']
+    self.assertNotIn('destination_keyspace.moving1@replica', rules)
+    self.assertNotIn('source_keyspace.moving1@replica', rules)
+    self.assertNotIn('moving1@replica', rules)
 
     utils.run_vtctl(['MigrateServedFrom', 'destination_keyspace/0', 'replica'],
                     auto_log=True)
-    rules = json.loads(utils.vtgate.get_vschema())["routing_rules"]
-    self.assertEqual(rules["destination_keyspace.moving1@replica"],
-                           ["destination_keyspace.moving1"])
-    self.assertEqual(rules["source_keyspace.moving1@replica"],
-                           ["destination_keyspace.moving1"])
-    self.assertEqual(rules["moving1@replica"], ["destination_keyspace.moving1"])
+    rules = json.loads(utils.vtgate.get_vschema())['routing_rules']
+    self.assertEqual(rules['destination_keyspace.moving1@replica'],
+                           ['destination_keyspace.moving1'])
+    self.assertEqual(rules['source_keyspace.moving1@replica'],
+                           ['destination_keyspace.moving1'])
+    self.assertEqual(rules['moving1@replica'], ['destination_keyspace.moving1'])
 
     # then serve master from the destination shards
     self._check_blacklisted_tables(source_master, False)
     utils.run_vtctl(['MigrateServedFrom', 'destination_keyspace/0', 'master'],
                     auto_log=True)
-    rules = json.loads(utils.vtgate.get_vschema())["routing_rules"]
-    self.assertEqual(rules["source_keyspace.moving1"],
-                           ["destination_keyspace.moving1"])
-    self.assertEqual(rules["moving1"], ["destination_keyspace.moving1"])
-    self._check_blacklisted_tables(source_master, True)
 
-    # Verify vreplication table entries
-    result = source_master.mquery('_vt', 'select * from vreplication')
-    self.assertEqual(len(result), 1)
-    self.assertEqual(result[0][1], 'ReverseSplitClone')
-    self.assertEqual(result[0][2],
-      'keyspace:"destination_keyspace" shard:"0" filter:<rules:<match:"moving1" > '
-      'rules:<match:"moving2" > > ')
-    self.assertEqual(result[0][11], 'Stopped')
-
-    # check the binlog player is gone now
-    self.check_no_binlog_player(destination_master)
+    self._verify_resharding('destination_keyspace', 'source_keyspace', 'Stopped')
 
   def _assert_tablet_controls(self, expected_dbtypes):
     shard_json = utils.run_vtctl_json(['GetShard', 'source_keyspace/0'])

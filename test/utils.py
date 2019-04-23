@@ -593,6 +593,7 @@ class VtGate(object):
       args.extend(extra_args)
     if self.mysql_port:
       args.extend(['-mysql_server_port', str(self.mysql_port)])
+      args.extend(['-mysql_auth_server_impl', 'none'])
 
     self.proc = run_bg(args)
     # We use a longer timeout here, as we may be waiting for the initial
