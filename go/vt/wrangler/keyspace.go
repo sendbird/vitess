@@ -1193,7 +1193,7 @@ func (wr *Wrangler) replicaMigrateServedFrom(ctx context.Context, fromKeyspace, 
 	tt := strings.ToLower(servedType.String())
 	for _, table := range tables {
 		for _, fromt := range []string{
-			table + tt,
+			table + "@" + tt,
 			fromKeyspace + "." + table + "@" + tt,
 			toKeyspace + "." + table + "@" + tt,
 		} {
@@ -1285,7 +1285,7 @@ func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, sourceShard, de
 		})
 	}
 	bls := &binlogdatapb.BinlogSource{
-		Keyspace: fromKeyspace,
+		Keyspace: toKeyspace,
 		Shard:    sourceShard.ShardName(),
 		Filter:   filter,
 	}
@@ -1327,7 +1327,7 @@ func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, sourceShard, de
 	for _, table := range tables {
 		for _, tabletType := range []topodatapb.TabletType{topodatapb.TabletType_REPLICA, topodatapb.TabletType_RDONLY} {
 			tt := strings.ToLower(tabletType.String())
-			delete(rules, table+tt)
+			delete(rules, table+"@"+tt)
 			delete(rules, fromKeyspace+"."+table+"@"+tt)
 			delete(rules, toKeyspace+"."+table+"@"+tt)
 		}
