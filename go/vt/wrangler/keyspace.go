@@ -1294,9 +1294,6 @@ func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, sourceShard, de
 	if err != nil {
 		return vterrors.Wrapf(err, "VReplicationExec(%v, %s) failed", destinationShard.MasterAlias, cmd)
 	}
-	if err := wr.SourceShardAdd(ctx, fromKeyspace, sourceShard.ShardName(), uint32(qr.InsertId), toKeyspace, destinationShard.ShardName(), nil, tables); err != nil {
-		return vterrors.Wrapf(err, "SourceShardAdd(%s, %s) failed", destinationShard.ShardName(), sourceShard.ShardName())
-	}
 
 	event.DispatchUpdate(ev, "updating destination shard")
 	sourceShard, err = wr.ts.UpdateShardFields(ctx, sourceShard.Keyspace(), sourceShard.ShardName(), func(si *topo.ShardInfo) error {

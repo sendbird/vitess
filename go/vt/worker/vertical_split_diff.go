@@ -185,9 +185,6 @@ func (vsdw *VerticalSplitDiffWorker) init(ctx context.Context) error {
 	if err != nil {
 		return vterrors.Wrapf(err, "cannot read keyspace %v", vsdw.keyspace)
 	}
-	if len(vsdw.keyspaceInfo.ServedFroms) == 0 {
-		return fmt.Errorf("keyspace %v has no KeyspaceServedFrom", vsdw.keyspace)
-	}
 
 	// read the shardinfo and validate it
 	vsdw.shardInfo, err = vsdw.wr.TopoServer().GetShard(ctx, vsdw.keyspace, vsdw.shard)

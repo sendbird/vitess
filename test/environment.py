@@ -40,9 +40,9 @@ from topo_flavor.server import topo_server
 # pylint: disable=unused-import
 import vtgate_gateway_flavor.discoverygateway
 
-from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
-from selenium.webdriver.chrome.options import Options
+#from selenium import webdriver
+#from selenium.common.exceptions import WebDriverException
+#from selenium.webdriver.chrome.options import Options
 
 from vttest import mysql_flavor
 

@@ -117,11 +117,7 @@ class TestVerticalSplit(unittest.TestCase, base_sharding.BaseShardingTest):
 
   def _init_keyspaces_and_tablets(self):
     utils.run_vtctl(['CreateKeyspace', 'source_keyspace'])
-    utils.run_vtctl(
-        ['CreateKeyspace', '--served_from',
-         'master:source_keyspace,replica:source_keyspace,rdonly:'
-         'source_keyspace',
-         'destination_keyspace'])
+    utils.run_vtctl(['CreateKeyspace', 'destination_keyspace'])
 
     source_master.init_tablet(
         'replica',
@@ -186,11 +182,6 @@ class TestVerticalSplit(unittest.TestCase, base_sharding.BaseShardingTest):
         destination_rdonly2]
     for t in master_tablets + replica_tablets:
       t.wait_for_vttablet_state('NOT_SERVING')
-
-    # check SrvKeyspace
-    self._check_srv_keyspace('ServedFrom(master): source_keyspace\n'
-                             'ServedFrom(rdonly): source_keyspace\n'
-                             'ServedFrom(replica): source_keyspace\n')
 
     # reparent to make the tablets work (we use health check, fix their types)
     utils.run_vtctl(['InitShardMaster', '-force', 'source_keyspace/0',
@@ -318,43 +309,16 @@ msg varchar(64)
                       table)
         time.sleep(1)
 
-  def _check_srv_keyspace(self, expected):
-    cell = 'test_nj'
-    keyspace = 'destination_keyspace'
-    ks = utils.run_vtctl_json(['GetSrvKeyspace', cell, keyspace])
-    result = ''
-    if 'served_from' in ks and ks['served_from']:
-      a = []
-      for served_from in sorted(ks['served_from']):
-        tt = topodata_pb2.TabletType.Name(served_from['tablet_type']).lower()
-        if tt == 'batch':
-          tt = 'rdonly'
-        a.append('ServedFrom(%s): %s\n' % (tt, served_from['keyspace']))
-      for line in sorted(a):
-        result += line
-    logging.debug('Cell %s keyspace %s has data:\n%s', cell, keyspace, result)
-    self.assertEqual(
-        expected, result,
-        'Mismatch in srv keyspace for cell %s keyspace %s, expected:\n'
-        '%s\ngot:\n%s' % (
-            cell, keyspace, expected, result))
-    self.assertEqual('', ks.get('sharding_column_name', ''),
-                     'Got a sharding_column_name in SrvKeyspace: %s' %
-                     str(ks))
-    self.assertEqual(0, ks.get('sharding_column_type', 0),
-                     'Got a sharding_column_type in SrvKeyspace: %s' %
-                     str(ks))
-
   def _check_blacklisted_tables(self, t, expected):
     status = t.get_status()
     if expected:
-      self.assertIn('BlacklistedTables: %s' % ' '.join(expected), status)
+      self.assertIn('BlacklistedTables', status)
     else:
       self.assertNotIn('BlacklistedTables', status)
 
     # check we can or cannot access the tables
     for table in ['moving1', 'moving2']:
-      if expected and '/moving/' in expected:
+      if expected:
         # table is blacklisted, should get the error
         _, stderr = utils.run_vtctl(['VtTabletExecute', '-json',
                                      t.tablet_alias,
@@ -389,31 +353,14 @@ msg varchar(64)
         except Exception, e:  # pylint: disable=broad-except
           self.fail('Execute failed w/ exception %s' % str(e))
 
-  def _check_stats(self):
-    v = utils.vtgate.get_vars()
-    self.assertEqual(
-        v['VttabletCall']['Histograms']['Execute.source_keyspace.0.replica'][
-            'Count'],
-        2
-        , 'unexpected value for VttabletCall('
-        'Execute.source_keyspace.0.replica) inside %s' % str(v))
-    # Verify master reads done by self._check_client_conn_redirection().
-    self.assertEqual(
-        v['VtgateApi']['Histograms'][
-            'ExecuteKeyRanges.destination_keyspace.master']['Count'],
-        6,
-        'unexpected value for VtgateApi('
-        'ExecuteKeyRanges.destination_keyspace.master) inside %s' % str(v))
-    self.assertEqual(
-        len(v['VtgateApiErrorCounts']), 0,
-        'unexpected errors for VtgateApiErrorCounts inside %s' % str(v))
-
   def test_vertical_split(self):
-    utils.run_vtctl(['CopySchemaShard', '--tables', '/moving/,view1',
+    utils.run_vtctl(['CopySchemaShard', '--tables',
+                     'moving1,moving2,moving3_no_pk,view1',
                      source_rdonly1.tablet_alias, 'destination_keyspace/0'],
-                    auto_log=True)
+                     auto_log=True)
     utils.run_vtctl(['VerticalSplitClone', 'source_keyspace',
-                     'destination_keyspace', '/moving/,view1'], auto_log=True)
+                     'destination_keyspace', 'moving1,moving2,moving3_no_pk,view1'],
+                     auto_log=True)
 
     time.sleep(10)
 
@@ -433,7 +380,8 @@ msg varchar(64)
     self.assertEqual(len(result), 1)
     self.assertEqual(result[0][1], 'VSplitClone')
     self.assertEqual(result[0][2],
-      'keyspace:"source_keyspace" shard:"0" filter:<rules:<match:"/moving/" > '
+      'keyspace:"source_keyspace" shard:"0" filter:<rules:<match:"moving1" > '
+      'rules:<match:"moving2" > rules:<match:"moving3_no_pk" > '
       'rules:<match:"view1" > > ')
 
     # check the binlog player is running and exporting vars
@@ -457,70 +405,22 @@ msg varchar(64)
     logging.debug('Running vtworker VerticalSplitDiff')
     utils.run_vtworker(['-cell', 'test_nj',
                         '--use_v3_resharding_mode=false',
+                        '--alsologtostderr',
                         'VerticalSplitDiff',
                         '--min_healthy_rdonly_tablets', '1',
                         'destination_keyspace/0'], auto_log=True)
 
     utils.pause('Good time to test vtworker for diffs')
 
-    # check we can't migrate the master just yet
-    utils.run_vtctl(['MigrateServedFrom', 'destination_keyspace/0', 'master'],
-                    expect_fail=True)
-
     # migrate rdonly only in test_ny cell, make sure nothing is migrated
     # in test_nj
     utils.run_vtctl(['MigrateServedFrom', '--cells=test_ny',
                      'destination_keyspace/0', 'rdonly'],
                     auto_log=True)
-    self._check_srv_keyspace('ServedFrom(master): source_keyspace\n'
-                             'ServedFrom(rdonly): source_keyspace\n'
-                             'ServedFrom(replica): source_keyspace\n')
-    self._check_blacklisted_tables(source_master, None)
-    self._check_blacklisted_tables(source_replica, None)
-    self._check_blacklisted_tables(source_rdonly1, None)
-    self._check_blacklisted_tables(source_rdonly2, None)
-
-    # migrate test_nj only, using command line manual fix command,
-    # and restore it back.
-    keyspace_json = utils.run_vtctl_json(
-        ['GetKeyspace', 'destination_keyspace'])
-    found = False
-    for ksf in keyspace_json['served_froms']:
-      if ksf['tablet_type'] == topodata_pb2.RDONLY:
-        found = True
-        self.assertEqual(sorted(ksf['cells']), ['test_ca', 'test_nj'])
-    self.assertTrue(found)
-    utils.run_vtctl(['SetKeyspaceServedFrom', '-source=source_keyspace',
-                     '-remove', '-cells=test_nj,test_ca', 'destination_keyspace',
-                     'rdonly'], auto_log=True)
-    keyspace_json = utils.run_vtctl_json(
-        ['GetKeyspace', 'destination_keyspace'])
-    found = False
-    for ksf in keyspace_json['served_froms']:
-      if ksf['tablet_type'] == topodata_pb2.RDONLY:
-        found = True
-    self.assertFalse(found)
-    utils.run_vtctl(['SetKeyspaceServedFrom', '-source=source_keyspace',
-                     'destination_keyspace', 'rdonly'],
-                    auto_log=True)
-    keyspace_json = utils.run_vtctl_json(
-        ['GetKeyspace', 'destination_keyspace'])
-    found = False
-    for ksf in keyspace_json['served_froms']:
-      if ksf['tablet_type'] == topodata_pb2.RDONLY:
-        found = True
-        self.assertTrue('cells' not in ksf or not ksf['cells'])
-    self.assertTrue(found)
 
     # now serve rdonly from the destination shards
     utils.run_vtctl(['MigrateServedFrom', 'destination_keyspace/0', 'rdonly'],
                     auto_log=True)
-    self._check_srv_keyspace('ServedFrom(master): source_keyspace\n'
-                             'ServedFrom(replica): source_keyspace\n')
-    self._check_blacklisted_tables(source_master, None)
-    self._check_blacklisted_tables(source_replica, None)
-    self._check_blacklisted_tables(source_rdonly1, ['/moving/', 'view1'])
-    self._check_blacklisted_tables(source_rdonly2, ['/moving/', 'view1'])
     self._check_client_conn_redirection(
         'destination_keyspace',
         ['master', 'replica'], ['moving1', 'moving2'])
@@ -528,11 +428,6 @@ msg varchar(64)
     # then serve replica from the destination shards
     utils.run_vtctl(['MigrateServedFrom', 'destination_keyspace/0', 'replica'],
                     auto_log=True)
-    self._check_srv_keyspace('ServedFrom(master): source_keyspace\n')
-    self._check_blacklisted_tables(source_master, None)
-    self._check_blacklisted_tables(source_replica, ['/moving/', 'view1'])
-    self._check_blacklisted_tables(source_rdonly1, ['/moving/', 'view1'])
-    self._check_blacklisted_tables(source_rdonly2, ['/moving/', 'view1'])
     self._check_client_conn_redirection(
         'destination_keyspace',
         ['master'], ['moving1', 'moving2'])
@@ -540,91 +435,20 @@ msg varchar(64)
     # move replica back and forth
     utils.run_vtctl(['MigrateServedFrom', '-reverse',
                      'destination_keyspace/0', 'replica'], auto_log=True)
-    self._check_srv_keyspace('ServedFrom(master): source_keyspace\n'
-                             'ServedFrom(replica): source_keyspace\n')
-    self._check_blacklisted_tables(source_master, None)
-    self._check_blacklisted_tables(source_replica, None)
-    self._check_blacklisted_tables(source_rdonly1, ['/moving/', 'view1'])
-    self._check_blacklisted_tables(source_rdonly2, ['/moving/', 'view1'])
     utils.run_vtctl(['MigrateServedFrom', 'destination_keyspace/0', 'replica'],
                     auto_log=True)
-    self._check_srv_keyspace('ServedFrom(master): source_keyspace\n')
-    self._check_blacklisted_tables(source_master, None)
-    self._check_blacklisted_tables(source_replica, ['/moving/', 'view1'])
-    self._check_blacklisted_tables(source_rdonly1, ['/moving/', 'view1'])
-    self._check_blacklisted_tables(source_rdonly2, ['/moving/', 'view1'])
     self._check_client_conn_redirection(
         'destination_keyspace',
         ['master'], ['moving1', 'moving2'])
 
-    # Cancel should fail now
-    utils.run_vtctl(['CancelResharding', 'destination_keyspace/0'],
-                    auto_log=True, expect_fail=True)
-
     # then serve master from the destination shards
+    self._check_blacklisted_tables(source_master, False)
     utils.run_vtctl(['MigrateServedFrom', 'destination_keyspace/0', 'master'],
                     auto_log=True)
-    self._check_srv_keyspace('')
-    self._check_blacklisted_tables(source_master, ['/moving/', 'view1'])
-    self._check_blacklisted_tables(source_replica, ['/moving/', 'view1'])
-    self._check_blacklisted_tables(source_rdonly1, ['/moving/', 'view1'])
-    self._check_blacklisted_tables(source_rdonly2, ['/moving/', 'view1'])
+    self._check_blacklisted_tables(source_master, True)
 
     # check the binlog player is gone now
     self.check_no_binlog_player(destination_master)
-
-    # check the stats are correct
-    self._check_stats()
-
-    # now remove the tables on the source shard. The blacklisted tables
-    # in the source shard won't match any table, make sure that works.
-    utils.run_vtctl(['ApplySchema',
-                     '-sql=drop view view1',
-                     'source_keyspace'],
-                    auto_log=True)
-    for t in ['moving1', 'moving2']:
-      utils.run_vtctl(['ApplySchema',
-                       '-sql=drop table %s' % (t),
-                       'source_keyspace'],
-                      auto_log=True)
-    for t in [source_master, source_replica, source_rdonly1, source_rdonly2]:
-      utils.run_vtctl(['ReloadSchema', t.tablet_alias])
-    qr = source_master.execute('select count(1) from staying1')
-    self.assertEqual(len(qr['rows']), 1,
-                     'cannot read staying1: got %s' % str(qr))
-
-    # test SetShardTabletControl
-    self._verify_vtctl_set_shard_tablet_control()
-
-  def _verify_vtctl_set_shard_tablet_control(self):
-    """Test that manually editing the blacklisted tables works correctly.
-
-    TODO(mberlin): This is more an integration test and should be moved to the
-    Go codebase eventually.
-    """
-    # check 'vtctl SetShardTabletControl' command works as expected:
-    # clear the rdonly entry:
-    utils.run_vtctl(['SetShardTabletControl', '--remove', 'source_keyspace/0',
-                     'rdonly'], auto_log=True)
-    self._assert_tablet_controls([topodata_pb2.MASTER, topodata_pb2.REPLICA])
-
-    # re-add rdonly:
-    utils.run_vtctl(['SetShardTabletControl',
-                     '--blacklisted_tables=/moving/,view1',
-                     'source_keyspace/0', 'rdonly'], auto_log=True)
-    self._assert_tablet_controls([topodata_pb2.MASTER, topodata_pb2.REPLICA,
-                                  topodata_pb2.RDONLY])
-
-    # and then clear all entries:
-    utils.run_vtctl(['SetShardTabletControl', '--remove', 'source_keyspace/0',
-                     'rdonly'], auto_log=True)
-    utils.run_vtctl(['SetShardTabletControl', '--remove', 'source_keyspace/0',
-                     'replica'], auto_log=True)
-    utils.run_vtctl(['SetShardTabletControl', '--remove', 'source_keyspace/0',
-                     'master'], auto_log=True)
-    shard_json = utils.run_vtctl_json(['GetShard', 'source_keyspace/0'])
-    self.assertTrue('tablet_controls' not in shard_json or
-                    not shard_json['tablet_controls'])
 
   def _assert_tablet_controls(self, expected_dbtypes):
     shard_json = utils.run_vtctl_json(['GetShard', 'source_keyspace/0'])
@@ -633,7 +457,8 @@ msg varchar(64)
     expected_dbtypes_set = set(expected_dbtypes)
     for tc in shard_json['tablet_controls']:
       self.assertIn(tc['tablet_type'], expected_dbtypes_set)
-      self.assertEqual(['/moving/', 'view1'], tc['blacklisted_tables'])
+      self.assertEqual(['moving1', 'moving2', 'moving3_no_pk', 'view1'],
+                        tc['blacklisted_tables'])
       expected_dbtypes_set.remove(tc['tablet_type'])
     self.assertEqual(0, len(expected_dbtypes_set),
                      'Not all expected db types were blacklisted')
