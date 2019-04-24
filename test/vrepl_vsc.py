@@ -305,6 +305,7 @@ index by_msg (msg)
     self.assertEqual(rules['%s.moving1' % to_keyspace],
                            ['%s.moving1' % from_keyspace])
     self.assertEqual(rules['moving1'], ['%s.moving1' % from_keyspace])
+    self.assertEqual(len(rules), 4)
     shard_info = utils.run_vtctl(['GetShard', '%s/0' % to_keyspace],
                     auto_log=True)
     src = json.loads(shard_info[0])['source_shards'][0]
@@ -372,6 +373,7 @@ index by_msg (msg)
     self.assertEqual(rules['source_keyspace.moving1@rdonly'],
                            ['destination_keyspace.moving1'])
     self.assertEqual(rules['moving1@rdonly'], ['destination_keyspace.moving1'])
+    self.assertEqual(len(rules), 10)
 
     # then serve replica from the destination shards
     utils.run_vtctl(['MigrateServedFrom', 'destination_keyspace/0', 'replica'],
@@ -382,6 +384,7 @@ index by_msg (msg)
     self.assertEqual(rules['source_keyspace.moving1@replica'],
                            ['destination_keyspace.moving1'])
     self.assertEqual(rules['moving1@replica'], ['destination_keyspace.moving1'])
+    self.assertEqual(len(rules), 16)
 
     # move replica back and forth
     utils.run_vtctl(['MigrateServedFrom', '-reverse',
@@ -390,6 +393,7 @@ index by_msg (msg)
     self.assertNotIn('destination_keyspace.moving1@replica', rules)
     self.assertNotIn('source_keyspace.moving1@replica', rules)
     self.assertNotIn('moving1@replica', rules)
+    self.assertEqual(len(rules), 10)
 
     utils.run_vtctl(['MigrateServedFrom', 'destination_keyspace/0', 'replica'],
                     auto_log=True)
@@ -399,13 +403,31 @@ index by_msg (msg)
     self.assertEqual(rules['source_keyspace.moving1@replica'],
                            ['destination_keyspace.moving1'])
     self.assertEqual(rules['moving1@replica'], ['destination_keyspace.moving1'])
+    self.assertEqual(len(rules), 16)
 
-    # then serve master from the destination shards
-    self._check_blacklisted_tables(source_master, False)
-    utils.run_vtctl(['MigrateServedFrom', 'destination_keyspace/0', 'master'],
+    # Migrate master, and reverse replication
+    utils.run_vtctl(['MigrateServedFrom', '-reverse_replication',
+                     'destination_keyspace/0', 'master'],
                     auto_log=True)
 
-    self._verify_resharding('destination_keyspace', 'source_keyspace', 'Stopped')
+    self._verify_resharding('destination_keyspace', 'source_keyspace', 'Running')
+    self._check_blacklisted_tables(destination_master, False)
+    self._check_blacklisted_tables(source_master, True)
+
+    # insert more data into logical source. This will get redirected
+    # to destination, which is now the new source.
+    moving1_first_add1 = self._insert_values('moving1', 100)
+    # Check to see that the source (new destination) got the data.
+    self._check_values_timeout(source_master, 'vt_source_keyspace',
+                               'moving1', moving1_first_add1, 100)
+
+    # Migrate master back, in one step. But don't reverse.
+    utils.run_vtctl(['MigrateServedFrom', 'source_keyspace/0', 'master'],
+                    auto_log=True)
+
+    self._verify_resharding('source_keyspace', 'destination_keyspace', 'Stopped')
+    self._check_blacklisted_tables(destination_master, True)
+    self._check_blacklisted_tables(source_master, False)
 
   def _assert_tablet_controls(self, expected_dbtypes):
     shard_json = utils.run_vtctl_json(['GetShard', 'source_keyspace/0'])
