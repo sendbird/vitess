@@ -421,6 +421,11 @@ index by_msg (msg)
     self._check_values_timeout(source_master, 'vt_source_keyspace',
                                'moving1', moving1_first_add1, 100)
 
+    # The reversal of resharding should show up.
+    output = utils.run_vtctl(['ShowResharding', 'source_keyspace/0'],
+                    auto_log=True)[0]
+    self.assertIn('Vertical Resharding', output)
+
     # Migrate master back, in one step. But don't reverse.
     utils.run_vtctl(['MigrateServedFrom', 'source_keyspace/0', 'master'],
                     auto_log=True)
@@ -428,6 +433,18 @@ index by_msg (msg)
     self._verify_resharding('source_keyspace', 'destination_keyspace', 'Stopped')
     self._check_blacklisted_tables(destination_master, True)
     self._check_blacklisted_tables(source_master, False)
+
+    # Reversal of the reversal should now show up.
+    output = utils.run_vtctl(['ShowResharding', 'destination_keyspace/0'],
+                    auto_log=True)[0]
+    self.assertIn('Vertical Resharding', output)
+
+    # No resharding should be there after the cancel.
+    utils.run_vtctl(['CancelResharding', 'destination_keyspace/0'],
+                    auto_log=True)[0]
+    output = utils.run_vtctl(['ShowResharding', 'destination_keyspace/0'],
+                    auto_log=True)[0]
+    self.assertIn('No resharding in progress', output)
 
   def _assert_tablet_controls(self, expected_dbtypes):
     shard_json = utils.run_vtctl_json(['GetShard', 'source_keyspace/0'])

@@ -240,14 +240,23 @@ func (wr *Wrangler) saveRoutingRules(ctx context.Context, rules map[string][]str
 
 // ShowResharding shows all resharding related metadata for the keyspace/shard.
 func (wr *Wrangler) ShowResharding(ctx context.Context, keyspace, shard string) (err error) {
-	ki, err := wr.ts.GetKeyspace(ctx, keyspace)
+	isVertical, err := wr.isVertical(ctx, keyspace, shard)
 	if err != nil {
 		return err
 	}
-	if len(ki.ServedFroms) == 0 {
-		return wr.showHorizontalResharding(ctx, keyspace, shard)
+	if isVertical {
+		return wr.showVerticalResharding(ctx, keyspace, shard)
 	}
-	return wr.showVerticalResharding(ctx, keyspace, shard)
+	return wr.showHorizontalResharding(ctx, keyspace, shard)
+}
+
+func (wr *Wrangler) isVertical(ctx context.Context, keyspace, shard string) (bool, error) {
+	destinationShard, err := wr.ts.GetShard(ctx, keyspace, shard)
+	if err != nil {
+		return false, err
+	}
+	isVertical := len(destinationShard.SourceShards) == 1 && len(destinationShard.SourceShards[0].Tables) != 0
+	return isVertical, nil
 }
 
 func (wr *Wrangler) showHorizontalResharding(ctx context.Context, keyspace, shard string) error {
@@ -312,14 +321,14 @@ func (wr *Wrangler) CancelResharding(ctx context.Context, keyspace, shard string
 	}
 	defer unlock(&err)
 
-	ki, err := wr.ts.GetKeyspace(ctx, keyspace)
+	isVertical, err := wr.isVertical(ctx, keyspace, shard)
 	if err != nil {
 		return err
 	}
-	if len(ki.ServedFroms) == 0 {
-		return wr.cancelHorizontalResharding(ctx, keyspace, shard)
+	if isVertical {
+		return wr.cancelVerticalResharding(ctx, keyspace, shard)
 	}
-	return wr.cancelVerticalResharding(ctx, keyspace, shard)
+	return wr.cancelHorizontalResharding(ctx, keyspace, shard)
 }
 
 func (wr *Wrangler) cancelHorizontalResharding(ctx context.Context, keyspace, shard string) error {
