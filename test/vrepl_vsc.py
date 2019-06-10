@@ -411,6 +411,7 @@ index by_msg (msg)
                      'destination_keyspace/0', 'master'],
                     auto_log=True)
 
+    # FIXME: Is it possible to use VerticalSplitDiff now??
     self._verify_resharding('destination_keyspace', 'source_keyspace', 'Running')
     self._check_blacklisted_tables(destination_master, False)
     self._check_blacklisted_tables(source_master, True)
