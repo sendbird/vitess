@@ -312,7 +312,7 @@ var commands = []commandGroup{
 				"Start the SplitClone process to perform horizontal resharding. Example: SplitClone ks '0' '-80,80-'"},
 			{"VerticalSplitClone", commandVerticalSplitClone,
 				"<from_keyspace> <to_keyspace> <tables>",
-				"Start the VerticalSplitClone process to perform vertical resharding. Example: SplitClone from_ks to_ks 'a,/b.*/'"},
+				"Start the VerticalSplitClone process to perform vertical resharding. Example: VerticalSplitClone from_ks to_ks 'a,/b.*/'"},
 			{"MigrateServedTypes", commandMigrateServedTypes,
 				"[-cells=c1,c2,...] [-reverse] [-skip-refresh-state] <keyspace/shard> <served tablet type>",
 				"Migrates a serving type from the source shard to the shards that it replicates to. This command also rebuilds the serving graph. The <keyspace/shard> argument can specify any of the shards involved in the migration."},
