@@ -150,10 +150,11 @@ func (cfg *Config) InitSchemas(keyspace, schema string, vschema *vschemapb.Keysp
 
 // DbName returns the default name for a database in this cluster.
 // If OnlyMySQL is set, this will be the name of the single database
-// created in MySQL. Otherwise, this will be blank.
+// created in MySQL. Otherwise, this will be the database that stores
+// the first keyspace in the topology.
 func (cfg *Config) DbName() string {
 	ns := cfg.Topology.GetKeyspaces()
-	if len(ns) > 0 && cfg.OnlyMySQL {
+	if len(ns) > 0 {
 		return ns[0].Name
 	}
 	return ""

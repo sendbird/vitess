@@ -26,15 +26,13 @@ import (
 // using given CacheServiceConfig.
 type NewConnFunc func(config Config) (CacheService, error)
 
-var (
-	// services stores all supported cache service.
-	services = make(map[string]NewConnFunc)
+// services stores all supported cache service.
+var services = make(map[string]NewConnFunc)
 
-	mu sync.Mutex
+var mu sync.Mutex
 
-	// DefaultCacheService decides the default cache service connection.
-	DefaultCacheService string
-)
+// DefaultCacheService decides the default cache service connection.
+var DefaultCacheService string
 
 // Config carries config data for CacheService.
 type Config struct {

@@ -1,6 +1,7 @@
 ---
 name: Bug Report
 about: You're experiencing an issue with Vitess that is different than the documented behavior.
+
 ---
 
 When filing a bug, please include the following headings if

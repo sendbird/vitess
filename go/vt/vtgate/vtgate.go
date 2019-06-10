@@ -46,7 +46,6 @@ import (
 	"vitess.io/vitess/go/vt/vtgate/gateway"
 	"vitess.io/vitess/go/vt/vtgate/vtgateservice"
 
-	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
@@ -1040,11 +1039,6 @@ func (vtg *VTGate) UpdateStream(ctx context.Context, keyspace string, shard stri
 		recordAndAnnotateError(err, statsKey, request, vtg.logUpdateStream)
 	}
 	return formatError(err)
-}
-
-// VStream streams binlog events.
-func (vtg *VTGate) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter, send func([]*binlogdatapb.VEvent) error) error {
-	return vtg.resolver.VStream(ctx, tabletType, vgtid, filter, send)
 }
 
 // GetGatewayCacheStatus returns a displayable version of the Gateway cache.
