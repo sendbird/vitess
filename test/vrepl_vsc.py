@@ -166,6 +166,7 @@ class TestVerticalSplit(unittest.TestCase, base_sharding.BaseShardingTest):
         shard='0',
         tablet_index=2)
 
+    # FIXME: Why are these necessary?
     utils.run_vtctl(
         ['RebuildKeyspaceGraph', 'source_keyspace'], auto_log=True)
     utils.run_vtctl(
