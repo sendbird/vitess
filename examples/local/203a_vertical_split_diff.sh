@@ -29,10 +29,10 @@ source "$script_root/env.sh"
 # shellcheck disable=SC2086
 "$VTROOT"/bin/vtworker \
     $TOPOLOGY_FLAGS \
-    -cell zone1 \
+    -cell test \
     -log_dir "$VTDATAROOT"/tmp \
     -alsologtostderr \
     -use_v3_resharding_mode \
-    VerticalSplitDiff -min_healthy_rdonly_tablets=1 customer/0
+    VerticalSplitDiff -min_healthy_rdonly_tablets=1 dst_ks/0
 
 disown -a
