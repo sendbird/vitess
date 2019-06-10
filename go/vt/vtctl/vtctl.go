@@ -317,7 +317,7 @@ var commands = []commandGroup{
 				"[-cells=c1,c2,...] [-reverse] [-skip-refresh-state] <keyspace/shard> <served tablet type>",
 				"Migrates a serving type from the source shard to the shards that it replicates to. This command also rebuilds the serving graph. The <keyspace/shard> argument can specify any of the shards involved in the migration."},
 			{"MigrateServedFrom", commandMigrateServedFrom,
-				"[-cells=c1,c2,...] [-reverse] <destination keyspace/shard> <served tablet type>",
+				"[-cells=c1,c2,...] [-reverse (replica, rdonly)] [-reverse_replication (master)] <destination keyspace/shard> <served tablet type>",
 				"Makes the <destination keyspace/shard> serve the given type. This command also rebuilds the serving graph."},
 			{"CancelResharding", commandCancelResharding,
 				"<keyspace/shard>",
