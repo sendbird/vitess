@@ -1074,7 +1074,7 @@ func formatTabletStats(ts *discovery.TabletStats) string {
 }
 
 func (wr *Wrangler) showVerticalResharding(ctx context.Context, keyspace, shard string) error {
-	ki, err := wr.ts.GetKeyspace(ctx, keyspace)
+	_, err := wr.ts.GetKeyspace(ctx, keyspace)
 	if err != nil {
 		return err
 	}
@@ -1091,7 +1091,9 @@ func (wr *Wrangler) showVerticalResharding(ctx context.Context, keyspace, shard 
 		return err
 	}
 	wr.Logger().Printf("Vertical Resharding:\n")
-	wr.Logger().Printf("  Served From: %v\n", ki.ServedFroms)
+	// FIXME
+	//rules, _ := GetRoutingRules()
+	//wr.Logger().Printf("  Routing Rules: %v\n", rules)
 	wr.Logger().Printf("  Source:\n")
 	if err := wr.printShards(ctx, []*topo.ShardInfo{sourceShard}); err != nil {
 		return err
