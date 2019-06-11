@@ -1091,9 +1091,11 @@ func (wr *Wrangler) showVerticalResharding(ctx context.Context, keyspace, shard 
 		return err
 	}
 	wr.Logger().Printf("Vertical Resharding:\n")
-	// FIXME
-	//rules, _ := GetRoutingRules()
-	//wr.Logger().Printf("  Routing Rules: %v\n", rules)
+	rules, err := wr.getRoutingRules(ctx)
+	if err != nil {
+		return err
+	}
+	wr.Logger().Printf("  Routing Rules: %v\n", rules)
 	wr.Logger().Printf("  Source:\n")
 	if err := wr.printShards(ctx, []*topo.ShardInfo{sourceShard}); err != nil {
 		return err
