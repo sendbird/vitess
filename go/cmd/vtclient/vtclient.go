@@ -64,9 +64,14 @@ Examples:
 	jsonOutput    = flag.Bool("json", false, "Output JSON instead of human-readable table")
 	parallel      = flag.Int("parallel", 1, "DMLs only: Number of threads executing the same query in parallel. Useful for simple load testing.")
 	count         = flag.Int("count", 1, "DMLs only: Number of times each thread executes the query. Useful for simple, sustained load testing.")
-	minRandomID   = flag.Int("min_random_id", 0, "min random ID to generate. When max_random_id > min_random_id, for each query, a random number is generated in [min_random_id, max_random_id) and attached to the end of the bind variables.")
-	maxRandomID   = flag.Int("max_random_id", 0, "max random ID.")
+	minSeqID      = flag.Int("min_sequence_id", 0, "min sequence ID to generate. When max_sequence_id > min_sequence_id, for each query, a number is generated in [min_sequence_id, max_sequence_id) and attached to the end of the bind variables.")
+	maxSeqID      = flag.Int("max_sequence_id", 0, "max sequence ID.")
+	useRandom     = flag.Bool("use_random_sequence", false, "use random sequence for generating [min_sequence_id, max_sequence_id)")
 	qps           = flag.Int("qps", 0, "queries per second to throttle each thread at.")
+)
+
+var (
+	seqChan = make(chan int, 10)
 )
 
 func init() {
@@ -150,6 +155,21 @@ func run() (*results, error) {
 		return nil, errors.New("no additional arguments after the query allowed")
 	}
 
+	if *maxSeqID > *minSeqID {
+		go func() {
+			if *useRandom {
+				rand.Seed(time.Now().UnixNano())
+				for {
+					seqChan <- rand.Intn(*maxSeqID-*minSeqID) + *minSeqID
+				}
+			} else {
+				for i := *minSeqID; i < *maxSeqID; i++ {
+					seqChan <- i
+				}
+			}
+		}()
+	}
+
 	c := vitessdriver.Configuration{
 		Protocol:  *vtgateconn.VtgateProtocol,
 		Address:   *server,
@@ -170,8 +190,8 @@ func run() (*results, error) {
 
 func prepareBindVariables() []interface{} {
 	bv := *bindVariables
-	if *maxRandomID > *minRandomID {
-		bv = append(bv, rand.Intn(*maxRandomID-*minRandomID)+*minRandomID)
+	if *maxSeqID > *minSeqID {
+		bv = append(bv, <-seqChan)
 	}
 	return bv
 }
