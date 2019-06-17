@@ -66,6 +66,7 @@ Examples:
 	count         = flag.Int("count", 1, "DMLs only: Number of times each thread executes the query. Useful for simple, sustained load testing.")
 	minRandomID   = flag.Int("min_random_id", 0, "min random ID to generate. When max_random_id > min_random_id, for each query, a random number is generated in [min_random_id, max_random_id) and attached to the end of the bind variables.")
 	maxRandomID   = flag.Int("max_random_id", 0, "max random ID.")
+	qps           = flag.Int("qps", 0, "queries per second to throttle each thread at.")
 )
 
 func init() {
@@ -181,12 +182,20 @@ func execMulti(ctx context.Context, db *sql.DB, sql string) (*results, error) {
 	wg := sync.WaitGroup{}
 	isDML := sqlparser.IsDML(sql)
 
+	isThrottled := *qps > 0
+
 	start := time.Now()
 	for i := 0; i < *parallel; i++ {
 		wg.Add(1)
 
 		go func() {
 			defer wg.Done()
+
+			var ticker *time.Ticker
+			if isThrottled {
+				tickDuration := time.Second / time.Duration(*qps)
+				ticker = time.NewTicker(tickDuration)
+			}
 
 			for j := 0; j < *count; j++ {
 				var qr *results
@@ -207,6 +216,10 @@ func execMulti(ctx context.Context, db *sql.DB, sql string) (*results, error) {
 				if err != nil {
 					ec.RecordError(err)
 					// We keep going and do not return early purpose.
+				}
+
+				if ticker != nil {
+					<-ticker.C
 				}
 			}
 		}()
