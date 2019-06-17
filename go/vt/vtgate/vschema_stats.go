@@ -86,10 +86,10 @@ const (
 {{if .Error}}
   <tr>
     <th>Error</th>
-    <td colspan="3">{{$.Error}}</td>
+    <td colspan="4">{{$.Error}}</td>
   </tr>
   <tr>
-    <td>colspan="4"></td>
+    <td colspan="5"></td>
   </tr>
 {{end}}
   <tr>
