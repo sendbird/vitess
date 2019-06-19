@@ -1127,6 +1127,30 @@ func (wr *Wrangler) cancelVerticalResharding(ctx context.Context, keyspace, shar
 	if _, err := wr.tmc.VReplicationExec(ctx, destinationMasterTabletInfo.Tablet, binlogplayer.DeleteVReplication(destinationShard.SourceShards[0].Uid)); err != nil {
 		return err
 	}
+
+	rules, err := wr.getRoutingRules(ctx)
+	if err != nil {
+		return err
+	}
+	fromKeyspace := destinationShard.SourceShards[0].Keyspace
+	for _, table := range destinationShard.SourceShards[0].Tables {
+		for _, tabletType := range []topodatapb.TabletType{topodatapb.TabletType_REPLICA, topodatapb.TabletType_RDONLY} {
+			tt := strings.ToLower(tabletType.String())
+			delete(rules, table+"@"+tt)
+			delete(rules, fromKeyspace+"."+table+"@"+tt)
+			delete(rules, keyspace+"."+table+"@"+tt)
+		}
+		delete(rules, keyspace+"."+table)
+		delete(rules, table)
+		delete(rules, fromKeyspace+"."+table)
+	}
+	if err := wr.saveRoutingRules(ctx, rules); err != nil {
+		return err
+	}
+	if err := topotools.RebuildVSchema(ctx, wr.logger, wr.ts, nil); err != nil {
+		return err
+	}
+
 	if _, err = wr.ts.UpdateShardFields(ctx, destinationShard.Keyspace(), destinationShard.ShardName(), func(si *topo.ShardInfo) error {
 		si.SourceShards = nil
 		return nil
