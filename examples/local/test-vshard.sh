@@ -13,10 +13,10 @@ export TOPO=etcd2
 # Terminal2
 mysql -h 127.0.0.1 -P 15306
 
-SRC_KS=src_ks
-DST_KS=dst_ks
-SRC_TABLET_ID=test-100
-DST_TABLET_ID=test-200
+export SRC_KS=src_ks
+export DST_KS=dst_ks
+export SRC_TABLET_ID=test-100
+export DST_TABLET_ID=test-200
 
 # Terminal1
 ./lvtctl.sh CreateKeyspace $SRC_KS
