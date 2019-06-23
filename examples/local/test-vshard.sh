@@ -55,6 +55,7 @@ KEYSPACE=$DST_KS UID_BASE=200 ./vttablet-up.sh
 ./lvtctl.sh ApplySchema -sql-file=../common/vsplit_init_tables.sql $DST_KS
 ./lvtctl.sh GetSrvKeyspaceNames test
 ./lvtctl.sh GetSchema $SRC_TABLET_ID
+# FIXME: Declarative, so in prod, read old VSchema->modify.
 ./lvtctl.sh ApplyVSchema -vschema_file=../common/vsplit_src_vschema.json $SRC_KS
 # FIXME: Shouldn't $DST_KS.staying1 not exist?
 ./lvtctl.sh ApplyVSchema -vschema_file=../common/vsplit_dst_vschema.json $DST_KS
