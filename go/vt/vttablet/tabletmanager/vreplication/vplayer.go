@@ -242,8 +242,14 @@ func (vp *vplayer) applyEvents(ctx context.Context, relay *relayLog) error {
 		// No events were received. This likely means that there's a network partition.
 		// So, we should assume we're falling behind.
 		if len(items) == 0 {
-			behind := time.Now().UnixNano() - vp.lastTimestampNs - vp.timeOffsetNs
-			vp.vr.stats.SecondsBehindMaster.Set(behind / 1e9)
+			nowNs := time.Now().UnixNano()
+			behind := nowNs - vp.lastTimestampNs - vp.timeOffsetNs
+			sbm := behind / 1e9
+			log.Infof(
+				"applyEvents SecondsBehindMaster calc: behindSec: %d, nowNs: %d, vp.lastTimestampNs: %d, vp.timeOffsetNs: %d",
+				sbm, nowNs, vp.lastTimestampNs, vp.timeOffsetNs)
+
+			vp.vr.stats.SecondsBehindMaster.Set(sbm)
 		}
 		// Filtered replication often ends up receiving a large number of empty transactions.
 		// This is required because the player needs to know the latest position of the source.
@@ -272,8 +278,14 @@ func (vp *vplayer) applyEvents(ctx context.Context, relay *relayLog) error {
 			for j, event := range events {
 				if event.Timestamp != 0 {
 					vp.lastTimestampNs = event.Timestamp * 1e9
-					vp.timeOffsetNs = time.Now().UnixNano() - event.CurrentTime
-					vp.vr.stats.SecondsBehindMaster.Set(event.CurrentTime/1e9 - event.Timestamp)
+					nowNs := time.Now().UnixNano()
+					vp.timeOffsetNs = nowNs - event.CurrentTime
+					sbm := event.CurrentTime/1e9 - event.Timestamp
+					log.Infof(
+						"applyEvents SecondsBehindMaster event calc: behindSec: %d, nowNs: %d, vp.lastTimestampNs: %d, vp.timeOffsetNs: %d",
+						sbm, nowNs, vp.lastTimestampNs, vp.timeOffsetNs)
+
+					vp.vr.stats.SecondsBehindMaster.Set(sbm)
 				}
 				mustSave := false
 				switch event.Type {
