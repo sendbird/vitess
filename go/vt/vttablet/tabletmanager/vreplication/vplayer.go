@@ -234,6 +234,8 @@ func (vp *vplayer) exec(ctx context.Context, sql string) error {
 }
 
 func (vp *vplayer) applyEvents(ctx context.Context, relay *relayLog) error {
+	printTmr := time.NewTimer(*printInterval)
+	defer printTmr.Stop()
 	for {
 		items, err := relay.Fetch()
 		if err != nil {
@@ -281,9 +283,14 @@ func (vp *vplayer) applyEvents(ctx context.Context, relay *relayLog) error {
 					nowNs := time.Now().UnixNano()
 					vp.timeOffsetNs = nowNs - event.CurrentTime
 					sbm := event.CurrentTime/1e9 - event.Timestamp
-					log.Infof(
-						"applyEvents SecondsBehindMaster event calc: behindSec: %d, nowNs: %d, vp.lastTimestampNs: %d, vp.timeOffsetNs: %d",
-						sbm, nowNs, vp.lastTimestampNs, vp.timeOffsetNs)
+					select {
+					case <-printTmr.C:
+						log.Infof(
+							"applyEvents SecondsBehindMaster event calc: behindSec: %d, nowNs: %d, vp.lastTimestampNs: %d, vp.timeOffsetNs: %d",
+							sbm, nowNs, vp.lastTimestampNs, vp.timeOffsetNs)
+					default:
+						// pass
+					}
 
 					vp.vr.stats.SecondsBehindMaster.Set(sbm)
 				}
