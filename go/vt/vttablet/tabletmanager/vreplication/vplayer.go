@@ -115,7 +115,7 @@ func (vp *vplayer) fetchAndApply(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	relay := newRelayLog(ctx, relayLogMaxItems, relayLogMaxSize)
+	relay := newRelayLog(ctx, *relayLogMaxItems, *relayLogMaxSize)
 
 	target := &querypb.Target{
 		Keyspace:   vp.vr.sourceTablet.Keyspace,

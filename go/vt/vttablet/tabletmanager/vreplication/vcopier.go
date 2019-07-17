@@ -182,7 +182,7 @@ func (vc *vcopier) copyTable(ctx context.Context, tableName string, copyState ma
 	}
 	defer vsClient.Close(ctx)
 
-	ctx, cancel := context.WithTimeout(ctx, copyTimeout)
+	ctx, cancel := context.WithTimeout(ctx, *copyTimeout)
 	defer cancel()
 
 	target := &querypb.Target{
