@@ -117,6 +117,7 @@ func (vc *vcopier) copyNext(ctx context.Context, settings binlogplayer.VRSetting
 
 var (
 	printInterval = flag.Duration("replication_debug_catchup_print_interval", 30*time.Second, "interval between debug prints")
+	printOn       = flag.Bool("replication_debug_catchup_print_enabled", false, "Enable debug printing")
 )
 
 func (vc *vcopier) catchup(ctx context.Context, copyState map[string]*sqltypes.Result) error {
@@ -144,16 +145,21 @@ func (vc *vcopier) catchup(ctx context.Context, copyState map[string]*sqltypes.R
 	seconds := int64(replicaLagTolerance / time.Second)
 	defer tmr.Stop()
 
-	printTmr := time.NewTimer(*printInterval)
-	defer printTmr.Stop()
+	var printTmr *time.Timer
+	if *printOn {
+		printTmr = time.NewTimer(*printInterval)
+		defer printTmr.Stop()
+	}
 	for {
 		sbm := vc.vr.stats.SecondsBehindMaster.Get()
 
-		select {
-		case <-printTmr.C:
-			log.Infof("catchup loop: SecondsBehindMaster: %d, SecondsLimit: %d", sbm, seconds)
-		default:
-			// pass
+		if *printOn {
+			select {
+			case <-printTmr.C:
+				log.Infof("catchup loop: SecondsBehindMaster: %d, SecondsLimit: %d", sbm, seconds)
+			default:
+				// pass
+			}
 		}
 
 		if sbm < seconds {
