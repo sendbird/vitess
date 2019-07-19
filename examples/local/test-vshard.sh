@@ -24,6 +24,7 @@ KEYSPACE=$SRC_KS UID_BASE=100 ./vttablet-up.sh
 sleep 15
 ./lvtctl.sh InitShardMaster -force $SRC_KS/0 $SRC_TABLET_ID
 ./lvtctl.sh ApplySchema -sql-file=../common/vsplit_init_tables.sql $SRC_KS
+./lvtctl.sh ApplyVSchema -vschema_file=../common/vsplit_src_vschema.json $SRC_KS
 
 ./lvtctl.sh GetSchema $SRC_TABLET_ID
 
@@ -31,10 +32,11 @@ sleep 15
 ./vtclient \
     -server 127.0.0.1:15991 \
     -timeout 1h \
-    -target '$SRC_KS:0' \
+    -target 'src_ks:0' \
     -count 1000000 \
-    -parallel 1 \
+    -parallel 5 \
     -qps 100 \
+    -min_sequence_id 0 \
     -max_sequence_id 1000000000 \
     -bind_variables '[ 1, "msg 12345" ]' \
     "INSERT INTO moving1 (time_created_ns,message,page) VALUES (:v1, :v2, :v3)"
