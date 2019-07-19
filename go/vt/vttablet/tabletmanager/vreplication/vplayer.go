@@ -234,10 +234,10 @@ func (vp *vplayer) exec(ctx context.Context, sql string) error {
 }
 
 func (vp *vplayer) applyEvents(ctx context.Context, relay *relayLog) error {
-	var printTmr *time.Timer
+	var printTkr *time.Ticker
 	if *printOn {
-		printTmr = time.NewTimer(*printInterval)
-		defer printTmr.Stop()
+		printTkr = time.NewTicker(*printInterval)
+		defer printTkr.Stop()
 	}
 	for {
 		items, err := relay.Fetch()
@@ -290,7 +290,7 @@ func (vp *vplayer) applyEvents(ctx context.Context, relay *relayLog) error {
 					sbm := event.CurrentTime/1e9 - event.Timestamp
 					if *printOn {
 						select {
-						case <-printTmr.C:
+						case <-printTkr.C:
 							log.Infof(
 								"applyEvents SecondsBehindMaster event calc: behindSec: %d, nowNs: %d, vp.lastTimestampNs: %d, vp.timeOffsetNs: %d",
 								sbm, nowNs, vp.lastTimestampNs, vp.timeOffsetNs)

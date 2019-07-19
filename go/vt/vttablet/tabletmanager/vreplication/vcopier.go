@@ -141,21 +141,21 @@ func (vc *vcopier) catchup(ctx context.Context, copyState map[string]*sqltypes.R
 	}()
 
 	// Wait for catchup.
-	tmr := time.NewTimer(1 * time.Second)
+	tkr := time.NewTicker(1 * time.Second)
 	seconds := int64(replicaLagTolerance / time.Second)
-	defer tmr.Stop()
+	defer tkr.Stop()
 
-	var printTmr *time.Timer
+	var printTkr *time.Ticker
 	if *printOn {
-		printTmr = time.NewTimer(*printInterval)
-		defer printTmr.Stop()
+		printTkr = time.NewTicker(*printInterval)
+		defer printTkr.Stop()
 	}
 	for {
 		sbm := vc.vr.stats.SecondsBehindMaster.Get()
 
 		if *printOn {
 			select {
-			case <-printTmr.C:
+			case <-printTkr.C:
 				log.Infof("catchup loop: SecondsBehindMaster: %d, SecondsLimit: %d", sbm, seconds)
 			default:
 				// pass
@@ -178,7 +178,7 @@ func (vc *vcopier) catchup(ctx context.Context, copyState map[string]*sqltypes.R
 			// Make sure vplayer returns before returning.
 			<-errch
 			return io.EOF
-		case <-tmr.C:
+		case <-tkr.C:
 		}
 	}
 }
