@@ -17,6 +17,7 @@ limitations under the License.
 package vreplication
 
 import (
+	"flag"
 	"fmt"
 	"strings"
 	"time"
@@ -39,9 +40,9 @@ var (
 	// between the two timeouts.
 	idleTimeout         = 1100 * time.Millisecond
 	dbLockRetryDelay    = 1 * time.Second
-	relayLogMaxSize     = 30000
-	relayLogMaxItems    = 1000
-	copyTimeout         = 1 * time.Hour
+	relayLogMaxSize     = flag.Int("replication_max_packet_bytes", 30000, "Max copy packet size.")
+	relayLogMaxItems    = flag.Int("replication_max_packet_items", 1000, "Max copy packet items.")
+	copyTimeout         = flag.Duration("replication_bulk_copy_duration", 1*time.Hour, "Bulk copy duration before VReplication begins.")
 	replicaLagTolerance = 10 * time.Second
 
 	// CreateCopyState is the list of statements to execute for creating

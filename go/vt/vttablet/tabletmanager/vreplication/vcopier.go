@@ -18,6 +18,7 @@ package vreplication
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"io"
 	"strconv"
@@ -114,6 +115,11 @@ func (vc *vcopier) copyNext(ctx context.Context, settings binlogplayer.VRSetting
 	return vc.copyTable(ctx, tableToCopy, copyState)
 }
 
+var (
+	printInterval = flag.Duration("replication_debug_catchup_print_interval", 30*time.Second, "interval between debug prints")
+	printOn       = flag.Bool("replication_debug_catchup_print_enabled", false, "Enable debug printing")
+)
+
 func (vc *vcopier) catchup(ctx context.Context, copyState map[string]*sqltypes.Result) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -138,8 +144,24 @@ func (vc *vcopier) catchup(ctx context.Context, copyState map[string]*sqltypes.R
 	tmr := time.NewTimer(1 * time.Second)
 	seconds := int64(replicaLagTolerance / time.Second)
 	defer tmr.Stop()
+
+	var printTmr *time.Timer
+	if *printOn {
+		printTmr = time.NewTimer(*printInterval)
+		defer printTmr.Stop()
+	}
 	for {
 		sbm := vc.vr.stats.SecondsBehindMaster.Get()
+
+		if *printOn {
+			select {
+			case <-printTmr.C:
+				log.Infof("catchup loop: SecondsBehindMaster: %d, SecondsLimit: %d", sbm, seconds)
+			default:
+				// pass
+			}
+		}
+
 		if sbm < seconds {
 			cancel()
 			// Make sure vplayer returns before returning.
@@ -182,7 +204,7 @@ func (vc *vcopier) copyTable(ctx context.Context, tableName string, copyState ma
 	}
 	defer vsClient.Close(ctx)
 
-	ctx, cancel := context.WithTimeout(ctx, copyTimeout)
+	ctx, cancel := context.WithTimeout(ctx, *copyTimeout)
 	defer cancel()
 
 	target := &querypb.Target{

@@ -331,14 +331,14 @@ func TestPlayerCopyTableCancel(t *testing.T) {
 	})
 	env.SchemaEngine.Reload(context.Background())
 
-	saveTimeout := copyTimeout
-	copyTimeout = 1 * time.Millisecond
-	defer func() { copyTimeout = saveTimeout }()
+	saveTimeout := *copyTimeout
+	*copyTimeout = 1 * time.Millisecond
+	defer func() { *copyTimeout = saveTimeout }()
 
 	// Set a hook to reset the copy timeout after first call.
 	streamRowsHook = func(ctx context.Context) {
 		<-ctx.Done()
-		copyTimeout = saveTimeout
+		*copyTimeout = saveTimeout
 		streamRowsHook = nil
 	}
 	defer func() { streamRowsHook = nil }()

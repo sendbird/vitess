@@ -180,6 +180,8 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 	// Main loop: calls bufferAndTransmit as events arrive.
 	timer := time.NewTimer(heartbeatTime)
 	defer timer.Stop()
+
+	var lastEventTimestamp int64
 	for {
 		timer.Reset(heartbeatTime)
 		// Drain event if timer fired before reset.
@@ -198,7 +200,9 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 				}
 				return fmt.Errorf("unexpected server EOF")
 			}
-			vevents, err := vs.parseEvent(ev)
+			var vevents []*binlogdatapb.VEvent
+			var err error
+			vevents, lastEventTimestamp, err = vs.parseEvent(ev, lastEventTimestamp)
 			if err != nil {
 				return err
 			}
@@ -232,10 +236,10 @@ func (vs *vstreamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 	}
 }
 
-func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, error) {
+func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent, defaultEventTimestamp int64) ([]*binlogdatapb.VEvent, int64, error) {
 	// Validate the buffer before reading fields from it.
 	if !ev.IsValid() {
-		return nil, fmt.Errorf("can't parse binlog event: invalid data: %#v", ev)
+		return nil, defaultEventTimestamp, fmt.Errorf("can't parse binlog event: invalid data: %#v", ev)
 	}
 
 	// We need to keep checking for FORMAT_DESCRIPTION_EVENT even after we've
@@ -245,9 +249,9 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 		var err error
 		vs.format, err = ev.Format()
 		if err != nil {
-			return nil, fmt.Errorf("can't parse FORMAT_DESCRIPTION_EVENT: %v, event data: %#v", err, ev)
+			return nil, defaultEventTimestamp, fmt.Errorf("can't parse FORMAT_DESCRIPTION_EVENT: %v, event data: %#v", err, ev)
 		}
-		return nil, nil
+		return nil, defaultEventTimestamp, nil
 	}
 
 	// We can't parse anything until we get a FORMAT_DESCRIPTION_EVENT that
@@ -257,22 +261,22 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 		// is a fake ROTATE_EVENT, which the master sends to tell us the name
 		// of the current log file.
 		if ev.IsRotate() {
-			return nil, nil
+			return nil, defaultEventTimestamp, nil
 		}
-		return nil, fmt.Errorf("got a real event before FORMAT_DESCRIPTION_EVENT: %#v", ev)
+		return nil, defaultEventTimestamp, fmt.Errorf("got a real event before FORMAT_DESCRIPTION_EVENT: %#v", ev)
 	}
 
 	// Strip the checksum, if any. We don't actually verify the checksum, so discard it.
 	ev, _, err := ev.StripChecksum(vs.format)
 	if err != nil {
-		return nil, fmt.Errorf("can't strip checksum from binlog event: %v, event data: %#v", err, ev)
+		return nil, defaultEventTimestamp, fmt.Errorf("can't strip checksum from binlog event: %v, event data: %#v", err, ev)
 	}
 	var vevents []*binlogdatapb.VEvent
 	switch {
 	case ev.IsGTID():
 		gtid, hasBegin, err := ev.GTID(vs.format)
 		if err != nil {
-			return nil, fmt.Errorf("can't get GTID from binlog event: %v, event data: %#v", err, ev)
+			return nil, defaultEventTimestamp, fmt.Errorf("can't get GTID from binlog event: %v, event data: %#v", err, ev)
 		}
 		if hasBegin {
 			vevents = append(vevents, &binlogdatapb.VEvent{
@@ -291,7 +295,7 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 	case ev.IsQuery():
 		q, err := ev.Query(vs.format)
 		if err != nil {
-			return nil, fmt.Errorf("can't get query from binlog event: %v, event data: %#v", err, ev)
+			return nil, defaultEventTimestamp, fmt.Errorf("can't get query from binlog event: %v, event data: %#v", err, ev)
 		}
 		switch cat := sqlparser.Preview(q.SQL); cat {
 		case sqlparser.StmtBegin:
@@ -324,29 +328,29 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 		case sqlparser.StmtOther:
 			// These are DBA statements like REPAIR that can be ignored.
 		default:
-			return nil, fmt.Errorf("unexpected statement type %s in row-based replication: %q", sqlparser.StmtType(cat), q.SQL)
+			return nil, defaultEventTimestamp, fmt.Errorf("unexpected statement type %s in row-based replication: %q", sqlparser.StmtType(cat), q.SQL)
 		}
 	case ev.IsTableMap():
 		// This is very frequent. It precedes every row event.
 		id := ev.TableID(vs.format)
 		tm, err := ev.TableMap(vs.format)
 		if err != nil {
-			return nil, err
+			return nil, defaultEventTimestamp, err
 		}
 		// We have to build a plan only for new ids.
 		if _, ok := vs.plans[id]; ok {
-			return nil, nil
+			return nil, defaultEventTimestamp, nil
 		}
 		if tm.Database != "" && tm.Database != vs.cp.DbName {
 			vs.plans[id] = nil
-			return nil, nil
+			return nil, defaultEventTimestamp, nil
 		}
 		st := vs.se.GetTable(sqlparser.NewTableIdent(tm.Name))
 		if st == nil {
-			return nil, fmt.Errorf("unknown table %v in schema", tm.Name)
+			return nil, defaultEventTimestamp, fmt.Errorf("unknown table %v in schema", tm.Name)
 		}
 		if len(st.Columns) < len(tm.Types) {
-			return nil, fmt.Errorf("cannot determine table columns for %s: event has %d columns, current schema has %d: %#v", tm.Name, len(tm.Types), len(st.Columns), ev)
+			return nil, defaultEventTimestamp, fmt.Errorf("cannot determine table columns for %s: event has %d columns, current schema has %d: %#v", tm.Name, len(tm.Types), len(st.Columns), ev)
 		}
 		table := &Table{
 			Name: st.Name.String(),
@@ -355,11 +359,11 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 		}
 		plan, err := buildPlan(table, vs.kschema, vs.filter)
 		if err != nil {
-			return nil, err
+			return nil, defaultEventTimestamp, err
 		}
 		if plan == nil {
 			vs.plans[id] = nil
-			return nil, nil
+			return nil, defaultEventTimestamp, nil
 		}
 		vs.plans[id] = &streamerPlan{
 			Plan:     plan,
@@ -381,21 +385,21 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 		id := ev.TableID(vs.format)
 		plan := vs.plans[id]
 		if plan == nil {
-			return nil, nil
+			return nil, defaultEventTimestamp, nil
 		}
 		rows, err := ev.Rows(vs.format, plan.TableMap)
 		if err != nil {
-			return nil, err
+			return nil, defaultEventTimestamp, err
 		}
 		rowChanges := make([]*binlogdatapb.RowChange, 0, len(rows.Rows))
 		for _, row := range rows.Rows {
 			beforeOK, beforeValues, err := vs.extractRowAndFilter(plan, row.Identify, rows.IdentifyColumns, row.NullIdentifyColumns)
 			if err != nil {
-				return nil, err
+				return nil, defaultEventTimestamp, err
 			}
 			afterOK, afterValues, err := vs.extractRowAndFilter(plan, row.Data, rows.DataColumns, row.NullColumns)
 			if err != nil {
-				return nil, err
+				return nil, defaultEventTimestamp, err
 			}
 			if !beforeOK && !afterOK {
 				continue
@@ -419,11 +423,17 @@ func (vs *vstreamer) parseEvent(ev mysql.BinlogEvent) ([]*binlogdatapb.VEvent, e
 			})
 		}
 	}
+
+	eventTimestamp := int64(ev.Timestamp())
+	if eventTimestamp == 0 {
+		eventTimestamp = defaultEventTimestamp
+	}
+
 	for _, vevent := range vevents {
-		vevent.Timestamp = int64(ev.Timestamp())
+		vevent.Timestamp = eventTimestamp
 		vevent.CurrentTime = time.Now().UnixNano()
 	}
-	return vevents, nil
+	return vevents, eventTimestamp, nil
 }
 
 func (vs *vstreamer) rebuildPlans() error {

@@ -1319,7 +1319,7 @@ func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, sourceShard, de
 		}
 
 		// get the position
-		event.DispatchUpdate(ev, "getting master position")
+		event.DispatchUpdate(ev, "destination master catch-up: getting source master position")
 		masterPosition, err := wr.tmc.MasterPosition(ctx, sourceMasterTabletInfo.Tablet)
 		if err != nil {
 			cancelMigration()
@@ -1327,7 +1327,7 @@ func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, sourceShard, de
 		}
 
 		// wait for it
-		event.DispatchUpdate(ev, "waiting for destination master to catch up to source master")
+		event.DispatchUpdate(ev, fmt.Sprintf("destination master catch-up: waiting for destination master to catch up to source master position (%v)", masterPosition))
 		if err := wr.tmc.VReplicationWaitForPos(ctx, destinationMasterTabletInfo.Tablet, int(uid), masterPosition); err != nil {
 			cancelMigration()
 			return err
@@ -1342,7 +1342,7 @@ func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, sourceShard, de
 		}
 
 		// Reverse the split clone
-		wr.Logger().Infof("Getting master position of target %v", topoproto.TabletAliasString(destinationShard.MasterAlias))
+		wr.Logger().Infof("reverse split clone: Getting master position of target %v", topoproto.TabletAliasString(destinationShard.MasterAlias))
 		targetMasterPos, err := wr.tmc.MasterPosition(ctx, destinationMasterTabletInfo.Tablet)
 		if err != nil {
 			cancelMigration()
@@ -1396,7 +1396,7 @@ func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, sourceShard, de
 	}
 
 	// Update routing rules
-	event.DispatchUpdate(ev, "updading routing rules")
+	event.DispatchUpdate(ev, "updating routing rules")
 	rules, err := wr.getRoutingRules(ctx)
 	if err != nil {
 		return err
