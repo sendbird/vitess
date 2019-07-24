@@ -26,6 +26,7 @@ import (
 	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
@@ -276,6 +277,69 @@ func TestPlayerFilters(t *testing.T) {
 		expectDBClientQueries(t, tcases.output)
 		if tcases.table != "" {
 			expectData(t, tcases.table, tcases.data)
+		}
+	}
+}
+
+func TestUnicode(t *testing.T) {
+	defer deleteTablet(addTablet(100, "0", topodatapb.TabletType_REPLICA, true, true))
+
+	execStatements(t, []string{
+		"create table src1(id int, val varchar(128) COLLATE utf8_unicode_ci, primary key(id)) DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci",
+		fmt.Sprintf("create table %s.dst1(id int, val varchar(128) COLLATE utf8_unicode_ci, primary key(id)) DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci", vrepldb),
+	})
+	defer execStatements(t, []string{
+		"drop table src1",
+		fmt.Sprintf("drop table %s.dst1", vrepldb),
+	})
+	env.SchemaEngine.Reload(context.Background())
+
+	filter := &binlogdatapb.Filter{
+		Rules: []*binlogdatapb.Rule{{
+			Match:  "dst1",
+			Filter: "select * from src1",
+		}},
+	}
+	cancel, _ := startVReplication(t, filter, binlogdatapb.OnDDLAction_IGNORE, "")
+	defer cancel()
+
+	testcases := []struct {
+		input  string
+		output []string
+		table  string
+		data   [][]string
+	}{{
+		// insert with insertNormal
+		input: "insert into src1 values(1, 0xC3B0C5B8E28098C28DC3B0C5B8E28098C28DC3B0C5B8E28098C28D)",
+		output: []string{
+			"begin",
+			"insert into dst1(id,val) values (1,'ðŸ‘\u008dðŸ‘\u008dðŸ‘\u008d')",
+			"/update _vt.vreplication set pos=",
+			"commit",
+		},
+		table: "dst1",
+		data: [][]string{
+			{"1", "👍👍👍"},
+		},
+	}}
+
+	conn, err := env.Mysqld.GetDbaConnection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecuteFetch("set names latin1", 10000, false); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tcases := range testcases {
+		execStatements(t, []string{"set names latin1", tcases.input})
+		expectDBClientQueries(t, tcases.output)
+		if tcases.table != "" {
+			customExpectData(t, tcases.table, tcases.data, func(ctx context.Context, query string) (*sqltypes.Result, error) {
+				return conn.ExecuteFetch(query, 10000, true)
+			})
 		}
 	}
 }

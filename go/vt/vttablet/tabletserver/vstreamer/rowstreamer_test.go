@@ -107,6 +107,35 @@ func TestStreamRowsScan(t *testing.T) {
 	checkStream(t, "select * from t3", []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewVarBinary("aaa")}, wantQuery, wantStream)
 }
 
+func TestStreamRowsUnicode(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	execStatements(t, []string{
+		"create table t1(id int, val varchar(128) COLLATE utf8_unicode_ci, primary key(id)) DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci",
+		// The data written here is the latin1 converted version of "1👍👍👍".
+		"insert into t1 values(1, 0xC3B0C5B8E28098C28DC3B0C5B8E28098C28DC3B0C5B8E28098C28D)",
+	})
+	defer execStatements(t, []string{
+		"drop table t1",
+	})
+	engine.se.Reload(context.Background())
+
+	wantStream := []string{
+		`fields:<name:"id" type:INT32 > fields:<name:"val" type:VARCHAR > pkfields:<name:"id" type:INT32 > `,
+		// The actual data here is ""1ðŸ‘\u008dðŸ‘\u008dðŸ‘\u008d", which are the bits
+		// that result in conversion of ""1👍👍👍" through latin1 charset.
+		`rows:<lengths:1 lengths:12 values:"1\360\237\221\215\360\237\221\215\360\237\221\215" > lastpk:<lengths:1 values:"1" > `,
+	}
+	wantQuery := "select id, val from t1 order by id"
+	savecp := *engine.cp
+	// Rowstreamer must override this to "binary"
+	engine.cp.Charset = "latin1"
+	defer func() { engine.cp = &savecp }()
+	checkStream(t, "select * from t1", nil, wantQuery, wantStream)
+}
+
 func TestStreamRowsKeyRange(t *testing.T) {
 	if testing.Short() {
 		t.Skip()
@@ -222,7 +251,7 @@ func checkStream(t *testing.T, query string, lastpk []sqltypes.Value, wantQuery 
 			}
 			srows := fmt.Sprintf("%v", rows)
 			if srows != wantStream[i] {
-				ch <- fmt.Errorf("stream %d:\n%s, want\n%s", i, srows, wantStream[i])
+				ch <- fmt.Errorf("stream %d:\n%q, want\n%s", i, rows.Rows[0].Values, wantStream[i])
 			}
 			i++
 			return nil
