@@ -1786,6 +1786,9 @@ func commandMigrateServedFrom(ctx context.Context, wr *wrangler.Wrangler, subFla
 	cellsStr := subFlags.String("cells", "", "Specifies a comma-separated list of cells to update")
 	filteredReplicationWaitTime := subFlags.Duration("filtered_replication_wait_time", 30*time.Second, "Specifies the maximum time to wait, in seconds, for filtered replication to catch up on master migrations")
 	reverseReplication := subFlags.Bool("reverse_replication", false, "For master migration, enabling this flag reverses replication which allows rollback.")
+	isEmergency := subFlags.Bool("emergency", false,
+		"For master migration *emergency only*, forcibly and irreversibly migrates to the destination. "+
+			" Should only be used when doing a VerticalSplitClone, where a previous MigrateServedFrom to target keyspace succeeded, but target died, and you need to revert back to the original keyspace.")
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1805,7 +1808,7 @@ func commandMigrateServedFrom(ctx context.Context, wr *wrangler.Wrangler, subFla
 	if *cellsStr != "" {
 		cells = strings.Split(*cellsStr, ",")
 	}
-	return wr.MigrateServedFrom(ctx, keyspace, shard, servedType, cells, *reverse, *filteredReplicationWaitTime, *reverseReplication)
+	return wr.MigrateServedFrom(ctx, keyspace, shard, servedType, cells, *reverse, *filteredReplicationWaitTime, *reverseReplication, *isEmergency)
 }
 
 func commandCancelResharding(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {

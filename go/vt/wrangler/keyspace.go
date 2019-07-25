@@ -1160,12 +1160,19 @@ func (wr *Wrangler) cancelVerticalResharding(ctx context.Context, keyspace, shar
 
 // MigrateServedFrom is used during vertical splits to migrate a
 // served type from a keyspace to another.
-func (wr *Wrangler) MigrateServedFrom(ctx context.Context, keyspace, shard string, servedType topodatapb.TabletType, cells []string, reverse bool, filteredReplicationWaitTime time.Duration, reverseReplication bool) (err error) {
+func (wr *Wrangler) MigrateServedFrom(ctx context.Context, keyspace, shard string, servedType topodatapb.TabletType, cells []string, reverse bool, filteredReplicationWaitTime time.Duration, reverseReplication bool, isEmergency bool) (err error) {
 	if servedType == topodatapb.TabletType_MASTER && reverse {
 		return fmt.Errorf("cannot migrate master back to %v/%v", keyspace, shard)
 	}
 	if servedType != topodatapb.TabletType_MASTER && reverseReplication {
 		return fmt.Errorf("cannot reverse replication for non-master migrate: %v/%v", keyspace, shard)
+	}
+	// TODO: Any reason to allow emergency migrates for non-masters?
+	if servedType != topodatapb.TabletType_MASTER && isEmergency {
+		return fmt.Errorf("cannot be an emergency for non-master migrate: %v/%v", keyspace, shard)
+	}
+	if isEmergency && reverseReplication {
+		return fmt.Errorf("cannot reverse replication during emergency for master migrate: %v/%v", keyspace, shard)
 	}
 	destinationShard, err := wr.ts.GetShard(ctx, keyspace, shard)
 	if err != nil {
@@ -1210,7 +1217,7 @@ func (wr *Wrangler) MigrateServedFrom(ctx context.Context, keyspace, shard strin
 	defer unlock(&err)
 
 	if servedType == topodatapb.TabletType_MASTER {
-		err = wr.masterMigrateServedFrom(ctx, sourceShard, destinationShard, tables, ev, filteredReplicationWaitTime, reverseReplication)
+		err = wr.masterMigrateServedFrom(ctx, sourceShard, destinationShard, tables, ev, filteredReplicationWaitTime, reverseReplication, isEmergency)
 	} else {
 		err = wr.replicaMigrateServedFrom(ctx, sourceShard.Keyspace(), keyspace, servedType, cells, reverse, tables, ev)
 	}
@@ -1256,7 +1263,7 @@ func (wr *Wrangler) replicaMigrateServedFrom(ctx context.Context, fromKeyspace, 
 // - Clear SourceShard on the destination Shard
 // - Refresh the destination master, so its stops its filtered
 //   replication and starts accepting writes
-func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, sourceShard, destinationShard *topo.ShardInfo, tables []string, ev *events.MigrateServedFrom, filteredReplicationWaitTime time.Duration, reverseReplication bool) error {
+func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, sourceShard, destinationShard *topo.ShardInfo, tables []string, ev *events.MigrateServedFrom, filteredReplicationWaitTime time.Duration, reverseReplication bool, isEmergency bool) error {
 	fromKeyspace := sourceShard.Keyspace()
 	toKeyspace := destinationShard.Keyspace()
 
@@ -1270,13 +1277,17 @@ func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, sourceShard, de
 		return err
 	}
 	var uid uint32
+	if len(destinationShard.SourceShards) != 0 {
+		uid = destinationShard.SourceShards[0].Uid
+	}
+
 	// If the destination shard has no source shards, the cutover has
 	// already started. Skip ahead to the cutover.
-	if len(destinationShard.SourceShards) != 0 {
+	// Also skip ahead if in emergency mode.
+	if len(destinationShard.SourceShards) != 0 && !isEmergency {
 		if len(sourceShard.SourceShards) != 0 {
 			return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "both sides have source shards. Please delete one and retry")
 		}
-		uid = destinationShard.SourceShards[0].Uid
 
 		// cancelMigration function has to be created before overwriting the original context.
 		cancelMigration := func() {
