@@ -1277,123 +1277,126 @@ func (wr *Wrangler) masterMigrateServedFrom(ctx context.Context, sourceShard, de
 		return err
 	}
 	var uid uint32
-	if len(destinationShard.SourceShards) != 0 {
-		uid = destinationShard.SourceShards[0].Uid
-	}
 
 	// If the destination shard has no source shards, the cutover has
 	// already started. Skip ahead to the cutover.
-	// Also skip ahead if in emergency mode.
-	if len(destinationShard.SourceShards) != 0 && !isEmergency {
+	if len(destinationShard.SourceShards) != 0 {
 		if len(sourceShard.SourceShards) != 0 {
 			return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "both sides have source shards. Please delete one and retry")
 		}
 
-		// cancelMigration function has to be created before overwriting the original context.
-		cancelMigration := func() {
-			event.DispatchUpdate(ev, "canceling migration")
-			wr.Logger().Infof("canceling migration")
+		uid = destinationShard.SourceShards[0].Uid
+
+		if !isEmergency {
+			// cancelMigration function has to be created before overwriting the original context.
+			cancelMigration := func() {
+				event.DispatchUpdate(ev, "canceling migration")
+				wr.Logger().Infof("canceling migration")
+				if _, err := wr.ts.UpdateShardFields(ctx, fromKeyspace, sourceShard.ShardName(), func(si *topo.ShardInfo) error {
+					return si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_MASTER, nil, true, tables)
+				}); err != nil {
+					wr.Logger().Errorf("Could not remove blacklist from source: %v", err)
+				}
+				if err := wr.tmc.RefreshState(ctx, sourceMasterTabletInfo.Tablet); err != nil {
+					wr.Logger().Errorf("Could not refresh source masters after removing blacklist: %v", err)
+				}
+				event.DispatchUpdate(ev, "restarting vreplication")
+				if _, err := wr.tmc.VReplicationExec(ctx, destinationMasterTabletInfo.Tablet, binlogplayer.StartVReplication(uid)); err != nil {
+					wr.Logger().Errorf("Could not restart vreplication while trying to cancel migration: %v", err)
+				}
+			}
+
+			ctx, cancel := context.WithTimeout(ctx, filteredReplicationWaitTime)
+			defer cancel()
+
+			// Update source shard (more blacklisted tables)
+			event.DispatchUpdate(ev, "blacklisting tables on source shard")
 			if _, err := wr.ts.UpdateShardFields(ctx, fromKeyspace, sourceShard.ShardName(), func(si *topo.ShardInfo) error {
-				return si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_MASTER, nil, true, tables)
+				return si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_MASTER, nil, false, tables)
 			}); err != nil {
-				wr.Logger().Errorf("Could not remove blacklist from source: %v", err)
+				cancelMigration()
+				return err
 			}
+
+			// Now refresh the blacklisted table list on the source master
+			event.DispatchUpdate(ev, "refreshing source master so it updates its blacklisted tables")
 			if err := wr.tmc.RefreshState(ctx, sourceMasterTabletInfo.Tablet); err != nil {
-				wr.Logger().Errorf("Could not refresh source masters after removing blacklist: %v", err)
+				cancelMigration()
+				return err
 			}
-			event.DispatchUpdate(ev, "restarting vreplication")
-			if _, err := wr.tmc.VReplicationExec(ctx, destinationMasterTabletInfo.Tablet, binlogplayer.StartVReplication(uid)); err != nil {
-				wr.Logger().Errorf("Could not restart vreplication while trying to cancel migration: %v", err)
+
+			// get the position
+			event.DispatchUpdate(ev, "destination master catch-up: getting source master position")
+			masterPosition, err := wr.tmc.MasterPosition(ctx, sourceMasterTabletInfo.Tablet)
+			if err != nil {
+				cancelMigration()
+				return err
 			}
-		}
 
-		ctx, cancel := context.WithTimeout(ctx, filteredReplicationWaitTime)
-		defer cancel()
+			// wait for it
+			event.DispatchUpdate(ev, fmt.Sprintf("destination master catch-up: waiting for destination master to catch up to source master position (%v)", masterPosition))
+			if err := wr.tmc.VReplicationWaitForPos(ctx, destinationMasterTabletInfo.Tablet, int(uid), masterPosition); err != nil {
+				cancelMigration()
+				return err
+			}
 
-		// Update source shard (more blacklisted tables)
-		event.DispatchUpdate(ev, "blacklisting tables on source shard")
-		if _, err := wr.ts.UpdateShardFields(ctx, fromKeyspace, sourceShard.ShardName(), func(si *topo.ShardInfo) error {
-			return si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_MASTER, nil, false, tables)
-		}); err != nil {
-			cancelMigration()
-			return err
-		}
+			// Stop the VReplication stream. We'll delete it later after the cutover succeeds.
+			// If cutover fails, we may have to restart this.
+			event.DispatchUpdate(ev, "stopping vreplication")
+			if _, err := wr.tmc.VReplicationExec(ctx, destinationMasterTabletInfo.Tablet, binlogplayer.StopVReplication(uid, "stopped for cutover")); err != nil {
+				cancelMigration()
+				return err
+			}
 
-		// Now refresh the blacklisted table list on the source master
-		event.DispatchUpdate(ev, "refreshing source master so it updates its blacklisted tables")
-		if err := wr.tmc.RefreshState(ctx, sourceMasterTabletInfo.Tablet); err != nil {
-			cancelMigration()
-			return err
-		}
-
-		// get the position
-		event.DispatchUpdate(ev, "destination master catch-up: getting source master position")
-		masterPosition, err := wr.tmc.MasterPosition(ctx, sourceMasterTabletInfo.Tablet)
-		if err != nil {
-			cancelMigration()
-			return err
-		}
-
-		// wait for it
-		event.DispatchUpdate(ev, fmt.Sprintf("destination master catch-up: waiting for destination master to catch up to source master position (%v)", masterPosition))
-		if err := wr.tmc.VReplicationWaitForPos(ctx, destinationMasterTabletInfo.Tablet, int(uid), masterPosition); err != nil {
-			cancelMigration()
-			return err
-		}
-
-		// Stop the VReplication stream. We'll delete it later after the cutover succeeds.
-		// If cutover fails, we may have to restart this.
-		event.DispatchUpdate(ev, "stopping vreplication")
-		if _, err := wr.tmc.VReplicationExec(ctx, destinationMasterTabletInfo.Tablet, binlogplayer.StopVReplication(uid, "stopped for cutover")); err != nil {
-			cancelMigration()
-			return err
-		}
-
-		// Reverse the split clone
-		wr.Logger().Infof("reverse split clone: Getting master position of target %v", topoproto.TabletAliasString(destinationShard.MasterAlias))
-		targetMasterPos, err := wr.tmc.MasterPosition(ctx, destinationMasterTabletInfo.Tablet)
-		if err != nil {
-			cancelMigration()
-			return err
-		}
-		filter := &binlogdatapb.Filter{}
-		for _, table := range tables {
-			filter.Rules = append(filter.Rules, &binlogdatapb.Rule{
-				Match: table,
-			})
-		}
-		bls := &binlogdatapb.BinlogSource{
-			Keyspace: toKeyspace,
-			Shard:    sourceShard.ShardName(),
-			Filter:   filter,
-		}
-		cmd := binlogplayer.CreateVReplicationState("ReverseSplitClone", bls, targetMasterPos, binlogplayer.BlpStopped, sourceMasterTabletInfo.DbName())
-		qr, err := wr.TabletManagerClient().VReplicationExec(ctx, sourceMasterTabletInfo.Tablet, cmd)
-		if err != nil {
-			cancelMigration()
-			return vterrors.Wrapf(err, "VReplicationExec(%v, %s) failed", destinationShard.MasterAlias, cmd)
-		}
-
-		event.DispatchUpdate(ev, "updating destination shard")
-		sourceShard, err = wr.ts.UpdateShardFields(ctx, sourceShard.Keyspace(), sourceShard.ShardName(), func(si *topo.ShardInfo) error {
-			si.SourceShards = append(si.SourceShards, &topodatapb.Shard_SourceShard{
-				Uid:      uint32(qr.InsertId),
+			// Reverse the split clone
+			wr.Logger().Infof("reverse split clone: Getting master position of target %v", topoproto.TabletAliasString(destinationShard.MasterAlias))
+			targetMasterPos, err := wr.tmc.MasterPosition(ctx, destinationMasterTabletInfo.Tablet)
+			if err != nil {
+				cancelMigration()
+				return err
+			}
+			filter := &binlogdatapb.Filter{}
+			for _, table := range tables {
+				filter.Rules = append(filter.Rules, &binlogdatapb.Rule{
+					Match: table,
+				})
+			}
+			bls := &binlogdatapb.BinlogSource{
 				Keyspace: toKeyspace,
-				Shard:    destinationShard.ShardName(),
-				Tables:   tables,
+				Shard:    sourceShard.ShardName(),
+				Filter:   filter,
+			}
+			cmd := binlogplayer.CreateVReplicationState("ReverseSplitClone", bls, targetMasterPos, binlogplayer.BlpStopped, sourceMasterTabletInfo.DbName())
+			qr, err := wr.TabletManagerClient().VReplicationExec(ctx, sourceMasterTabletInfo.Tablet, cmd)
+			if err != nil {
+				cancelMigration()
+				return vterrors.Wrapf(err, "VReplicationExec(%v, %s) failed", destinationShard.MasterAlias, cmd)
+			}
+
+			event.DispatchUpdate(ev, "updating destination shard")
+			sourceShard, err = wr.ts.UpdateShardFields(ctx, sourceShard.Keyspace(), sourceShard.ShardName(), func(si *topo.ShardInfo) error {
+				si.SourceShards = append(si.SourceShards, &topodatapb.Shard_SourceShard{
+					Uid:      uint32(qr.InsertId),
+					Keyspace: toKeyspace,
+					Shard:    destinationShard.ShardName(),
+					Tables:   tables,
+				})
+				return nil
 			})
-			return nil
-		})
-		if err != nil {
-			cancelMigration()
-			return err
+			if err != nil {
+				cancelMigration()
+				return err
+			}
 		}
+
 		// After this, we should not cancel migration because we're starting to accept traffic
 		// on destination.
-		if _, err := wr.ts.UpdateShardFields(ctx, destinationShard.Keyspace(), destinationShard.ShardName(), func(si *topo.ShardInfo) error {
-			si.SourceShards = nil
-			return si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_MASTER, nil, true, tables)
-		}); err != nil {
+		_, err := wr.ts.UpdateShardFields(ctx, destinationShard.Keyspace(), destinationShard.ShardName(),
+			func(si *topo.ShardInfo) error {
+				si.SourceShards = nil
+				return si.UpdateSourceBlacklistedTables(ctx, topodatapb.TabletType_MASTER, nil, true, tables)
+			})
+		if err != nil && !isEmergency {
 			// We don't cancel here, because an error does not mean the operation definitely failed.
 			return err
 		}
