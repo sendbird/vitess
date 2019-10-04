@@ -77,6 +77,21 @@ create table t2_id4_idx(
 	primary key(id),
 	key idx_id4(id4)
 ) Engine=InnoDB;
+
+create table sequence_test(
+	id bigint,
+	val varchar(16),
+	primary key(id)
+)Engine=InnoDB;
+
+create table sequence_test_seq (
+	id int default 0, 
+	next_id bigint default null, 
+	cache bigint default null, 
+	primary key(id)
+) comment 'vitess_sequence' Engine=InnoDB;
+
+insert into sequence_test_seq(id, next_id, cache) values(0, 1, 10);
 `
 
 	vschema = &vschemapb.Keyspace{
@@ -149,6 +164,33 @@ create table t2_id4_idx(
 				}},
 				Columns: []*vschemapb.Column{{
 					Name: "val1",
+					Type: sqltypes.VarChar,
+				}},
+			},
+			"sequence_test_seq": {
+				Type:   "sequence",
+				Pinned: "80",
+				Columns: []*vschemapb.Column{{
+					Name: "id",
+					// Type: sqltypes.Int64,
+				}, {
+					Name: "next_id",
+					// Type: sqltypes.Int64,
+				}, {
+					Name: "cache",
+					// Type: sqltypes.Int64,
+				}},
+			},
+			"sequence_test": {
+				ColumnVindexes: []*vschemapb.ColumnVindex{{
+					Column: "id",
+					Name:   "hash",
+				}}, AutoIncrement: &vschemapb.AutoIncrement{
+					Column:   "id",
+					Sequence: "sequence_test_seq",
+				},
+				Columns: []*vschemapb.Column{{
+					Name: "val",
 					Type: sqltypes.VarChar,
 				}},
 			},
