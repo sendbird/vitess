@@ -78,6 +78,18 @@ create table t2_id4_idx(
 	key idx_id4(id4)
 ) Engine=InnoDB;
 
+create table user(
+	id bigint,
+	name varchar(20),
+	primary key(id)
+) Engine=InnoDB;
+
+create table user_details(
+	user_id bigint,
+	email varchar(45),
+	primary key(user_id)
+) Engine=InnoDB;
+
 create table sequence_test(
 	id bigint,
 	val varchar(16),
@@ -167,7 +179,26 @@ insert into sequence_test_seq(id, next_id, cache) values(0, 1, 10);
 					Type: sqltypes.VarChar,
 				}},
 			},
-			"sequence_test_seq": {
+			"user": {
+				ColumnVindexes: []*vschemapb.ColumnVindex{{
+					Column: "id",
+					Name:   "hash",
+				}},
+				Columns: []*vschemapb.Column{{
+					Name: "name",
+					Type: sqltypes.VarChar,
+				}},
+			},
+			"user_details": {
+				ColumnVindexes: []*vschemapb.ColumnVindex{{
+					Column: "user_id",
+					Name:   "hash",
+				}},
+				Columns: []*vschemapb.Column{{
+					Name: "email",
+        }},
+      },
+      "sequence_test_seq": {
 				Type:   "sequence",
 				Pinned: "80",
 				Columns: []*vschemapb.Column{{
