@@ -113,6 +113,9 @@ type Config struct {
 
 	// Whether to enable/disable workflow manager
 	InitWorkflowManager bool
+
+	// ExtraArg are the args appended to vtcombo process arguments
+	ExtraArg []string
 }
 
 // InitSchemas is a shortcut for tests that just want to setup a single

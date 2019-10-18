@@ -224,6 +224,7 @@ func VtcomboProcess(env Environment, args *Config, mysql MySQLManager) *VtProces
 
 	vt.ExtraArgs = append(vt.ExtraArgs, QueryServerArgs...)
 	vt.ExtraArgs = append(vt.ExtraArgs, env.VtcomboArguments()...)
+	vt.ExtraArgs = append(vt.ExtraArgs, args.ExtraArg...)
 
 	if args.SchemaDir != "" {
 		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-schema_dir", args.SchemaDir}...)
