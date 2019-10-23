@@ -156,7 +156,7 @@ func (vttablet *VttabletProcess) TearDown() error {
 // VttabletProcessInstance returns a VttabletProcess handle for vttablet process
 // configured with the given Config.
 // The process must be manually started by calling setup()
-func VttabletProcessInstance(Port int, GrpcPort int, TabletUID int, Cell string, Shard string, Hostname string, Keyspace string, VtctldPort int, TabletType string, topoPort int, hostname string, ExtraArgs []string) *VttabletProcess {
+func VttabletProcessInstance(Port int, GrpcPort int, TabletUID int, Cell string, Shard string, Hostname string, Keyspace string, VtctldPort int, TabletType string, topoPort int, hostname string, extraArgs []string) *VttabletProcess {
 	vtctl := VtctlProcessInstance(topoPort, hostname)
 	vttablet := &VttabletProcess{
 		Name:                        "vttablet",
@@ -178,7 +178,7 @@ func VttabletProcessInstance(Port int, GrpcPort int, TabletUID int, Cell string,
 		GrpcPort:                    GrpcPort,
 		PidFile:                     path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/vt_%010d/vttable.pid", TabletUID)),
 		VtctldAddress:               fmt.Sprintf("http://%s:%d", Hostname, VtctldPort),
-		ExtraArg:                    ExtraArgs,
+		ExtraArg:                    extraArgs,
 	}
 
 	if TabletType == "rdonly" {

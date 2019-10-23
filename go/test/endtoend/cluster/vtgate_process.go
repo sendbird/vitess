@@ -146,7 +146,7 @@ func (vtgate *VtgateProcess) TearDown() error {
 // VtgateProcessInstance returns a Vtgate handle for vtgate process
 // configured with the given Config.
 // The process must be manually started by calling setup()
-func VtgateProcessInstance(Port int, GrpcPort int, MySQLServerPort int, Cell string, CellsToWatch string, Hostname string, TabletTypesToWait string, topoPort int, hostname string, ExtraArgs []string) *VtgateProcess {
+func VtgateProcessInstance(Port int, GrpcPort int, MySQLServerPort int, Cell string, CellsToWatch string, Hostname string, TabletTypesToWait string, topoPort int, hostname string, extraArgs []string) *VtgateProcess {
 	vtctl := VtctlProcessInstance(topoPort, hostname)
 	vtgate := &VtgateProcess{
 		Name:                  "vtgate",
@@ -166,7 +166,7 @@ func VtgateProcessInstance(Port int, GrpcPort int, MySQLServerPort int, Cell str
 		CommonArg:             *vtctl,
 		PidFile:               path.Join(os.Getenv("VTDATAROOT"), "/tmp/vtgate.pid"),
 		MySQLAuthServerImpl:   "none",
-		ExtraArg:              ExtraArgs,
+		ExtraArg:              extraArgs,
 	}
 
 	vtgate.VerifyURL = fmt.Sprintf("http://%s:%d/debug/vars", Hostname, Port)
