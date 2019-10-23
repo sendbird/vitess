@@ -30,12 +30,12 @@ import (
 )
 
 var (
-	ClusterInstance *cluster.LocalProcessCluster
+	clusterInstance *cluster.LocalProcessCluster
 	vtParams        mysql.ConnParams
-	KeyspaceName    = "ks"
-	Cell            = "zone1"
-	Hostname        = "localhost"
-	SQLSchema       = `
+	keyspaceName    = "ks"
+	cell            = "zone1"
+	hostname        = "localhost"
+	sqlSchema       = `
 	create table twopc_user (
 		user_id bigint,
 		name varchar(128),
@@ -48,7 +48,7 @@ var (
 		primary key (id)
 	) Engine=InnoDB;`
 
-	VSchema = `
+	vSchema = `
 	{	
 		"sharded":true,
 		"vindexes": {
@@ -96,38 +96,38 @@ func TestMain(m *testing.M) {
 	flag.Parse()
 
 	exitCode := func() int {
-		ClusterInstance = &cluster.LocalProcessCluster{Cell: Cell, Hostname: Hostname}
+		clusterInstance = &cluster.LocalProcessCluster{Cell: cell, Hostname: hostname}
 		//Set extra tablet args for twopc
-		ClusterInstance.VtTabletExtraArgs = []string{
+		clusterInstance.VtTabletExtraArgs = []string{
 			"-twopc_enable",
 			"-twopc_coordinator_address", "localhost:15028",
 			"-twopc_abandon_age", "3600",
 		}
-		defer ClusterInstance.Teardown()
+		defer clusterInstance.Teardown()
 
 		// Start topo server
-		if err := ClusterInstance.StartTopo(); err != nil {
+		if err := clusterInstance.StartTopo(); err != nil {
 			return 1
 		}
 
 		// Start keyspace
 		keyspace := &cluster.Keyspace{
-			Name:      KeyspaceName,
-			SchemaSQL: SQLSchema,
-			VSchema:   VSchema,
+			Name:      keyspaceName,
+			SchemaSQL: sqlSchema,
+			VSchema:   vSchema,
 		}
-		if err := ClusterInstance.StartKeyspace(*keyspace, []string{"-80", "80-"}, 1, false); err != nil {
+		if err := clusterInstance.StartKeyspace(*keyspace, []string{"-80", "80-"}, 1, false); err != nil {
 			return 1
 		}
 
 		//Starting Vtgate in SINGLE transaction mode
-		ClusterInstance.VtGateExtraArgs = []string{"-transaction_mode", "SINGLE"}
-		if err := ClusterInstance.StartVtgate(); err != nil {
+		clusterInstance.VtGateExtraArgs = []string{"-transaction_mode", "SINGLE"}
+		if err := clusterInstance.StartVtgate(); err != nil {
 			return 1
 		}
 		vtParams = mysql.ConnParams{
-			Host: ClusterInstance.Hostname,
-			Port: ClusterInstance.VtgateMySQLPort,
+			Host: clusterInstance.Hostname,
+			Port: clusterInstance.VtgateMySQLPort,
 		}
 		return m.Run()
 	}()
@@ -163,20 +163,20 @@ func TestTransactionModes(t *testing.T) {
 	}
 
 	//Enable TWOPC transaction mode
-	ClusterInstance.VtGateExtraArgs = []string{"-transaction_mode", "TWOPC"}
+	clusterInstance.VtGateExtraArgs = []string{"-transaction_mode", "TWOPC"}
 	//Restart VtGate
-	err = ClusterInstance.VtgateProcess.TearDown()
+	err = clusterInstance.VtgateProcess.TearDown()
 	if err != nil {
 		t.Errorf("Fail to kill vtgate for restart : %v", err)
 	}
-	err = ClusterInstance.StartVtgate()
+	err = clusterInstance.StartVtgate()
 	if err != nil {
 		t.Errorf("Fail to start vtgate with new config:  %v", err)
 	}
 
 	vtParams = mysql.ConnParams{
-		Host: ClusterInstance.Hostname,
-		Port: ClusterInstance.VtgateMySQLPort,
+		Host: clusterInstance.Hostname,
+		Port: clusterInstance.VtgateMySQLPort,
 	}
 	conn2, err := mysql.Connect(ctx, &vtParams)
 	if err != nil {
