@@ -36,6 +36,8 @@ type VtgateProcess struct {
 	MySQLAuthServerImpl   string
 	Directory             string
 	VerifyURL             string
+	//Extra Arg to be set before starting the vtgate process
+	ExtraArg []string
 
 	proc *exec.Cmd
 	exit chan error
@@ -63,6 +65,7 @@ func (vtgate *VtgateProcess) Setup() (err error) {
 		"-mysql_auth_server_impl", vtgate.MySQLAuthServerImpl,
 		"-pid_file", vtgate.PidFile,
 	)
+	vtgate.proc.Args = append(vtgate.proc.Args, vtgate.ExtraArg...)
 
 	vtgate.proc.Stderr = os.Stderr
 	vtgate.proc.Stdout = os.Stdout
@@ -143,7 +146,7 @@ func (vtgate *VtgateProcess) TearDown() error {
 // VtgateProcessInstance returns a Vtgate handle for vtgate process
 // configured with the given Config.
 // The process must be manually started by calling setup()
-func VtgateProcessInstance(Port int, GrpcPort int, MySQLServerPort int, Cell string, CellsToWatch string, Hostname string, TabletTypesToWait string, topoPort int, hostname string) *VtgateProcess {
+func VtgateProcessInstance(Port int, GrpcPort int, MySQLServerPort int, Cell string, CellsToWatch string, Hostname string, TabletTypesToWait string, topoPort int, hostname string, ExtraArgs []string) *VtgateProcess {
 	vtctl := VtctlProcessInstance(topoPort, hostname)
 	vtgate := &VtgateProcess{
 		Name:                  "vtgate",
@@ -163,6 +166,7 @@ func VtgateProcessInstance(Port int, GrpcPort int, MySQLServerPort int, Cell str
 		CommonArg:             *vtctl,
 		PidFile:               path.Join(os.Getenv("VTDATAROOT"), "/tmp/vtgate.pid"),
 		MySQLAuthServerImpl:   "none",
+		ExtraArg:              ExtraArgs,
 	}
 
 	vtgate.VerifyURL = fmt.Sprintf("http://%s:%d/debug/vars", Hostname, Port)
