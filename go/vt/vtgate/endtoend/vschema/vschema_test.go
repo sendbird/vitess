@@ -127,13 +127,12 @@ func TestVSchema(t *testing.T) {
 
 	// Use the DDL to create an unsharded vschema and test again
 
-	// Create VSchema
+	// Create VSchema and do a Select to force update VSCHEMA
 	exec(t, conn, "begin")
 	exec(t, conn, "ALTER VSCHEMA ADD TABLE vt_user")
 	exec(t, conn, "select * from  vt_user")
 	exec(t, conn, "commit")
 
-	// Select to force update VSCHEMA
 	exec(t, conn, "begin")
 	exec(t, conn, "ALTER VSCHEMA ADD TABLE main")
 	exec(t, conn, "select * from  main")
