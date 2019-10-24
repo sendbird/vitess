@@ -24,6 +24,7 @@ import (
 	"path"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	vttestpb "vitess.io/vitess/go/vt/proto/vttest"
@@ -75,7 +76,7 @@ func TestMain(m *testing.M) {
 
 		cfg.TabletHostName = *tabletHostName
 
-		//List of users authorized to execute vschema ddl operations
+		// List of users authorized to execute vschema ddl operations
 		cfg.ExtraArg = append(cfg.ExtraArg, "-vschema_ddl_authorized_users=%")
 
 		cluster = &vttest.LocalCluster{
@@ -110,52 +111,60 @@ func TestVSchema(t *testing.T) {
 
 	// Test the blank database with no vschema
 	exec(t, conn, "insert into vt_user (id,name) values(1,'test1'), (2,'test2'), (3,'test3'), (4,'test4')")
+
 	qr := exec(t, conn, "select id, name from vt_user order by id")
-	if got, want := fmt.Sprintf("%v", qr.Rows), `[[INT64(1) VARCHAR("test1")] [INT64(2) VARCHAR("test2")] [INT64(3) VARCHAR("test3")] [INT64(4) VARCHAR("test4")]]`; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
+	got := fmt.Sprintf("%v", qr.Rows)
+	want := `[[INT64(1) VARCHAR("test1")] [INT64(2) VARCHAR("test2")] [INT64(3) VARCHAR("test3")] [INT64(4) VARCHAR("test4")]]`
+	assert.Equal(t, want, got)
 
 	qr = exec(t, conn, "delete from vt_user")
-	if got, want := fmt.Sprintf("%v", qr.Rows), `[]`; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
+	got = fmt.Sprintf("%v", qr.Rows)
+	want = `[]`
+	assert.Equal(t, want, got)
 
-	//Test Blank VSCHEMA
+	// Test Blank VSCHEMA
 	qr = exec(t, conn, "SHOW VSCHEMA TABLES")
-	if got, want := fmt.Sprintf("%v", qr.Rows), `[[VARCHAR("dual")]]`; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
+	got = fmt.Sprintf("%v", qr.Rows)
+	want = `[[VARCHAR("dual")]]`
+	assert.Equal(t, want, got)
 
-	//Use the DDL to create an unsharded vschema and test again
+	// Use the DDL to create an unsharded vschema and test again
 
-	//Create VSchema
+	// Create VSchema
 	exec(t, conn, "begin")
-	exec(t, conn, "ALTER VSCHEMA ADD TABLE main")
 	exec(t, conn, "ALTER VSCHEMA ADD TABLE vt_user")
+	exec(t, conn, "select * from  vt_user")
 	exec(t, conn, "commit")
 
-	//Test Showing Tables
-	qr = exec(t, conn, "SHOW VSCHEMA TABLES")
-	if got, want := fmt.Sprintf("%v", qr.Rows), `[[VARCHAR("dual")] [VARCHAR("main")] [VARCHAR("vt_user")]]`; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	//Test Showing Vindexes
-	qr = exec(t, conn, "SHOW VSCHEMA VINDEXES")
-	if got, want := fmt.Sprintf("%v", qr.Rows), `[]`; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
+	// Select to force update VSCHEMA
+	exec(t, conn, "begin")
+	exec(t, conn, "ALTER VSCHEMA ADD TABLE main")
+	exec(t, conn, "select * from  main")
+	exec(t, conn, "commit")
 
-	//Test DML operations
+	// Test Showing Tables
+	qr = exec(t, conn, "SHOW VSCHEMA TABLES")
+	got = fmt.Sprintf("%v", qr.Rows)
+	want = `[[VARCHAR("dual")] [VARCHAR("main")] [VARCHAR("vt_user")]]`
+	assert.Equal(t, want, got)
+
+	// Test Showing Vindexes
+	qr = exec(t, conn, "SHOW VSCHEMA VINDEXES")
+	got = fmt.Sprintf("%v", qr.Rows)
+	want = `[]`
+	assert.Equal(t, want, got)
+
+	// Test DML operations
 	exec(t, conn, "insert into vt_user (id,name) values(1,'test1'), (2,'test2'), (3,'test3'), (4,'test4')")
 	qr = exec(t, conn, "select id, name from vt_user order by id")
-	if got, want := fmt.Sprintf("%v", qr.Rows), `[[INT64(1) VARCHAR("test1")] [INT64(2) VARCHAR("test2")] [INT64(3) VARCHAR("test3")] [INT64(4) VARCHAR("test4")]]`; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
+	got = fmt.Sprintf("%v", qr.Rows)
+	want = `[[INT64(1) VARCHAR("test1")] [INT64(2) VARCHAR("test2")] [INT64(3) VARCHAR("test3")] [INT64(4) VARCHAR("test4")]]`
+	assert.Equal(t, want, got)
 
 	qr = exec(t, conn, "delete from vt_user")
-	if got, want := fmt.Sprintf("%v", qr.Rows), `[]`; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
+	got = fmt.Sprintf("%v", qr.Rows)
+	want = `[]`
+	assert.Equal(t, want, got)
 
 }
 
