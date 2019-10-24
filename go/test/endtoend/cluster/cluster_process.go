@@ -10,9 +10,6 @@ import (
 // DefaultCell : If no cell name is passed, then use following
 const DefaultCell = "zone1"
 
-//VtGateGrpcPort exported to use by multiple test cases
-var VtGateGrpcPort = 15028
-
 // LocalProcessCluster Testcases need to use this to iniate a cluster
 type LocalProcessCluster struct {
 	Keyspaces     []Keyspace
@@ -22,6 +19,7 @@ type LocalProcessCluster struct {
 	TopoPort      int
 
 	VtgateMySQLPort int
+	VtgateGrpcPort  int
 	VtctldHTTPPort  int
 
 	// standalone executable
@@ -167,7 +165,6 @@ func (cluster *LocalProcessCluster) StartKeyspace(keyspace Keyspace, shardNames 
 				cluster.vtctldProcess.Port,
 				tablet.Type,
 				cluster.topoProcess.Port,
-				cluster.Hostname,
 				cluster.VtTabletExtraArgs)
 			log.Info(fmt.Sprintf("Starting vttablet for tablet uid %d, grpc port %d", tablet.TabletUID, tablet.GrpcPort))
 
@@ -209,18 +206,20 @@ func (cluster *LocalProcessCluster) StartKeyspace(keyspace Keyspace, shardNames 
 // StartVtgate starts vtgate
 func (cluster *LocalProcessCluster) StartVtgate() (err error) {
 	vtgateHTTPPort := cluster.GetAndReservePort()
-	vtgateGrpcPort := VtGateGrpcPort //cluster.GetAndReservePort()
+	// In order to let client choose the grpc port for a VtGate
+	if cluster.VtgateGrpcPort == 0 {
+		cluster.VtgateGrpcPort = cluster.GetAndReservePort()
+	}
 	cluster.VtgateMySQLPort = cluster.GetAndReservePort()
 	log.Info(fmt.Sprintf("Starting vtgate on port %d", vtgateHTTPPort))
 	cluster.VtgateProcess = *VtgateProcessInstance(
 		vtgateHTTPPort,
-		vtgateGrpcPort,
+		cluster.VtgateGrpcPort,
 		cluster.VtgateMySQLPort,
 		cluster.Cell,
 		cluster.Cell,
 		cluster.Hostname, "MASTER,REPLICA",
 		cluster.topoProcess.Port,
-		cluster.Hostname,
 		cluster.VtGateExtraArgs)
 
 	log.Info(fmt.Sprintf("Vtgate started, connect to mysql using : mysql -h 127.0.0.1 -P %d", cluster.VtgateMySQLPort))

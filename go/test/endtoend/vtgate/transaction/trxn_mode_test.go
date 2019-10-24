@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package vtgate
+package transaction
 
 import (
 	"context"
@@ -97,10 +97,12 @@ func TestMain(m *testing.M) {
 
 	exitCode := func() int {
 		clusterInstance = &cluster.LocalProcessCluster{Cell: cell, Hostname: hostname}
-		//Set extra tablet args for twopc
+		// Reserver vtGate port inorder to pass it to vtTablet
+		clusterInstance.VtgateGrpcPort = clusterInstance.GetAndReservePort()
+		// Set extra tablet args for twopc
 		clusterInstance.VtTabletExtraArgs = []string{
 			"-twopc_enable",
-			"-twopc_coordinator_address", "localhost:15028",
+			"-twopc_coordinator_address", fmt.Sprintf("localhost:%d", clusterInstance.VtgateGrpcPort),
 			"-twopc_abandon_age", "3600",
 		}
 		defer clusterInstance.Teardown()
@@ -120,7 +122,7 @@ func TestMain(m *testing.M) {
 			return 1
 		}
 
-		//Starting Vtgate in SINGLE transaction mode
+		// Starting Vtgate in SINGLE transaction mode
 		clusterInstance.VtGateExtraArgs = []string{"-transaction_mode", "SINGLE"}
 		if err := clusterInstance.StartVtgate(); err != nil {
 			return 1
@@ -162,9 +164,9 @@ func TestTransactionModes(t *testing.T) {
 		t.Errorf("multi-db insert: %v, must contain %s", err, want)
 	}
 
-	//Enable TWOPC transaction mode
+	// Enable TWOPC transaction mode
 	clusterInstance.VtGateExtraArgs = []string{"-transaction_mode", "TWOPC"}
-	//Restart VtGate
+	// Restart VtGate
 	err = clusterInstance.VtgateProcess.TearDown()
 	if err != nil {
 		t.Errorf("Fail to kill vtgate for restart : %v", err)
@@ -191,7 +193,7 @@ func TestTransactionModes(t *testing.T) {
 	exec(t, conn2, "insert into twopc_lookup(name, id) values('Tim',7)")
 	exec(t, conn2, "commit")
 
-	//Verify the values are present
+	// Verify the values are present
 	qr := exec(t, conn2, "select user_id from twopc_user where name='mark'")
 	if got, want := fmt.Sprintf("%v", qr.Rows), `[[INT64(3)]]`; got != want {
 		t.Errorf("select:\n%v want\n%v", got, want)
@@ -201,13 +203,13 @@ func TestTransactionModes(t *testing.T) {
 		t.Errorf("select:\n%v want\n%v", got, want)
 	}
 
-	//DELETE from multiple tables using TWOPC trnx mode
+	// DELETE from multiple tables using TWOPC trnx mode
 	exec(t, conn2, "begin")
 	exec(t, conn2, "delete from twopc_user where user_id = 3")
 	exec(t, conn2, "delete from twopc_lookup where id = 3")
 	exec(t, conn2, "commit")
 
-	//VERIFY that values are deleted
+	// VERIFY that values are deleted
 	qr = exec(t, conn2, "select user_id from twopc_user where user_id=3")
 	if got, want := fmt.Sprintf("%v", qr.Rows), `[]`; got != want {
 		t.Errorf("select:\n%v want\n%v", got, want)

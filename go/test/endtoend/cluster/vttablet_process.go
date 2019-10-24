@@ -40,8 +40,8 @@ type VttabletProcess struct {
 	VtctldAddress               string
 	Directory                   string
 	VerifyURL                   string
-	//Extra Arg to be set before starting the vttablet process
-	ExtraArg []string
+	//Extra Args to be set before starting the vttablet process
+	ExtraArgs []string
 
 	proc *exec.Cmd
 	exit chan error
@@ -75,7 +75,7 @@ func (vttablet *VttabletProcess) Setup() (err error) {
 		"-vtctld_addr", vttablet.VtctldAddress,
 	)
 
-	vttablet.proc.Args = append(vttablet.proc.Args, vttablet.ExtraArg...)
+	vttablet.proc.Args = append(vttablet.proc.Args, vttablet.ExtraArgs...)
 
 	vttablet.proc.Stderr = os.Stderr
 	vttablet.proc.Stdout = os.Stdout
@@ -156,35 +156,35 @@ func (vttablet *VttabletProcess) TearDown() error {
 // VttabletProcessInstance returns a VttabletProcess handle for vttablet process
 // configured with the given Config.
 // The process must be manually started by calling setup()
-func VttabletProcessInstance(Port int, GrpcPort int, TabletUID int, Cell string, Shard string, Hostname string, Keyspace string, VtctldPort int, TabletType string, topoPort int, hostname string, extraArgs []string) *VttabletProcess {
+func VttabletProcessInstance(port int, grpcPort int, tabletUID int, cell string, shard string, hostname string, keyspace string, vtctldPort int, tabletType string, topoPort int, extraArgs []string) *VttabletProcess {
 	vtctl := VtctlProcessInstance(topoPort, hostname)
 	vttablet := &VttabletProcess{
 		Name:                        "vttablet",
 		Binary:                      "vttablet",
-		FileToLogQueries:            path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/tmp/vt_%010d/vttable.pid", TabletUID)),
-		Directory:                   path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/vt_%010d", TabletUID)),
-		TabletPath:                  fmt.Sprintf("%s-%010d", Cell, TabletUID),
+		FileToLogQueries:            path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/tmp/vt_%010d/vttable.pid", tabletUID)),
+		Directory:                   path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/vt_%010d", tabletUID)),
+		TabletPath:                  fmt.Sprintf("%s-%010d", cell, tabletUID),
 		ServiceMap:                  "grpc-queryservice,grpc-tabletmanager,grpc-updatestream",
 		LogDir:                      path.Join(os.Getenv("VTDATAROOT"), "/tmp"),
-		Shard:                       Shard,
-		TabletHostname:              Hostname,
-		Keyspace:                    Keyspace,
+		Shard:                       shard,
+		TabletHostname:              hostname,
+		Keyspace:                    keyspace,
 		TabletType:                  "replica",
 		CommonArg:                   *vtctl,
 		HealthCheckInterval:         5,
 		BackupStorageImplementation: "file",
 		FileBackupStorageRoot:       path.Join(os.Getenv("VTDATAROOT"), "/backups"),
-		Port:                        Port,
-		GrpcPort:                    GrpcPort,
-		PidFile:                     path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/vt_%010d/vttable.pid", TabletUID)),
-		VtctldAddress:               fmt.Sprintf("http://%s:%d", Hostname, VtctldPort),
-		ExtraArg:                    extraArgs,
+		Port:                        port,
+		GrpcPort:                    grpcPort,
+		PidFile:                     path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/vt_%010d/vttable.pid", tabletUID)),
+		VtctldAddress:               fmt.Sprintf("http://%s:%d", hostname, vtctldPort),
+		ExtraArgs:                   extraArgs,
 	}
 
-	if TabletType == "rdonly" {
-		vttablet.TabletType = TabletType
+	if tabletType == "rdonly" {
+		vttablet.TabletType = tabletType
 	}
-	vttablet.VerifyURL = fmt.Sprintf("http://%s:%d/debug/vars", Hostname, Port)
+	vttablet.VerifyURL = fmt.Sprintf("http://%s:%d/debug/vars", hostname, port)
 
 	return vttablet
 }
