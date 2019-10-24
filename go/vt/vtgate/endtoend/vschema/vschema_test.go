@@ -56,49 +56,46 @@ create table main (
 func TestMain(m *testing.M) {
 	flag.Parse()
 
-	exitCode := func() int {
-		var cfg vttest.Config
-		cfg.Topology = &vttestpb.VTTestTopology{
-			Keyspaces: []*vttestpb.Keyspace{{
-				Name: "ks",
-				Shards: []*vttestpb.Shard{{
-					Name: "80",
-				}},
+	var cfg vttest.Config
+	cfg.Topology = &vttestpb.VTTestTopology{
+		Keyspaces: []*vttestpb.Keyspace{{
+			Name: "ks",
+			Shards: []*vttestpb.Shard{{
+				Name: "80",
 			}},
-		}
-		cfg.ExtraMyCnf = []string{path.Join(os.Getenv("VTTOP"), "config/mycnf/rbr.cnf")}
-		if err := cfg.InitSchemas("ks", schema, nil); err != nil {
-			fmt.Fprintf(os.Stderr, "%v\n", err)
-			os.RemoveAll(cfg.SchemaDir)
-			return 1
-		}
-		defer os.RemoveAll(cfg.SchemaDir)
+		}},
+	}
+	cfg.ExtraMyCnf = []string{path.Join(os.Getenv("VTTOP"), "config/mycnf/rbr.cnf")}
+	if err := cfg.InitSchemas("ks", schema, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.RemoveAll(cfg.SchemaDir)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(cfg.SchemaDir)
 
-		cfg.TabletHostName = *tabletHostName
+	cfg.TabletHostName = *tabletHostName
 
-		// List of users authorized to execute vschema ddl operations
-		cfg.ExtraArg = append(cfg.ExtraArg, "-vschema_ddl_authorized_users=%")
+	// List of users authorized to execute vschema ddl operations
+	cfg.ExtraArg = append(cfg.ExtraArg, "-vschema_ddl_authorized_users=%")
 
-		cluster = &vttest.LocalCluster{
-			Config: cfg,
-		}
-		if err := cluster.Setup(); err != nil {
-			fmt.Fprintf(os.Stderr, "%v\n", err)
-			cluster.TearDown()
-			return 1
-		}
-		defer cluster.TearDown()
+	cluster = &vttest.LocalCluster{
+		Config: cfg,
+	}
+	if err := cluster.Setup(); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		cluster.TearDown()
+		os.Exit(1)
+	}
+	defer cluster.TearDown()
 
-		vtParams = mysql.ConnParams{
-			Host: "localhost",
-			Port: cluster.Env.PortForProtocol("vtcombo_mysql_port", ""),
-		}
-		mysqlParams = cluster.MySQLConnParams()
-		grpcAddress = fmt.Sprintf("localhost:%d", cluster.Env.PortForProtocol("vtcombo", "grpc"))
+	vtParams = mysql.ConnParams{
+		Host: "localhost",
+		Port: cluster.Env.PortForProtocol("vtcombo_mysql_port", ""),
+	}
+	mysqlParams = cluster.MySQLConnParams()
+	grpcAddress = fmt.Sprintf("localhost:%d", cluster.Env.PortForProtocol("vtcombo", "grpc"))
 
-		return m.Run()
-	}()
-	os.Exit(exitCode)
+	os.Exit(m.Run())
 }
 
 func TestVSchema(t *testing.T) {
