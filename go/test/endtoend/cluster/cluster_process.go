@@ -194,9 +194,11 @@ func (cluster *LocalProcessCluster) StartKeyspace(keyspace Keyspace, shardNames 
 	}
 
 	//Apply VSchema
-	if err = cluster.VtctlclientProcess.ApplyVSchema(keyspace.Name, keyspace.VSchema); err != nil {
-		log.Error(err.Error())
-		return
+	if keyspace.VSchema != "" {
+		if err = cluster.VtctlclientProcess.ApplyVSchema(keyspace.Name, keyspace.VSchema); err != nil {
+			log.Error(err.Error())
+			return
+		}
 	}
 
 	log.Info("Done creating keyspace : " + keyspace.Name)
