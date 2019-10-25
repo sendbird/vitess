@@ -97,46 +97,52 @@ var (
 func TestMain(m *testing.M) {
 	flag.Parse()
 
-	clusterInstance = &cluster.LocalProcessCluster{Cell: cell, Hostname: hostname}
-	// Reserver vtGate port inorder to pass it to vtTablet
-	clusterInstance.VtgateGrpcPort = clusterInstance.GetAndReservePort()
-	// Set extra tablet args for twopc
-	clusterInstance.VtTabletExtraArgs = []string{
-		"-twopc_enable",
-		"-twopc_coordinator_address", fmt.Sprintf("localhost:%d", clusterInstance.VtgateGrpcPort),
-		"-twopc_abandon_age", "3600",
-	}
-	defer clusterInstance.Teardown()
+	exitcode, err := func() (int, error) {
+		clusterInstance = &cluster.LocalProcessCluster{Cell: cell, Hostname: hostname}
+		defer clusterInstance.Teardown()
 
-	// Start topo server
-	if err := clusterInstance.StartTopo(); err != nil {
+		// Reserver vtGate port inorder to pass it to vtTablet
+		clusterInstance.VtgateGrpcPort = clusterInstance.GetAndReservePort()
+		// Set extra tablet args for twopc
+		clusterInstance.VtTabletExtraArgs = []string{
+			"-twopc_enable",
+			"-twopc_coordinator_address", fmt.Sprintf("localhost:%d", clusterInstance.VtgateGrpcPort),
+			"-twopc_abandon_age", "3600",
+		}
+
+		// Start topo server
+		if err := clusterInstance.StartTopo(); err != nil {
+			return 1, err
+		}
+
+		// Start keyspace
+		keyspace := &cluster.Keyspace{
+			Name:      keyspaceName,
+			SchemaSQL: sqlSchema,
+			VSchema:   vSchema,
+		}
+		if err := clusterInstance.StartKeyspace(*keyspace, []string{"-80", "80-"}, 1, false); err != nil {
+			return 1, err
+		}
+
+		// Starting Vtgate in SINGLE transaction mode
+		clusterInstance.VtGateExtraArgs = []string{"-transaction_mode", "SINGLE"}
+		if err := clusterInstance.StartVtgate(); err != nil {
+			return 1, err
+		}
+		vtParams = mysql.ConnParams{
+			Host: clusterInstance.Hostname,
+			Port: clusterInstance.VtgateMySQLPort,
+		}
+
+		return m.Run(), nil
+	}()
+	if err != nil {
 		fmt.Printf("%v\n", err)
 		os.Exit(1)
+	} else {
+		os.Exit(exitcode)
 	}
-
-	// Start keyspace
-	keyspace := &cluster.Keyspace{
-		Name:      keyspaceName,
-		SchemaSQL: sqlSchema,
-		VSchema:   vSchema,
-	}
-	if err := clusterInstance.StartKeyspace(*keyspace, []string{"-80", "80-"}, 1, false); err != nil {
-		fmt.Printf("%v\n", err)
-		os.Exit(1)
-	}
-
-	// Starting Vtgate in SINGLE transaction mode
-	clusterInstance.VtGateExtraArgs = []string{"-transaction_mode", "SINGLE"}
-	if err := clusterInstance.StartVtgate(); err != nil {
-		fmt.Printf("%v\n", err)
-		os.Exit(1)
-	}
-	vtParams = mysql.ConnParams{
-		Host: clusterInstance.Hostname,
-		Port: clusterInstance.VtgateMySQLPort,
-	}
-
-	os.Exit(m.Run())
 }
 
 func exec(t *testing.T, conn *mysql.Conn, query string) *sqltypes.Result {
