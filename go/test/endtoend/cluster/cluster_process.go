@@ -226,6 +226,21 @@ func (cluster *LocalProcessCluster) StartVtgate() (err error) {
 	return cluster.VtgateProcess.Setup()
 }
 
+// ReStartVtgate starts vtgate with updated configs
+func (cluster *LocalProcessCluster) ReStartVtgate() (err error) {
+	err = cluster.VtgateProcess.TearDown()
+	if err != nil {
+		log.Error(err.Error())
+		return
+	}
+	err = cluster.StartVtgate()
+	if err != nil {
+		log.Error(err.Error())
+		return
+	}
+	return err
+}
+
 // Teardown brings down the cluster by invoking teardown for individual processes
 func (cluster *LocalProcessCluster) Teardown() (err error) {
 	if err = cluster.VtgateProcess.TearDown(); err != nil {

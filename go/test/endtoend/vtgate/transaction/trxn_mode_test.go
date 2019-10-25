@@ -24,6 +24,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/test/endtoend/cluster"
@@ -168,15 +170,11 @@ func TestTransactionModes(t *testing.T) {
 	// Enable TWOPC transaction mode
 	clusterInstance.VtGateExtraArgs = []string{"-transaction_mode", "TWOPC"}
 	// Restart VtGate
-	err = clusterInstance.VtgateProcess.TearDown()
-	if err != nil {
-		t.Errorf("Fail to kill vtgate for restart : %v", err)
-	}
-	err = clusterInstance.StartVtgate()
-	if err != nil {
-		t.Errorf("Fail to start vtgate with new config:  %v", err)
+	if err = clusterInstance.ReStartVtgate(); err != nil {
+		t.Errorf("Fail to re-start vtgate with new config:  %v", err)
 	}
 
+	// Make a new mysql connection to vtGate
 	vtParams = mysql.ConnParams{
 		Host: clusterInstance.Hostname,
 		Port: clusterInstance.VtgateMySQLPort,
@@ -196,13 +194,14 @@ func TestTransactionModes(t *testing.T) {
 
 	// Verify the values are present
 	qr := exec(t, conn2, "select user_id from twopc_user where name='mark'")
-	if got, want := fmt.Sprintf("%v", qr.Rows), `[[INT64(3)]]`; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
+	got := fmt.Sprintf("%v", qr.Rows)
+	want = `[[INT64(3)]]`
+	assert.Equal(t, want, got)
+
 	qr = exec(t, conn2, "select name from twopc_lookup where id=3")
-	if got, want := fmt.Sprintf("%v", qr.Rows), `[[VARCHAR("mark")]]`; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
+	got = fmt.Sprintf("%v", qr.Rows)
+	want = `[[VARCHAR("mark")]]`
+	assert.Equal(t, want, got)
 
 	// DELETE from multiple tables using TWOPC trnx mode
 	exec(t, conn2, "begin")
@@ -212,11 +211,12 @@ func TestTransactionModes(t *testing.T) {
 
 	// VERIFY that values are deleted
 	qr = exec(t, conn2, "select user_id from twopc_user where user_id=3")
-	if got, want := fmt.Sprintf("%v", qr.Rows), `[]`; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
+	got = fmt.Sprintf("%v", qr.Rows)
+	want = `[]`
+	assert.Equal(t, want, got)
+
 	qr = exec(t, conn2, "select name from twopc_lookup where id=3")
-	if got, want := fmt.Sprintf("%v", qr.Rows), `[]`; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
+	got = fmt.Sprintf("%v", qr.Rows)
+	want = `[]`
+	assert.Equal(t, want, got)
 }
