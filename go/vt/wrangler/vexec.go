@@ -410,6 +410,9 @@ type ReplicationStatus struct {
 	// Tags contain the tags specified for this stream
 	Tags string
 
+	WorkflowType    string
+	WorkflowSubType string
+
 	// CopyState represents the rows from the _vt.copy_state table.
 	CopyState []copyState
 }
@@ -418,6 +421,7 @@ func (wr *Wrangler) getReplicationStatusFromRow(ctx context.Context, row sqltype
 	var err error
 	var id, timeUpdated, transactionTimestamp, timeHeartbeat int64
 	var state, dbName, pos, stopPos, message, tags string
+	var workflowType, workflowSubType int64
 	var bls binlogdatapb.BinlogSource
 	var mpos mysql.Position
 
@@ -477,6 +481,9 @@ func (wr *Wrangler) getReplicationStatusFromRow(ctx context.Context, row sqltype
 	if err != nil {
 		return nil, "", err
 	}
+	workflowType, _ = row.ToInt64("workflow_type")
+	workflowSubType, _ = row.ToInt64("workflow_sub_type")
+
 	status := &ReplicationStatus{
 		Shard:                primary.Shard,
 		Tablet:               primary.AliasString(),
@@ -491,6 +498,8 @@ func (wr *Wrangler) getReplicationStatusFromRow(ctx context.Context, row sqltype
 		TimeHeartbeat:        timeHeartbeat,
 		Message:              message,
 		Tags:                 tags,
+		WorkflowType:         binlogdatapb.VReplicationWorkflowType_name[int32(workflowType)],
+		WorkflowSubType:      binlogdatapb.VReplicationWorkflowSubType_name[int32(workflowSubType)],
 	}
 	status.CopyState, err = wr.getCopyState(ctx, primary, id)
 	if err != nil {
@@ -506,7 +515,7 @@ func (wr *Wrangler) getStreams(ctx context.Context, workflow, keyspace string) (
 	rsr.ShardStatuses = make(map[string]*ShardReplicationStatus)
 	rsr.Workflow = workflow
 	var results map[*topo.TabletInfo]*querypb.QueryResult
-	query := "select id, source, pos, stop_pos, max_replication_lag, state, db_name, time_updated, transaction_timestamp, time_heartbeat, message, tags from _vt.vreplication"
+	query := "select id, source, pos, stop_pos, max_replication_lag, state, db_name, time_updated, transaction_timestamp, time_heartbeat, message, tags, workflow_type, workflow_sub_type from _vt.vreplication"
 	results, err := wr.runVexec(ctx, workflow, keyspace, query, false)
 	if err != nil {
 		return nil, err

@@ -275,7 +275,7 @@ func (ct *controller) runBlp(ctx context.Context) (err error) {
 			if errSetting != nil {
 				return err // yes, err and not errSetting.
 			}
-			if settings.WorkflowType == int64(binlogdatapb.VReplicationWorkflowType_ONLINEDDL) {
+			if settings.WorkflowType == int64(binlogdatapb.VReplicationWorkflowType_OnlineDDL) {
 				// Specific to OnlineDDL, if we encounter an "unrecoverable error", we change the migration state into Error and then we quit the workflow
 				if errSetState := vr.setState(binlogplayer.BlpError, err.Error()); errSetState != nil {
 					return err // yes, err and not errSetState.

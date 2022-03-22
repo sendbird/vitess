@@ -60,6 +60,7 @@ type materializer struct {
 	targetVSchema *vindexes.KeyspaceSchema
 	sourceShards  []*topo.ShardInfo
 	targetShards  []*topo.ShardInfo
+	isPartial     bool
 }
 
 const (
@@ -119,7 +120,7 @@ func shouldInclude(table string, excludes []string) bool {
 // MoveTables initiates moving table(s) over to another keyspace
 func (wr *Wrangler) MoveTables(ctx context.Context, workflow, sourceKeyspace, targetKeyspace, tableSpecs,
 	cell, tabletTypes string, allTables bool, excludeTables string, autoStart, stopAfterCopy bool,
-	externalCluster string, dropForeignKeys bool) error {
+	externalCluster string, dropForeignKeys bool, sourceShards []string) error {
 	//FIXME validate tableSpecs, allTables, excludeTables
 	var tables []string
 	var externalTopo *topo.Server
@@ -243,8 +244,8 @@ func (wr *Wrangler) MoveTables(ctx context.Context, workflow, sourceKeyspace, ta
 		TabletTypes:           tabletTypes,
 		StopAfterCopy:         stopAfterCopy,
 		ExternalCluster:       externalCluster,
+		SourceShards:          sourceShards,
 	}
-
 	createDDLMode := createDDLAsCopy
 	if dropForeignKeys {
 		createDDLMode = createDDLAsCopyDropForeignKeys
@@ -926,14 +927,42 @@ func (wr *Wrangler) buildMaterializer(ctx context.Context, ms *vtctldatapb.Mater
 			}
 		}
 	}
-
+	isPartial := false
 	sourceShards, err := wr.sourceTs.GetServingShards(ctx, ms.SourceKeyspace)
 	if err != nil {
 		return nil, err
 	}
+	if len(ms.SourceShards) > 0 {
+		isPartial = true
+		var sourceShards2 []*topo.ShardInfo
+		for _, shard := range sourceShards {
+			for _, shard2 := range ms.SourceShards {
+				if shard.ShardName() == shard2 {
+					sourceShards2 = append(sourceShards2, shard)
+					break
+				}
+			}
+		}
+		sourceShards = sourceShards2
+	}
 	targetShards, err := wr.ts.GetServingShards(ctx, ms.TargetKeyspace)
 	if err != nil {
 		return nil, err
+	}
+	if len(ms.SourceShards) > 0 {
+		var targetShards2 []*topo.ShardInfo
+		for _, shard := range targetShards {
+			for _, shard2 := range ms.SourceShards {
+				if shard.ShardName() == shard2 {
+					targetShards2 = append(targetShards2, shard)
+					break
+				}
+			}
+		}
+		targetShards = targetShards2
+	}
+	if len(sourceShards) == 0 || len(targetShards) == 0 {
+		return nil, fmt.Errorf("no source and/or target shards specified for workflow %s ", ms.Workflow)
 	}
 	return &materializer{
 		wr:            wr,
@@ -941,6 +970,7 @@ func (wr *Wrangler) buildMaterializer(ctx context.Context, ms *vtctldatapb.Mater
 		targetVSchema: targetVSchema,
 		sourceShards:  sourceShards,
 		targetShards:  targetShards,
+		isPartial:     isPartial,
 	}, nil
 }
 
@@ -1210,7 +1240,13 @@ func (mz *materializer) generateInserts(ctx context.Context, targetShard *topo.S
 
 			bls.Filter.Rules = append(bls.Filter.Rules, rule)
 		}
-		ig.AddRow(mz.ms.Workflow, bls, "", mz.ms.Cell, mz.ms.TabletTypes)
+		workflowSubType := binlogdatapb.VReplicationWorkflowSubType_None
+		if mz.isPartial {
+			workflowSubType = binlogdatapb.VReplicationWorkflowSubType_Partial
+		}
+		ig.AddRow(mz.ms.Workflow, bls, "", mz.ms.Cell, mz.ms.TabletTypes,
+			int64(mz.ms.MaterializationIntent),
+			int64(workflowSubType))
 	}
 	return ig.String(), nil
 }

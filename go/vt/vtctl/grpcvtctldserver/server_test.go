@@ -479,6 +479,9 @@ func TestApplyVSchema(t *testing.T) {
 					RoutingRules: &vschemapb.RoutingRules{
 						Rules: []*vschemapb.RoutingRule{},
 					},
+					ShardRoutingRules: &vschemapb.ShardRoutingRules{
+						Rules: []*vschemapb.ShardRoutingRule{},
+					},
 				}
 				utils.MustMatch(t, changedSrvVSchema, finalSrvVSchema)
 			}

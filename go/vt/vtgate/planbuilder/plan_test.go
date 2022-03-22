@@ -635,6 +635,10 @@ func (vw *vschemaWrapper) currentDb() string {
 	return ksName
 }
 
+func (vw *vschemaWrapper) FindRoutedShard(keyspace, shard string) (string, error) {
+	return "", nil
+}
+
 func escapeNewLines(in string) string {
 	return strings.ReplaceAll(in, "\n", "\\n")
 }

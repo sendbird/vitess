@@ -50,6 +50,9 @@ type VSchema interface {
 
 	// ForeignKeyMode returns the foreign_key flag value
 	ForeignKeyMode() string
+
+	// FindRoutedShard looks up shard routing rules for a shard
+	FindRoutedShard(keyspace, shard string) (string, error)
 }
 
 // PlannerNameToVersion returns the numerical representation of the planner

@@ -17,26 +17,48 @@ limitations under the License.
 package planbuilder
 
 import (
+	"fmt"
+
 	"vitess.io/vitess/go/vt/key"
+	"vitess.io/vitess/go/vt/log"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
+	"vitess.io/vitess/go/vt/vtgate/vindexes"
 )
 
+// cache shard name to vindexes.Keyspace for optimization. key is <source_keyspace>.<shard>
+var shardRouteMap map[string]*vindexes.Keyspace
+
+func init() {
+	shardRouteMap = make(map[string]*vindexes.Keyspace)
+}
+
 func buildPlanForBypass(stmt sqlparser.Statement, _ *sqlparser.ReservedVars, vschema plancontext.VSchema) (engine.Primitive, error) {
+	keyspace, err := vschema.DefaultKeyspace()
+	if err != nil {
+		return nil, err
+	}
+
 	switch vschema.Destination().(type) {
 	case key.DestinationExactKeyRange:
 		if _, ok := stmt.(*sqlparser.Insert); ok {
 			return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "INSERT not supported when targeting a key range: %s", vschema.TargetString())
 		}
+	case key.DestinationShard:
+		shard := string(vschema.Destination().(key.DestinationShard))
+		targetKeyspace, err := getShardRoute(vschema, keyspace.Name, shard)
+		if err != nil {
+			return nil, err
+		}
+		if targetKeyspace != nil {
+			log.Infof("Routing shard %s to from keyspace %s to keyspace %s", shard, keyspace.Name, targetKeyspace.Name) // todo: remove
+			keyspace = targetKeyspace
+		}
 	}
 
-	keyspace, err := vschema.DefaultKeyspace()
-	if err != nil {
-		return nil, err
-	}
 	return &engine.Send{
 		Keyspace:             keyspace,
 		TargetDestination:    vschema.Destination(),
@@ -45,4 +67,28 @@ func buildPlanForBypass(stmt sqlparser.Statement, _ *sqlparser.ReservedVars, vsc
 		SingleShardOnly:      false,
 		MultishardAutocommit: sqlparser.MultiShardAutocommitDirective(stmt),
 	}, nil
+}
+
+func getShardRoute(vschema plancontext.VSchema, keyspace, shard string) (*vindexes.Keyspace, error) {
+	shardRouteKey := fmt.Sprintf("%s.%s", keyspace, shard)
+	if ks, ok := shardRouteMap[shardRouteKey]; ok {
+		return ks, nil
+	}
+	targetKeyspaceName, err := vschema.FindRoutedShard(keyspace, shard)
+	if err != nil {
+		return nil, err
+	}
+	if targetKeyspaceName != keyspace {
+		keyspaces, err := vschema.AllKeyspace()
+		if err != nil {
+			return nil, err
+		}
+		for _, ks := range keyspaces {
+			if ks.Name == targetKeyspaceName {
+				shardRouteMap[shardRouteKey] = ks // store route from source to target ks for this shard
+				return ks, nil
+			}
+		}
+	}
+	return nil, nil
 }

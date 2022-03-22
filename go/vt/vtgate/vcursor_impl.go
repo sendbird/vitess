@@ -924,3 +924,7 @@ func (vc *vcursorImpl) MessageStream(rss []*srvtopo.ResolvedShard, tableName str
 func (vc *vcursorImpl) VStream(rss []*srvtopo.ResolvedShard, filter *binlogdatapb.Filter, gtid string, callback func(evs []*binlogdatapb.VEvent) error) error {
 	return vc.executor.ExecuteVStream(vc.ctx, rss, filter, gtid, callback)
 }
+
+func (vc *vcursorImpl) FindRoutedShard(keyspace, shard string) (string, error) {
+	return vc.vschema.FindRoutedShard(keyspace, shard)
+}

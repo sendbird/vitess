@@ -53,7 +53,7 @@ type testResharderEnv struct {
 }
 
 var (
-	testMode = "" //"debug"
+	testMode = "debug"
 )
 
 //----------------------------------------------

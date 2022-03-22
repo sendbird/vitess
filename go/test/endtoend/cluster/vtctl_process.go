@@ -41,7 +41,7 @@ type VtctlProcess struct {
 // AddCellInfo executes vtctl command to add cell info
 func (vtctl *VtctlProcess) AddCellInfo(Cell string) (err error) {
 	tmpProcess := exec.Command(
-		vtctl.Binary,
+		"vtctl",
 		"--topo_implementation", vtctl.TopoImplementation,
 		"--topo_global_server_address", vtctl.TopoGlobalAddress,
 		"--topo_global_root", vtctl.TopoGlobalRoot,
