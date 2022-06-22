@@ -38,6 +38,7 @@ type Plan struct {
 	Warnings     []*query.QueryWarning   // Warnings that need to be yielded every time this query runs
 
 	// TableInfo contains a slice of "<keyspace_name>.<table_name>" strings
+
 	TableInfo []string
 
 	ExecCount    uint64 // Count of times this plan was executed
