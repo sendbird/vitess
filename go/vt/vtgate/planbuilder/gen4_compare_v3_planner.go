@@ -111,7 +111,8 @@ func preliminaryChecks(statement sqlparser.Statement) (bool, bool, error) {
 func planWithPlannerVersion(statement sqlparser.Statement, vars *sqlparser.ReservedVars, ctxVSchema plancontext.VSchema, query string, version plancontext.PlannerVersion) (engine.Primitive, error) {
 	ctxVSchema.SetPlannerVersion(version)
 	stmt := sqlparser.CloneStatement(statement)
-	return createInstructionFor(query, stmt, vars, ctxVSchema, false, false)
+	primitive, _, err := createInstructionFor(query, stmt, vars, ctxVSchema, false, false)
+	return primitive, err
 }
 
 // hasLockPrimitive recursively walks through the given primitive and its children

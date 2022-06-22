@@ -75,7 +75,7 @@ func TestBuilder(query string, vschema plancontext.VSchema, keyspace string) (*e
 
 // BuildFromStmt builds a plan based on the AST provided.
 func BuildFromStmt(query string, stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema, bindVarNeeds *sqlparser.BindVarNeeds, enableOnlineDDL, enableDirectDDL bool) (*engine.Plan, error) {
-	instruction, err := createInstructionFor(query, stmt, reservedVars, vschema, enableOnlineDDL, enableDirectDDL)
+	instruction, tableInfo, err := createInstructionFor(query, stmt, reservedVars, vschema, enableOnlineDDL, enableDirectDDL)
 	if err != nil {
 		return nil, err
 	}
@@ -84,6 +84,7 @@ func BuildFromStmt(query string, stmt sqlparser.Statement, reservedVars *sqlpars
 		Original:     query,
 		Instructions: instruction,
 		BindVarNeeds: bindVarNeeds,
+		TableInfo:    tableInfo,
 	}
 	return plan, nil
 }
@@ -161,76 +162,176 @@ func buildRoutePlan(stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVa
 
 type stmtPlanner func(sqlparser.Statement, *sqlparser.ReservedVars, plancontext.VSchema) (engine.Primitive, error)
 
-func createInstructionFor(query string, stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema, enableOnlineDDL, enableDirectDDL bool) (engine.Primitive, error) {
+func createInstructionFor(query string, stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema, enableOnlineDDL, enableDirectDDL bool) (engine.Primitive, []string, error) {
 	switch stmt := stmt.(type) {
 	case *sqlparser.Select:
 		configuredPlanner, err := getConfiguredPlanner(vschema, buildSelectPlan, stmt, query)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return buildRoutePlan(stmt, reservedVars, vschema, configuredPlanner)
+		prim, err := buildRoutePlan(stmt, reservedVars, vschema, configuredPlanner)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.Insert:
-		return buildRoutePlan(stmt, reservedVars, vschema, buildInsertPlan)
+		prim, err := buildRoutePlan(stmt, reservedVars, vschema, buildInsertPlan)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.Update:
 		configuredPlanner, err := getConfiguredPlanner(vschema, buildUpdatePlan, stmt, query)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return buildRoutePlan(stmt, reservedVars, vschema, configuredPlanner)
+		prim, err := buildRoutePlan(stmt, reservedVars, vschema, configuredPlanner)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.Delete:
-		return buildRoutePlan(stmt, reservedVars, vschema, buildDeletePlan)
+		prim, err := buildRoutePlan(stmt, reservedVars, vschema, buildDeletePlan)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.Union:
 		configuredPlanner, err := getConfiguredPlanner(vschema, buildUnionPlan, stmt, query)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return buildRoutePlan(stmt, reservedVars, vschema, configuredPlanner)
+		prim, err := buildRoutePlan(stmt, reservedVars, vschema, configuredPlanner)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case sqlparser.DDLStatement:
-		return buildGeneralDDLPlan(query, stmt, reservedVars, vschema, enableOnlineDDL, enableDirectDDL)
+		prim, err := buildGeneralDDLPlan(query, stmt, reservedVars, vschema, enableOnlineDDL, enableDirectDDL)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.AlterMigration:
-		return buildAlterMigrationPlan(query, vschema, enableOnlineDDL)
+		prim, err := buildAlterMigrationPlan(query, vschema, enableOnlineDDL)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.RevertMigration:
-		return buildRevertMigrationPlan(query, stmt, vschema, enableOnlineDDL)
+		prim, err := buildRevertMigrationPlan(query, stmt, vschema, enableOnlineDDL)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.ShowMigrationLogs:
-		return buildShowMigrationLogsPlan(query, vschema, enableOnlineDDL)
+		prim, err := buildShowMigrationLogsPlan(query, vschema, enableOnlineDDL)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.ShowThrottledApps:
-		return buildShowThrottledAppsPlan(query, vschema)
+		prim, err := buildShowThrottledAppsPlan(query, vschema)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.AlterVschema:
-		return buildVSchemaDDLPlan(stmt, vschema)
+		prim, err := buildVSchemaDDLPlan(stmt, vschema)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.Use:
-		return buildUsePlan(stmt, vschema)
+		prim, err := buildUsePlan(stmt, vschema)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case sqlparser.Explain:
-		return buildExplainPlan(stmt, reservedVars, vschema, enableOnlineDDL, enableDirectDDL)
+		prim, err := buildExplainPlan(stmt, reservedVars, vschema, enableOnlineDDL, enableDirectDDL)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.OtherRead, *sqlparser.OtherAdmin:
-		return buildOtherReadAndAdmin(query, vschema)
+		prim, err := buildOtherReadAndAdmin(query, vschema)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.Set:
-		return buildSetPlan(stmt, vschema)
+		prim, err := buildSetPlan(stmt, vschema)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.Load:
-		return buildLoadPlan(query, vschema)
+		prim, err := buildLoadPlan(query, vschema)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case sqlparser.DBDDLStatement:
-		return buildRoutePlan(stmt, reservedVars, vschema, buildDBDDLPlan)
+		prim, err := buildRoutePlan(stmt, reservedVars, vschema, buildDBDDLPlan)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.SetTransaction:
-		return buildRoutePlan(stmt, reservedVars, vschema, buildSetTxPlan)
+		prim, err := buildRoutePlan(stmt, reservedVars, vschema, buildSetTxPlan)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.Begin, *sqlparser.Commit, *sqlparser.Rollback, *sqlparser.Savepoint, *sqlparser.SRollback, *sqlparser.Release:
 		// Empty by design. Not executed by a plan
-		return nil, nil
+		return nil, nil, nil
 	case *sqlparser.Show:
-		return buildShowPlan(query, stmt, reservedVars, vschema)
+		prim, err := buildShowPlan(query, stmt, reservedVars, vschema)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.LockTables:
-		return buildRoutePlan(stmt, reservedVars, vschema, buildLockPlan)
+		prim, err := buildRoutePlan(stmt, reservedVars, vschema, buildLockPlan)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.UnlockTables:
-		return buildRoutePlan(stmt, reservedVars, vschema, buildUnlockPlan)
+		prim, err := buildRoutePlan(stmt, reservedVars, vschema, buildUnlockPlan)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.Flush:
-		return buildFlushPlan(stmt, vschema)
+		prim, err := buildFlushPlan(stmt, vschema)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.CallProc:
-		return buildCallProcPlan(stmt, vschema)
+		prim, err := buildCallProcPlan(stmt, vschema)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.Stream:
-		return buildStreamPlan(stmt, vschema)
+		prim, err := buildStreamPlan(stmt, vschema)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	case *sqlparser.VStream:
-		return buildVStreamPlan(stmt, vschema)
+		prim, err := buildVStreamPlan(stmt, vschema)
+		if err != nil {
+			return nil, nil, err
+		}
+		return prim, nil, nil
 	}
 
-	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "BUG: unexpected statement type: %T", stmt)
+	return nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "BUG: unexpected statement type: %T", stmt)
 }
 
 func buildDBDDLPlan(stmt sqlparser.Statement, _ *sqlparser.ReservedVars, vschema plancontext.VSchema) (engine.Primitive, error) {

@@ -54,6 +54,12 @@ type LogStats struct {
 	ExecuteTime   time.Duration
 	CommitTime    time.Duration
 	Error         error
+
+	// This is the new way of reporting tables used by a query.
+	// It contains a slice of "<keyspace_name>.<table_name>" strings. Tables are listed in it only once,
+	// even if they are used multiple times in the query.
+	// This is preferred over Table/Keyspace which handles multiple tables badly.
+	Tables []string
 }
 
 // NewLogStats constructs a new LogStats with supplied Method and ctx

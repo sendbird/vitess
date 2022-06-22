@@ -37,6 +37,9 @@ type Plan struct {
 	BindVarNeeds *sqlparser.BindVarNeeds // Stores BindVars needed to be provided as part of expression rewriting
 	Warnings     []*query.QueryWarning   // Warnings that need to be yielded every time this query runs
 
+	// TableInfo contains a slice of "<keyspace_name>.<table_name>" strings
+	TableInfo []string
+
 	ExecCount    uint64 // Count of times this plan was executed
 	ExecTime     uint64 // Total execution time
 	ShardQueries uint64 // Total number of shard queries
