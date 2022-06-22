@@ -32,14 +32,16 @@ import (
 var _ stmtPlanner = gen4Planner("apa", 0)
 
 func gen4Planner(query string, plannerVersion querypb.ExecuteOptions_PlannerVersion) stmtPlanner {
-	return func(stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema) (engine.Primitive, error) {
+	return func(stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema) (engine.Primitive, []string, error) {
 		switch stmt := stmt.(type) {
 		case sqlparser.SelectStatement:
-			return gen4SelectStmtPlanner(query, plannerVersion, stmt, reservedVars, vschema)
+			prim, err := gen4SelectStmtPlanner(query, plannerVersion, stmt, reservedVars, vschema)
+			return prim, nil, err
 		case *sqlparser.Update:
-			return gen4UpdateStmtPlanner(plannerVersion, stmt, reservedVars, vschema)
+			prim, err := gen4UpdateStmtPlanner(plannerVersion, stmt, reservedVars, vschema)
+			return prim, nil, err
 		default:
-			return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "%T not yet supported", stmt)
+			return nil, nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "%T not yet supported", stmt)
 		}
 	}
 }

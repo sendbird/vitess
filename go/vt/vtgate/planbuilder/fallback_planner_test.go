@@ -39,7 +39,7 @@ type testPlanner struct {
 
 var _ stmtPlanner = (*testPlanner)(nil).plan
 
-func (tp *testPlanner) plan(statement sqlparser.Statement, vars *sqlparser.ReservedVars, schema plancontext.VSchema) (engine.Primitive, error) {
+func (tp *testPlanner) plan(statement sqlparser.Statement, vars *sqlparser.ReservedVars, schema plancontext.VSchema) (engine.Primitive, []string, error) {
 	tp.called = true
 	if tp.panic != nil {
 		panic(tp.panic)
@@ -47,7 +47,7 @@ func (tp *testPlanner) plan(statement sqlparser.Statement, vars *sqlparser.Reser
 	if tp.messWithAST != nil {
 		tp.messWithAST(statement)
 	}
-	return tp.res, tp.err
+	return tp.res, nil, tp.err
 }
 
 func TestFallbackPlanner(t *testing.T) {
@@ -62,14 +62,14 @@ func TestFallbackPlanner(t *testing.T) {
 	var vschema plancontext.VSchema
 
 	// first planner succeeds
-	_, _ = fb.plan(stmt, nil, vschema)
+	_, _, _ = fb.plan(stmt, nil, vschema)
 	assert.True(t, a.called)
 	assert.False(t, b.called)
 	a.called = false
 
 	// first planner errors
 	a.err = fmt.Errorf("fail")
-	_, _ = fb.plan(stmt, nil, vschema)
+	_, _, _ = fb.plan(stmt, nil, vschema)
 	assert.True(t, a.called)
 	assert.True(t, b.called)
 
@@ -78,7 +78,7 @@ func TestFallbackPlanner(t *testing.T) {
 
 	// first planner panics
 	a.panic = "oh noes"
-	_, _ = fb.plan(stmt, nil, vschema)
+	_, _, _ = fb.plan(stmt, nil, vschema)
 	assert.True(t, a.called)
 	assert.True(t, b.called)
 }
@@ -102,7 +102,7 @@ func TestFallbackClonesBeforePlanning(t *testing.T) {
 	var vschema plancontext.VSchema
 
 	// first planner succeeds
-	_, _ = fb.plan(stmt, nil, vschema)
+	_, _, _ = fb.plan(stmt, nil, vschema)
 
 	assert.NotNilf(t, stmt.SelectExprs, "should not have changed")
 }

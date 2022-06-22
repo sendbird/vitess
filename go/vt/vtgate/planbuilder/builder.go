@@ -153,14 +153,33 @@ func getPlannerFromQueryHint(stmt sqlparser.Statement) (plancontext.PlannerVersi
 	return plancontext.PlannerNameToVersion(val)
 }
 
-func buildRoutePlan(stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema, f func(statement sqlparser.Statement, reservedVars *sqlparser.ReservedVars, schema plancontext.VSchema) (engine.Primitive, error)) (engine.Primitive, error) {
+func buildRoutePlan(
+	stmt sqlparser.Statement,
+	reservedVars *sqlparser.ReservedVars,
+	vschema plancontext.VSchema,
+	f func(statement sqlparser.Statement, reservedVars *sqlparser.ReservedVars, schema plancontext.VSchema) (engine.Primitive, []string, error),
+) (engine.Primitive, []string, error) {
 	if vschema.Destination() != nil {
-		return buildPlanForBypass(stmt, reservedVars, vschema)
+		prim, err := buildPlanForBypass(stmt, reservedVars, vschema)
+		return prim, nil, err
 	}
 	return f(stmt, reservedVars, vschema)
 }
+func buildRoutePlanLegacy(
+	stmt sqlparser.Statement,
+	reservedVars *sqlparser.ReservedVars,
+	vschema plancontext.VSchema,
+	f func(statement sqlparser.Statement, reservedVars *sqlparser.ReservedVars, schema plancontext.VSchema) (engine.Primitive, error),
+) (engine.Primitive, []string, error) {
+	if vschema.Destination() != nil {
+		prim, err := buildPlanForBypass(stmt, reservedVars, vschema)
+		return prim, nil, err
+	}
+	prim, err := f(stmt, reservedVars, vschema)
+	return prim, nil, err
+}
 
-type stmtPlanner func(sqlparser.Statement, *sqlparser.ReservedVars, plancontext.VSchema) (engine.Primitive, error)
+type stmtPlanner func(sqlparser.Statement, *sqlparser.ReservedVars, plancontext.VSchema) (engine.Primitive, []string, error)
 
 func createInstructionFor(query string, stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema, enableOnlineDDL, enableDirectDDL bool) (engine.Primitive, []string, error) {
 	switch stmt := stmt.(type) {
@@ -169,43 +188,23 @@ func createInstructionFor(query string, stmt sqlparser.Statement, reservedVars *
 		if err != nil {
 			return nil, nil, err
 		}
-		prim, err := buildRoutePlan(stmt, reservedVars, vschema, configuredPlanner)
-		if err != nil {
-			return nil, nil, err
-		}
-		return prim, nil, nil
+		return buildRoutePlan(stmt, reservedVars, vschema, configuredPlanner)
 	case *sqlparser.Insert:
-		prim, err := buildRoutePlan(stmt, reservedVars, vschema, buildInsertPlan)
-		if err != nil {
-			return nil, nil, err
-		}
-		return prim, nil, nil
+		return buildRoutePlanLegacy(stmt, reservedVars, vschema, buildInsertPlan)
 	case *sqlparser.Update:
 		configuredPlanner, err := getConfiguredPlanner(vschema, buildUpdatePlan, stmt, query)
 		if err != nil {
 			return nil, nil, err
 		}
-		prim, err := buildRoutePlan(stmt, reservedVars, vschema, configuredPlanner)
-		if err != nil {
-			return nil, nil, err
-		}
-		return prim, nil, nil
+		return buildRoutePlan(stmt, reservedVars, vschema, configuredPlanner)
 	case *sqlparser.Delete:
-		prim, err := buildRoutePlan(stmt, reservedVars, vschema, buildDeletePlan)
-		if err != nil {
-			return nil, nil, err
-		}
-		return prim, nil, nil
+		return buildRoutePlanLegacy(stmt, reservedVars, vschema, buildDeletePlan)
 	case *sqlparser.Union:
 		configuredPlanner, err := getConfiguredPlanner(vschema, buildUnionPlan, stmt, query)
 		if err != nil {
 			return nil, nil, err
 		}
-		prim, err := buildRoutePlan(stmt, reservedVars, vschema, configuredPlanner)
-		if err != nil {
-			return nil, nil, err
-		}
-		return prim, nil, nil
+		return buildRoutePlan(stmt, reservedVars, vschema, configuredPlanner)
 	case sqlparser.DDLStatement:
 		prim, err := buildGeneralDDLPlan(query, stmt, reservedVars, vschema, enableOnlineDDL, enableDirectDDL)
 		if err != nil {
@@ -273,17 +272,9 @@ func createInstructionFor(query string, stmt sqlparser.Statement, reservedVars *
 		}
 		return prim, nil, nil
 	case sqlparser.DBDDLStatement:
-		prim, err := buildRoutePlan(stmt, reservedVars, vschema, buildDBDDLPlan)
-		if err != nil {
-			return nil, nil, err
-		}
-		return prim, nil, nil
+		return buildRoutePlanLegacy(stmt, reservedVars, vschema, buildDBDDLPlan)
 	case *sqlparser.SetTransaction:
-		prim, err := buildRoutePlan(stmt, reservedVars, vschema, buildSetTxPlan)
-		if err != nil {
-			return nil, nil, err
-		}
-		return prim, nil, nil
+		return buildRoutePlanLegacy(stmt, reservedVars, vschema, buildSetTxPlan)
 	case *sqlparser.Begin, *sqlparser.Commit, *sqlparser.Rollback, *sqlparser.Savepoint, *sqlparser.SRollback, *sqlparser.Release:
 		// Empty by design. Not executed by a plan
 		return nil, nil, nil
@@ -294,17 +285,9 @@ func createInstructionFor(query string, stmt sqlparser.Statement, reservedVars *
 		}
 		return prim, nil, nil
 	case *sqlparser.LockTables:
-		prim, err := buildRoutePlan(stmt, reservedVars, vschema, buildLockPlan)
-		if err != nil {
-			return nil, nil, err
-		}
-		return prim, nil, nil
+		return buildRoutePlanLegacy(stmt, reservedVars, vschema, buildLockPlan)
 	case *sqlparser.UnlockTables:
-		prim, err := buildRoutePlan(stmt, reservedVars, vschema, buildUnlockPlan)
-		if err != nil {
-			return nil, nil, err
-		}
-		return prim, nil, nil
+		return buildRoutePlanLegacy(stmt, reservedVars, vschema, buildUnlockPlan)
 	case *sqlparser.Flush:
 		prim, err := buildFlushPlan(stmt, vschema)
 		if err != nil {

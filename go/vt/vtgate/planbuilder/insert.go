@@ -241,7 +241,8 @@ func subquerySelectPlan(ins *sqlparser.Insert, vschema plancontext.VSchema, rese
 	// Override the locking with `for update` to lock the rows for inserting the data.
 	selectStmt.SetLock(sqlparser.ForUpdateLock)
 
-	return queryPlanner(selectStmt, reservedVars, vschema)
+	prim, _, err := queryPlanner(selectStmt, reservedVars, vschema)
+	return prim, err
 }
 
 func getStatementAndPlanner(

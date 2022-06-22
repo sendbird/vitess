@@ -36,18 +36,18 @@ import (
 )
 
 func buildSelectPlan(query string) stmtPlanner {
-	return func(stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema) (engine.Primitive, error) {
+	return func(stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema) (engine.Primitive, []string, error) {
 		sel := stmt.(*sqlparser.Select)
 		if sel.With != nil {
-			return nil, vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "unsupported: with expression in select statement")
+			return nil, nil, vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "unsupported: with expression in select statement")
 		}
 
 		p, err := handleDualSelects(sel, vschema)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if p != nil {
-			return p, nil
+			return p, []string{".dual"}, nil
 		}
 
 		getPlan := func(sel *sqlparser.Select) (logicalPlan, error) {
@@ -63,14 +63,14 @@ func buildSelectPlan(query string) stmtPlanner {
 
 		plan, err := getPlan(sel)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		if shouldRetryWithCNFRewriting(plan) {
 			// by transforming the predicates to CNF, the planner will sometimes find better plans
 			primitive := rewriteToCNFAndReplan(stmt, getPlan)
 			if primitive != nil {
-				return primitive, nil
+				return primitive, nil, nil
 			}
 		}
 		primitive := plan.Primitive()
@@ -84,7 +84,7 @@ func buildSelectPlan(query string) stmtPlanner {
 			}
 		}
 
-		return primitive, nil
+		return primitive, nil, nil
 	}
 }
 

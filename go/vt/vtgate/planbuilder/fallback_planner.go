@@ -31,21 +31,21 @@ type fallbackPlanner struct {
 
 var _ stmtPlanner = (*fallbackPlanner)(nil).plan
 
-func (fp *fallbackPlanner) safePrimary(stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema) (res engine.Primitive, err error) {
+func (fp *fallbackPlanner) safePrimary(stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema) (res engine.Primitive, tables []string, err error) {
 	defer func() {
 		// if the primary planner panics, we want to catch it here so we can fall back
 		if r := recover(); r != nil {
 			err = fmt.Errorf("%v", r) // not using vterror since this will only be used for logging
 		}
 	}()
-	res, err = fp.primary(stmt, reservedVars, vschema)
+	res, tables, err = fp.primary(stmt, reservedVars, vschema)
 	return
 }
 
-func (fp *fallbackPlanner) plan(stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema) (engine.Primitive, error) {
-	res, err := fp.safePrimary(sqlparser.CloneStatement(stmt), reservedVars, vschema)
+func (fp *fallbackPlanner) plan(stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema) (engine.Primitive, []string, error) {
+	res, tables, err := fp.safePrimary(sqlparser.CloneStatement(stmt), reservedVars, vschema)
 	if err != nil {
 		return fp.fallback(stmt, reservedVars, vschema)
 	}
-	return res, nil
+	return res, tables, nil
 }

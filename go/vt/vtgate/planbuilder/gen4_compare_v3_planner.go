@@ -23,8 +23,8 @@ import (
 	"vitess.io/vitess/go/vt/vtgate/engine"
 )
 
-func gen4CompareV3Planner(query string) func(sqlparser.Statement, *sqlparser.ReservedVars, plancontext.VSchema) (engine.Primitive, error) {
-	return func(statement sqlparser.Statement, vars *sqlparser.ReservedVars, ctxVSchema plancontext.VSchema) (engine.Primitive, error) {
+func gen4CompareV3Planner(query string) func(sqlparser.Statement, *sqlparser.ReservedVars, plancontext.VSchema) (engine.Primitive, []string, error) {
+	return func(statement sqlparser.Statement, vars *sqlparser.ReservedVars, ctxVSchema plancontext.VSchema) (engine.Primitive, []string, error) {
 		switch statement.(type) {
 		case *sqlparser.Select, *sqlparser.Union:
 		// These we can compare. Everything else we'll just use the Gen4 planner
@@ -40,11 +40,11 @@ func gen4CompareV3Planner(query string) func(sqlparser.Statement, *sqlparser.Res
 		// preliminary checks on the given statement
 		onlyGen4, hasOrderBy, err := preliminaryChecks(statement)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		// plan statement using Gen4
-		gen4Primitive, gen4Err := planWithPlannerVersion(statement, vars, ctxVSchema, query, Gen4)
+		gen4Primitive, tables, gen4Err := planWithPlannerVersion(statement, vars, ctxVSchema, query, Gen4)
 
 		// if onlyGen4 is set to true or Gen4's instruction contain a lock primitive,
 		// we use only Gen4's primitive and exit early without using V3's.
@@ -52,23 +52,23 @@ func gen4CompareV3Planner(query string) func(sqlparser.Statement, *sqlparser.Res
 		// we want to execute them once using Gen4 to avoid the duplicated locks
 		// or double lock-releases.
 		if onlyGen4 || (gen4Primitive != nil && hasLockPrimitive(gen4Primitive)) {
-			return gen4Primitive, gen4Err
+			return gen4Primitive, tables, gen4Err
 		}
 
 		// get V3's plan
-		v3Primitive, v3Err := planWithPlannerVersion(statement, vars, ctxVSchema, query, V3)
+		v3Primitive, _, v3Err := planWithPlannerVersion(statement, vars, ctxVSchema, query, V3)
 
 		// check potential errors from Gen4 and V3
 		err = engine.CompareV3AndGen4Errors(v3Err, gen4Err)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		return &engine.Gen4CompareV3{
 			V3:         v3Primitive,
 			Gen4:       gen4Primitive,
 			HasOrderBy: hasOrderBy,
-		}, nil
+		}, tables, nil
 	}
 }
 
@@ -108,11 +108,10 @@ func preliminaryChecks(statement sqlparser.Statement) (bool, bool, error) {
 	return onlyGen4, hasOrderBy, nil
 }
 
-func planWithPlannerVersion(statement sqlparser.Statement, vars *sqlparser.ReservedVars, ctxVSchema plancontext.VSchema, query string, version plancontext.PlannerVersion) (engine.Primitive, error) {
+func planWithPlannerVersion(statement sqlparser.Statement, vars *sqlparser.ReservedVars, ctxVSchema plancontext.VSchema, query string, version plancontext.PlannerVersion) (engine.Primitive, []string, error) {
 	ctxVSchema.SetPlannerVersion(version)
 	stmt := sqlparser.CloneStatement(statement)
-	primitive, _, err := createInstructionFor(query, stmt, vars, ctxVSchema, false, false)
-	return primitive, err
+	return createInstructionFor(query, stmt, vars, ctxVSchema, false, false)
 }
 
 // hasLockPrimitive recursively walks through the given primitive and its children
