@@ -71,6 +71,7 @@ type Pool struct {
 // to publish stats only.
 func NewPool(env tabletenv.Env, name string, cfg tabletenv.ConnPoolConfig) *Pool {
 	idleTimeout := cfg.IdleTimeoutSeconds.Get()
+	refreshTimeout := cfg.RefreshTimoutSeconds.Get()
 	cp := &Pool{
 		env:                env,
 		name:               name,
@@ -78,6 +79,7 @@ func NewPool(env tabletenv.Env, name string, cfg tabletenv.ConnPoolConfig) *Pool
 		prefillParallelism: cfg.PrefillParallelism,
 		timeout:            cfg.TimeoutSeconds.Get(),
 		idleTimeout:        idleTimeout,
+		refreshTimeout:     refreshTimeout,
 		waiterCap:          int64(cfg.MaxWaiters),
 		dbaPool:            dbconnpool.NewConnectionPool(name+"_dbaPool", 1, idleTimeout, 0, 0),
 	}
