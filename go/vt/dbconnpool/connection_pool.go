@@ -54,6 +54,7 @@ type ConnectionPool struct {
 	connections         *pools.ResourcePool
 	capacity            int
 	idleTimeout         time.Duration
+	refreshTimeout      time.Duration
 	resolutionFrequency time.Duration
 
 	// info is set at Open() time
@@ -120,7 +121,7 @@ func (cp *ConnectionPool) connect(ctx context.Context) (pools.Resource, error) {
 	}
 	return &PooledDBConnection{
 		DBConnection: c,
-		timeCreated: time.Now(),
+		timeCreated:  time.Now(),
 		pool:         cp,
 	}, nil
 }
