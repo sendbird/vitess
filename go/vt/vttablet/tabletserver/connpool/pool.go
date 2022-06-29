@@ -71,7 +71,7 @@ type Pool struct {
 // to publish stats only.
 func NewPool(env tabletenv.Env, name string, cfg tabletenv.ConnPoolConfig) *Pool {
 	idleTimeout := cfg.IdleTimeoutSeconds.Get()
-	refreshTimeout := cfg.RefreshTimoutSeconds.Get()
+	refreshTimeout := cfg.RefreshTimeoutSeconds.Get()
 	cp := &Pool{
 		env:                env,
 		name:               name,
