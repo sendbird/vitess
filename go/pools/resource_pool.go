@@ -326,11 +326,14 @@ func (rp *ResourcePool) Put(resource Resource) {
 	var wrapper resourceWrapper
 	if resource != nil {
 		refreshTimeout := rp.RefreshTimeout()
-		refreshTimeout += time.Millisecond * time.Duration(rand.Int63n(refreshTimeout.Milliseconds()))
-		if refreshTimeout > 0 && time.Until(resource.TimeCreated().Add(refreshTimeout)) < 0 {
-			// If the resource has lived too long, get a new one
-			rp.refreshClosed.Add(1)
-			rp.reopenResource(&wrapper)
+		if refreshTimeout > 0 {
+			r := rand.New(rand.NewSource(time.Now().UnixNano()))
+			extendedTimeout += time.Millisecond * time.Duration(r.Int63n(refreshTimeout.Milliseconds()))
+			if time.Until(resource.TimeCreated().Add(extendedTimeout)) < 0 {
+				// If the resource has lived too long, get a new one
+				rp.refreshClosed.Add(1)
+				rp.reopenResource(&wrapper)
+			}
 		} else {
 			wrapper = resourceWrapper{
 				resource: resource,
