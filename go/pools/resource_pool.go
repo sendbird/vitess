@@ -21,6 +21,7 @@ package pools
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -325,6 +326,7 @@ func (rp *ResourcePool) Put(resource Resource) {
 	var wrapper resourceWrapper
 	if resource != nil {
 		refreshTimeout := rp.RefreshTimeout()
+		refreshTimeout += time.Millisecond * time.Duration(rand.Int63n(refreshTimeout.Milliseconds()))
 		if refreshTimeout > 0 && time.Until(resource.TimeCreated().Add(refreshTimeout)) < 0 {
 			// If the resource has lived too long, get a new one
 			rp.refreshClosed.Add(1)
@@ -334,7 +336,7 @@ func (rp *ResourcePool) Put(resource Resource) {
 				resource: resource,
 				timeUsed: time.Now(),
 			}
-        }
+		}
 	} else {
 		rp.reopenResource(&wrapper)
 	}
