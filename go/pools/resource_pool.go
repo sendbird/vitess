@@ -328,7 +328,7 @@ func (rp *ResourcePool) Put(resource Resource) {
 		refreshTimeout := rp.RefreshTimeout()
 		if refreshTimeout > 0 {
 			r := rand.New(rand.NewSource(time.Now().UnixNano()))
-			extendedTimeout += time.Millisecond * time.Duration(r.Int63n(refreshTimeout.Milliseconds()))
+			extendedTimeout := refreshTimeout + time.Millisecond * time.Duration(r.Int63n(refreshTimeout.Milliseconds()))
 			if time.Until(resource.TimeCreated().Add(extendedTimeout)) < 0 {
 				// If the resource has lived too long, get a new one
 				rp.refreshClosed.Add(1)
