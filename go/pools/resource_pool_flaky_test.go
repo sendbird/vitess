@@ -442,16 +442,74 @@ func TestIdleTimeout(t *testing.T) {
 	assert.EqualValues(t, 2, p.IdleClosed())
 }
 
+func TestRefreshTimeout(t *testing.T) {
+    // refreshTimeout 0
+    ctx := context.Background()
+	lastID.Set(0)
+	count.Set(0)
+
+    p := NewResourcePool(PoolFactory, 1, 1, 10*time.Second, 0, 1, logWait, nil, 0)
+    defer p.Close()
+
+    r, err := p.Get(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count.Get())
+	assert.EqualValues(t, 0, p.RefreshClosed())
+
+	time.Sleep(10 * time.Millisecond)
+
+	p.Put(r)
+	assert.EqualValues(t, 1, lastID.Get())
+	assert.EqualValues(t, 1, count.Get())
+	assert.EqualValues(t, 0, p.RefreshClosed())
+
+    // refreshTimeout > 1
+    ctx = context.Background()
+	lastID.Set(0)
+	count.Set(0)
+
+    p = NewResourcePool(PoolFactory, 1, 1, 10*time.Second, 10*time.Millisecond, 1, logWait, nil, 0)
+    defer p.Close()
+
+    r, err = p.Get(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count.Get())
+	assert.EqualValues(t, 0, p.RefreshClosed())
+
+	time.Sleep(5 * time.Millisecond)
+
+	p.Put(r)
+	assert.EqualValues(t, 1, lastID.Get())
+	assert.EqualValues(t, 1, count.Get())
+	assert.EqualValues(t, 0, p.RefreshClosed())
+
+    r, err = p.Get(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, count.Get())
+	assert.EqualValues(t, 0, p.RefreshClosed())
+
+	time.Sleep(10 * time.Millisecond)
+
+	p.Put(r)
+	assert.EqualValues(t, 2, lastID.Get())
+	assert.EqualValues(t, 1, count.Get())
+	assert.EqualValues(t, 1, p.RefreshClosed())
+}
+
 func TestExtendedRefreshTimeout(t *testing.T) {
     // refreshTimeout 0
     p := NewResourcePool(PoolFactory, 5, 5, time.Second, 0, 1, logWait, nil, 0)
+    defer p.Close()
     assert.Zero(t, p.ExtendedRefreshTimeout())
 
     // refreshTimeout > 1
-    refreshTimeout := 10*time.Second
-    p = NewResourcePool(PoolFactory, 5, 5, time.Second, refreshTimeout, 1, logWait, nil, 0)
-    assert.LessOrEqual(t, refreshTimeout, p.ExtendedRefreshTimeout())
-    assert.Greater(t, 2 * refreshTimeout, p.ExtendedRefreshTimeout())
+    refreshTimeout := 10*time.Millisecond
+    for i := 0; i< 10; i++ {
+        p = NewResourcePool(PoolFactory, 5, 5, time.Second, refreshTimeout, 1, logWait, nil, 0)
+        defer p.Close()
+        assert.LessOrEqual(t, refreshTimeout, p.ExtendedRefreshTimeout())
+        assert.Greater(t, 2 * refreshTimeout, p.ExtendedRefreshTimeout())
+    }
 }
 
 func TestIdleTimeoutCreateFail(t *testing.T) {
