@@ -325,15 +325,13 @@ func (rp *ResourcePool) get(ctx context.Context) (resource Resource, err error) 
 func (rp *ResourcePool) Put(resource Resource) {
 	var wrapper resourceWrapper
 	if resource != nil {
-		refreshTimeout := rp.RefreshTimeout()
-		if refreshTimeout > 0 {
-			r := rand.New(rand.NewSource(time.Now().UnixNano()))
-			extendedTimeout := refreshTimeout + time.Millisecond * time.Duration(r.Int63n(refreshTimeout.Milliseconds()))
-			if time.Until(resource.TimeCreated().Add(extendedTimeout)) < 0 {
-				// If the resource has lived too long, get a new one
-				rp.refreshClosed.Add(1)
-				rp.reopenResource(&wrapper)
-			}
+	    // Replace resource
+		extendedRefreshTimeout := rp.ExtendedRefreshTimeout()
+		if extendedRefreshTimeout > 0 && time.Until(resource.TimeCreated().Add(extendedRefreshTimeout)) < 0 {
+            // If the resource has lived too long, get a new one
+            resource.Close()
+            rp.refreshClosed.Add(1)
+            rp.reopenResource(&wrapper)
 		} else {
 			wrapper = resourceWrapper{
 				resource: resource,
@@ -341,6 +339,7 @@ func (rp *ResourcePool) Put(resource Resource) {
 			}
 		}
 	} else {
+	    // Create new resource
 		rp.reopenResource(&wrapper)
 	}
 	select {
@@ -496,6 +495,17 @@ func (rp *ResourcePool) IdleClosed() int64 {
 // RefreshTimeout returns the resource refresh timeout.
 func (rp *ResourcePool) RefreshTimeout() time.Duration {
 	return rp.refreshTimeout.Get()
+}
+
+// ExtendedRefreshTimeout returns random duration within range [RefreshTimeout, 2*RefreshTimeout)
+func (rp *ResourcePool) ExtendedRefreshTimeout() time.Duration {
+    if rp.RefreshTimeout() == 0 {
+        return 0
+    } else {
+        r := rand.New(rand.NewSource(time.Now().UnixNano()))
+        refreshTimeout := rp.RefreshTimeout()
+        return refreshTimeout + time.Millisecond * time.Duration(r.Int63n(refreshTimeout.Milliseconds()))
+    }
 }
 
 // RefreshClosed returns the count of resources closed due to refresh timeout.

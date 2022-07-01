@@ -442,6 +442,18 @@ func TestIdleTimeout(t *testing.T) {
 	assert.EqualValues(t, 2, p.IdleClosed())
 }
 
+func TestExtendedRefreshTimeout(t *testing.T) {
+    // refreshTimeout 0
+    p := NewResourcePool(PoolFactory, 5, 5, time.Second, 0, 1, logWait, nil, 0)
+    assert.Zero(t, p.ExtendedRefreshTimeout())
+
+    // refreshTimeout > 1
+    refreshTimeout := 10*time.Second
+    p = NewResourcePool(PoolFactory, 5, 5, time.Second, refreshTimeout, 1, logWait, nil, 0)
+    assert.LessOrEqual(t, refreshTimeout, p.ExtendedRefreshTimeout())
+    assert.Greater(t, 2 * refreshTimeout, p.ExtendedRefreshTimeout())
+}
+
 func TestIdleTimeoutCreateFail(t *testing.T) {
 	ctx := context.Background()
 	lastID.Set(0)
