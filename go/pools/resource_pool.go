@@ -108,6 +108,7 @@ type resourceWrapper struct {
 // If a resource is unused beyond idleTimeout, it's replaced
 // with a new one.
 // An idleTimeout of 0 means that there is no timeout.
+// An refreshTimeout of 0 means that there is no timeout.
 // A non-zero value of prefillParallelism causes the pool to be pre-filled.
 // The value specifies how many resources can be opened in parallel.
 // refreshCheck is a function we consult at refreshInterval
@@ -325,13 +326,13 @@ func (rp *ResourcePool) get(ctx context.Context) (resource Resource, err error) 
 func (rp *ResourcePool) Put(resource Resource) {
 	var wrapper resourceWrapper
 	if resource != nil {
-	    // Replace resource
+		// Replace resource
 		extendedRefreshTimeout := rp.ExtendedRefreshTimeout()
 		if extendedRefreshTimeout > 0 && time.Until(resource.TimeCreated().Add(extendedRefreshTimeout)) < 0 {
-            // If the resource has lived too long, get a new one
-            resource.Close()
-            rp.refreshClosed.Add(1)
-            rp.reopenResource(&wrapper)
+			// If the resource has lived too long, get a new one
+			resource.Close()
+			rp.refreshClosed.Add(1)
+			rp.reopenResource(&wrapper)
 		} else {
 			wrapper = resourceWrapper{
 				resource: resource,
@@ -504,7 +505,7 @@ func (rp *ResourcePool) ExtendedRefreshTimeout() time.Duration {
     } else {
         r := rand.New(rand.NewSource(time.Now().UnixNano()))
         refreshTimeout := rp.RefreshTimeout()
-        return refreshTimeout + time.Millisecond * time.Duration(r.Int63n(refreshTimeout.Milliseconds()))
+        return refreshTimeout + time.Duration(r.Int63n(refreshTimeout.Nanoseconds()))
     }
 }
 
