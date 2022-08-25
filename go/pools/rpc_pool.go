@@ -44,7 +44,7 @@ type RPCPool struct {
 // will not be called).
 func NewRPCPool(size int, waitTimeout time.Duration, logWait func(time.Time)) *RPCPool {
 	return &RPCPool{
-		rp:          NewResourcePool(rpcResourceFactory, size, size, 0, size, logWait, nil, 0),
+		rp:          NewResourcePool(rpcResourceFactory, size, size, 0, 0, size, logWait, nil, 0),
 		waitTimeout: waitTimeout,
 	}
 }
@@ -81,12 +81,18 @@ func (pool *RPCPool) Close() { pool.rp.Close() }
 
 func (pool *RPCPool) StatsJSON() string { return pool.rp.StatsJSON() }
 
-type _rpc struct{}
+type _rpc struct {
+	timeCreated time.Time
+}
 
-var rpc = &_rpc{}
+var rpc = &_rpc{time.Now()}
 
 // Close implements Resource for _rpc.
 func (*_rpc) Close() {}
+
+func (rpc *_rpc) TimeCreated() time.Time {
+	return rpc.timeCreated
+}
 
 // we only ever return the same rpc pointer. it's used as a sentinel and is
 // only used internally so using the same one over and over doesn't matter.

@@ -21,6 +21,7 @@ package pools
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -61,21 +62,24 @@ type RefreshCheck func() (bool, error)
 // is the responsibility of the caller.
 type Resource interface {
 	Close()
+	TimeCreated() time.Time
 }
 
 // ResourcePool allows you to use a pool of resources.
 type ResourcePool struct {
 	// stats. Atomic fields must remain at the top in order to prevent panics on certain architectures.
-	available  sync2.AtomicInt64
-	active     sync2.AtomicInt64
-	inUse      sync2.AtomicInt64
-	waitCount  sync2.AtomicInt64
-	waitTime   sync2.AtomicDuration
-	idleClosed sync2.AtomicInt64
-	exhausted  sync2.AtomicInt64
+	available     sync2.AtomicInt64
+	active        sync2.AtomicInt64
+	inUse         sync2.AtomicInt64
+	waitCount     sync2.AtomicInt64
+	waitTime      sync2.AtomicDuration
+	idleClosed    sync2.AtomicInt64
+	refreshClosed sync2.AtomicInt64
+	exhausted     sync2.AtomicInt64
 
-	capacity    sync2.AtomicInt64
-	idleTimeout sync2.AtomicDuration
+	capacity       sync2.AtomicInt64
+	idleTimeout    sync2.AtomicDuration
+	refreshTimeout sync2.AtomicDuration
 
 	resources chan resourceWrapper
 	factory   Factory
@@ -104,21 +108,23 @@ type resourceWrapper struct {
 // If a resource is unused beyond idleTimeout, it's replaced
 // with a new one.
 // An idleTimeout of 0 means that there is no timeout.
+// An refreshTimeout of 0 means that there is no timeout.
 // A non-zero value of prefillParallelism causes the pool to be pre-filled.
 // The value specifies how many resources can be opened in parallel.
 // refreshCheck is a function we consult at refreshInterval
 // intervals to determine if the pool should be drained and reopened
-func NewResourcePool(factory Factory, capacity, maxCap int, idleTimeout time.Duration, prefillParallelism int, logWait func(time.Time), refreshCheck RefreshCheck, refreshInterval time.Duration) *ResourcePool {
+func NewResourcePool(factory Factory, capacity, maxCap int, idleTimeout time.Duration, refreshTimeout time.Duration, prefillParallelism int, logWait func(time.Time), refreshCheck RefreshCheck, refreshInterval time.Duration) *ResourcePool {
 	if capacity <= 0 || maxCap <= 0 || capacity > maxCap {
 		panic(errors.New("invalid/out of range capacity"))
 	}
 	rp := &ResourcePool{
-		resources:   make(chan resourceWrapper, maxCap),
-		factory:     factory,
-		available:   sync2.NewAtomicInt64(int64(capacity)),
-		capacity:    sync2.NewAtomicInt64(int64(capacity)),
-		idleTimeout: sync2.NewAtomicDuration(idleTimeout),
-		logWait:     logWait,
+		resources:      make(chan resourceWrapper, maxCap),
+		factory:        factory,
+		available:      sync2.NewAtomicInt64(int64(capacity)),
+		capacity:       sync2.NewAtomicInt64(int64(capacity)),
+		idleTimeout:    sync2.NewAtomicDuration(idleTimeout),
+		refreshTimeout: sync2.NewAtomicDuration(refreshTimeout),
+		logWait:        logWait,
 	}
 	for i := 0; i < capacity; i++ {
 		rp.resources <- resourceWrapper{}
@@ -320,11 +326,21 @@ func (rp *ResourcePool) get(ctx context.Context) (resource Resource, err error) 
 func (rp *ResourcePool) Put(resource Resource) {
 	var wrapper resourceWrapper
 	if resource != nil {
-		wrapper = resourceWrapper{
-			resource: resource,
-			timeUsed: time.Now(),
+		// Replace resource
+		extendedRefreshTimeout := rp.ExtendedRefreshTimeout()
+		if extendedRefreshTimeout > 0 && time.Until(resource.TimeCreated().Add(extendedRefreshTimeout)) < 0 {
+			// If the resource has lived too long, get a new one
+			resource.Close()
+			rp.refreshClosed.Add(1)
+			rp.reopenResource(&wrapper)
+		} else {
+			wrapper = resourceWrapper{
+				resource: resource,
+				timeUsed: time.Now(),
+			}
 		}
 	} else {
+	    // Create new resource
 		rp.reopenResource(&wrapper)
 	}
 	select {
@@ -415,7 +431,7 @@ func (rp *ResourcePool) SetIdleTimeout(idleTimeout time.Duration) {
 
 // StatsJSON returns the stats in JSON format.
 func (rp *ResourcePool) StatsJSON() string {
-	return fmt.Sprintf(`{"Capacity": %v, "Available": %v, "Active": %v, "InUse": %v, "MaxCapacity": %v, "WaitCount": %v, "WaitTime": %v, "IdleTimeout": %v, "IdleClosed": %v, "Exhausted": %v}`,
+	return fmt.Sprintf(`{"Capacity": %v, "Available": %v, "Active": %v, "InUse": %v, "MaxCapacity": %v, "WaitCount": %v, "WaitTime": %v, "IdleTimeout": %v, "IdleClosed": %v, "RefreshTimeout": %v, "RefreshClosed": %v, "Exhausted": %v}`,
 		rp.Capacity(),
 		rp.Available(),
 		rp.Active(),
@@ -425,6 +441,8 @@ func (rp *ResourcePool) StatsJSON() string {
 		rp.WaitTime().Nanoseconds(),
 		rp.IdleTimeout().Nanoseconds(),
 		rp.IdleClosed(),
+		rp.RefreshTimeout().Nanoseconds(),
+		rp.RefreshClosed(),
 		rp.Exhausted(),
 	)
 }
@@ -465,7 +483,7 @@ func (rp *ResourcePool) WaitTime() time.Duration {
 	return rp.waitTime.Get()
 }
 
-// IdleTimeout returns the idle timeout.
+// IdleTimeout returns the resource idle timeout.
 func (rp *ResourcePool) IdleTimeout() time.Duration {
 	return rp.idleTimeout.Get()
 }
@@ -473,6 +491,27 @@ func (rp *ResourcePool) IdleTimeout() time.Duration {
 // IdleClosed returns the count of resources closed due to idle timeout.
 func (rp *ResourcePool) IdleClosed() int64 {
 	return rp.idleClosed.Get()
+}
+
+// RefreshTimeout returns the resource refresh timeout.
+func (rp *ResourcePool) RefreshTimeout() time.Duration {
+	return rp.refreshTimeout.Get()
+}
+
+// ExtendedRefreshTimeout returns random duration within range [RefreshTimeout, 2*RefreshTimeout)
+func (rp *ResourcePool) ExtendedRefreshTimeout() time.Duration {
+    if rp.RefreshTimeout() == 0 {
+        return 0
+    } else {
+        r := rand.New(rand.NewSource(time.Now().UnixNano()))
+        refreshTimeout := rp.RefreshTimeout()
+        return refreshTimeout + time.Duration(r.Int63n(refreshTimeout.Nanoseconds()))
+    }
+}
+
+// RefreshClosed returns the count of resources closed due to refresh timeout.
+func (rp *ResourcePool) RefreshClosed() int64 {
+	return rp.refreshClosed.Get()
 }
 
 // Exhausted returns the number of times Available dropped below 1
