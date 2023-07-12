@@ -17,19 +17,19 @@ limitations under the License.
 package framework
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"time"
 
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/yaml2"
 
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/vterrors"
-
-	"context"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/dbconfigs"
@@ -61,7 +61,7 @@ var (
 func StartCustomServer(connParams, connAppDebugParams mysql.ConnParams, dbName string, config *tabletenv.TabletConfig) error {
 	// Setup a fake vtgate server.
 	protocol := "resolveTest"
-	*vtgateconn.VtgateProtocol = protocol
+	vtgateconn.SetVTGateProtocol(protocol)
 	vtgateconn.RegisterDialer(protocol, func(context.Context, string) (vtgateconn.Impl, error) {
 		return &txResolver{
 			FakeVTGateConn: fakerpcvtgateconn.FakeVTGateConn{},
@@ -90,7 +90,12 @@ func StartCustomServer(connParams, connAppDebugParams mysql.ConnParams, dbName s
 		return vterrors.Wrap(err, "could not start listener")
 	}
 	ServerAddress = fmt.Sprintf("http://%s", ln.Addr().String())
-	go http.Serve(ln, nil)
+	go func() {
+		err := servenv.HTTPServe(ln)
+		if err != nil {
+			log.Errorf("HTTPServe failed: %v", err)
+		}
+	}()
 	for {
 		time.Sleep(10 * time.Millisecond)
 		response, err := http.Get(fmt.Sprintf("%s/debug/vars", ServerAddress))
@@ -113,10 +118,12 @@ func StartServer(connParams, connAppDebugParams mysql.ConnParams, dbName string)
 	config.TwoPCCoordinatorAddress = "fake"
 	config.HotRowProtection.Mode = tabletenv.Enable
 	config.TrackSchemaVersions = true
-	config.GracePeriods.ShutdownSeconds = 2
-	config.SignalSchemaChangeReloadIntervalSeconds = tabletenv.Seconds(2.1)
+	_ = config.GracePeriods.ShutdownSeconds.Set("2s")
 	config.SignalWhenSchemaChange = true
-	config.Healthcheck.IntervalSeconds = 0.1
+	_ = config.Healthcheck.IntervalSeconds.Set("100ms")
+	_ = config.Oltp.TxTimeoutSeconds.Set("5s")
+	_ = config.Olap.TxTimeoutSeconds.Set("5s")
+	config.EnableViews = true
 	gotBytes, _ := yaml2.Marshal(config)
 	log.Infof("Config:\n%s", gotBytes)
 	return StartCustomServer(connParams, connAppDebugParams, dbName, config)

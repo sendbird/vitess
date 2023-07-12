@@ -35,6 +35,7 @@ import (
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/test/endtoend/onlineddl"
+	"vitess.io/vitess/go/test/endtoend/throttler"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -140,6 +141,7 @@ const (
 	maxConcurrency                = 20
 	singleConnectionSleepInterval = 2 * time.Millisecond
 	countIterations               = 5
+	migrationWaitTimeout          = 60 * time.Second
 )
 
 func resetOpOrder() {
@@ -172,16 +174,14 @@ func TestMain(m *testing.M) {
 		clusterInstance.VtctldExtraArgs = []string{
 			"--schema_change_dir", schemaChangeDirectory,
 			"--schema_change_controller", "local",
-			"--schema_change_check_interval", "1",
+			"--schema_change_check_interval", "1s",
 		}
 
 		clusterInstance.VtTabletExtraArgs = []string{
-			"--enable-lag-throttler",
-			"--throttle_threshold", "1s",
-			"--heartbeat_enable",
 			"--heartbeat_interval", "250ms",
 			"--heartbeat_on_demand_duration", "5s",
 			"--migration_check_interval", "5s",
+			"--watch_replication_stream",
 		}
 		clusterInstance.VtGateExtraArgs = []string{
 			"--ddl_strategy", "online",
@@ -229,6 +229,8 @@ func TestSchemaChange(t *testing.T) {
 
 	shards = clusterInstance.Keyspaces[0].Shards
 	require.Equal(t, 1, len(shards))
+
+	throttler.EnableLagThrottlerAndWaitForStatus(t, clusterInstance, time.Second)
 
 	t.Run("create schema", func(t *testing.T) {
 		assert.Equal(t, 1, len(clusterInstance.Keyspaces[0].Shards))
@@ -308,6 +310,10 @@ func TestSchemaChange(t *testing.T) {
 			})
 		})
 	}
+
+	t.Run("summary: validate sequential migration IDs", func(t *testing.T) {
+		onlineddl.ValidateSequentialMigrationIDs(t, &vtParams, shards)
+	})
 }
 
 func testWithInitialSchema(t *testing.T) {
@@ -343,7 +349,7 @@ func testOnlineDDLStatement(t *testing.T, alterStatement string, ddlStrategy str
 	assert.NoError(t, err)
 
 	if !strategySetting.Strategy.IsDirect() {
-		status := onlineddl.WaitForMigrationStatus(t, &vtParams, shards, uuid, 30*time.Second, schema.OnlineDDLStatusComplete, schema.OnlineDDLStatusFailed)
+		status := onlineddl.WaitForMigrationStatus(t, &vtParams, shards, uuid, migrationWaitTimeout, schema.OnlineDDLStatusComplete, schema.OnlineDDLStatusFailed)
 		fmt.Printf("# Migration status (for debug purposes): <%s>\n", status)
 	}
 

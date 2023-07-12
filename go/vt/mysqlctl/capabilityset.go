@@ -36,6 +36,7 @@ type capabilitySet struct {
 }
 
 func newCapabilitySet(f MySQLFlavor, v ServerVersion) (c capabilitySet) {
+	noSocketFile()
 	c.flavor = f
 	c.version = v
 	return

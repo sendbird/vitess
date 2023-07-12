@@ -17,12 +17,12 @@ limitations under the License.
 package engine
 
 import (
+	"context"
 	"fmt"
 
 	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/sqltypes"
 	querypb "vitess.io/vitess/go/vt/proto/query"
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 )
@@ -35,7 +35,7 @@ type (
 	Distinct struct {
 		Source    Primitive
 		CheckCols []CheckCol
-		Truncate  bool
+		Truncate  int
 	}
 	CheckCol struct {
 		Col       int
@@ -115,7 +115,7 @@ func (pt *probeTable) hashCodeForRow(inputRow sqltypes.Row) (evalengine.HashCode
 	code := evalengine.HashCode(17)
 	for i, checkCol := range pt.checkCols {
 		if i >= len(inputRow) {
-			return 0, vterrors.New(vtrpcpb.Code_INTERNAL, "distinct check colls is larger than its input row")
+			return 0, vterrors.VT13001("index out of range in row when creating the DISTINCT hash code")
 		}
 		col := inputRow[checkCol.Col]
 		hashcode, err := evalengine.NullsafeHashcode(col, checkCol.Collation, col.Type())
@@ -161,14 +161,14 @@ func newProbeTable(checkCols []CheckCol) *probeTable {
 	cols := make([]CheckCol, len(checkCols))
 	copy(cols, checkCols)
 	return &probeTable{
-		seenRows:  map[uintptr][]sqltypes.Row{},
+		seenRows:  map[evalengine.HashCode][]sqltypes.Row{},
 		checkCols: cols,
 	}
 }
 
 // TryExecute implements the Primitive interface
-func (d *Distinct) TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
-	input, err := vcursor.ExecutePrimitive(d.Source, bindVars, wantfields)
+func (d *Distinct) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
+	input, err := vcursor.ExecutePrimitive(ctx, d.Source, bindVars, wantfields)
 	if err != nil {
 		return nil, err
 	}
@@ -189,17 +189,17 @@ func (d *Distinct) TryExecute(vcursor VCursor, bindVars map[string]*querypb.Bind
 			result.Rows = append(result.Rows, row)
 		}
 	}
-	if d.Truncate {
-		return result.Truncate(len(d.CheckCols)), nil
+	if d.Truncate > 0 {
+		return result.Truncate(d.Truncate), nil
 	}
 	return result, err
 }
 
 // TryStreamExecute implements the Primitive interface
-func (d *Distinct) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+func (d *Distinct) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
 	pt := newProbeTable(d.CheckCols)
 
-	err := vcursor.StreamExecutePrimitive(d.Source, bindVars, wantfields, func(input *sqltypes.Result) error {
+	err := vcursor.StreamExecutePrimitive(ctx, d.Source, bindVars, wantfields, func(input *sqltypes.Result) error {
 		result := &sqltypes.Result{
 			Fields:   input.Fields,
 			InsertID: input.InsertID,
@@ -235,8 +235,8 @@ func (d *Distinct) GetTableName() string {
 }
 
 // GetFields implements the Primitive interface
-func (d *Distinct) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	return d.Source.GetFields(vcursor, bindVars)
+func (d *Distinct) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	return d.Source.GetFields(ctx, vcursor, bindVars)
 }
 
 // NeedsTransaction implements the Primitive interface
@@ -260,8 +260,8 @@ func (d *Distinct) description() PrimitiveDescription {
 		other["Collations"] = colls
 	}
 
-	if d.Truncate {
-		other["ResultColumns"] = len(d.CheckCols)
+	if d.Truncate > 0 {
+		other["ResultColumns"] = d.Truncate
 	}
 	return PrimitiveDescription{
 		Other:        other,
@@ -279,7 +279,7 @@ func (cc CheckCol) SwitchToWeightString() CheckCol {
 }
 
 func (cc CheckCol) String() string {
-	coll := collations.Local().LookupByID(cc.Collation)
+	coll := cc.Collation.Get()
 	var collation string
 	if coll != nil {
 		collation = ": " + coll.Name()

@@ -18,14 +18,15 @@ package main
 
 import (
 	"encoding/json"
-	"flag"
 	"log"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
 
-	"vitess.io/vitess/go/mysql/collations/internal/charset"
+	"github.com/spf13/pflag"
+
+	"vitess.io/vitess/go/mysql/collations/charset"
 	"vitess.io/vitess/go/mysql/collations/internal/uca"
 	"vitess.io/vitess/go/mysql/collations/tools/makecolldata/codegen"
 )
@@ -57,8 +58,8 @@ type CollationMetadata struct {
 	UpperCaseFirst bool
 }
 
-var Mysqldata = flag.String("mysqldata", "testdata/mysqldata", "")
-var Embed = flag.Bool("embed", false, "")
+var Mysqldata = pflag.String("mysqldata", "testdata/mysqldata", "")
+var Embed = pflag.Bool("embed", false, "")
 
 func loadMysqlMetadata() (all AllMetadata) {
 	mysqdata, err := filepath.Glob(path.Join(*Mysqldata, "*.json"))
@@ -106,10 +107,10 @@ func (all AllMetadata) get(name string) *CollationMetadata {
 }
 
 const PkgCollations codegen.Package = "vitess.io/vitess/go/mysql/collations"
-const PkgCharset codegen.Package = "vitess.io/vitess/go/mysql/collations/internal/charset"
+const PkgCharset codegen.Package = "vitess.io/vitess/go/mysql/collations/charset"
 
 func main() {
-	flag.Parse()
+	pflag.Parse()
 	metadata := loadMysqlMetadata()
 	maketables(*Embed, ".", metadata)
 	makeversions(".")

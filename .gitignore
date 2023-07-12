@@ -4,6 +4,9 @@
 # For mac users
 .DS_Store
 
+# For direnv users
+.envrc
+
 # Produced by yacc
 *.output
 
@@ -67,12 +70,7 @@ _test/
 /vendor/*/
 
 # release folder
-releases
-
-# Angular2 Bower Libs
-/web/vtctld2/.bowerrc~
-/web/vtctld2/bower.json~
-/web/vtctld2/public/bower_components/
+/releases/
 
 # Local examples
 /examples/local/vtdataroot
@@ -85,3 +83,6 @@ venv
 
 .scannerwork
 report
+
+# plan test output
+/go/vt/vtgate/planbuilder/testdata/plan_test*

@@ -18,12 +18,12 @@ package planbuilder
 
 import (
 	"bytes"
-
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
-	"vitess.io/vitess/go/vt/vterrors"
+	"fmt"
 
 	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vterrors"
+	popcode "vitess.io/vitess/go/vt/vtgate/engine/opcode"
+	"vitess.io/vitess/go/vt/vtgate/vindexes"
 )
 
 type subqueryInfo struct {
@@ -98,7 +98,7 @@ func (pb *primitiveBuilder) findOrigin(expr sqlparser.Expr, reservedVars *sqlpar
 					return false, err
 				}
 			default:
-				return false, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "BUG: unexpected SELECT type: %T", node)
+				return false, vterrors.VT13001(fmt.Sprintf("unexpected SELECT type: %T", node))
 			}
 			sqi := subqueryInfo{
 				ast:  node,
@@ -135,7 +135,7 @@ func (pb *primitiveBuilder) findOrigin(expr sqlparser.Expr, reservedVars *sqlpar
 			continue
 		}
 		if sqi.origin != nil {
-			return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "unsupported: cross-shard correlated subquery")
+			return nil, nil, nil, vterrors.VT12001("cross-shard correlated subquery")
 		}
 
 		sqName, hasValues := pb.jt.GenerateSubqueryVars()
@@ -143,7 +143,7 @@ func (pb *primitiveBuilder) findOrigin(expr sqlparser.Expr, reservedVars *sqlpar
 		if !ok {
 			// (subquery) -> :_sq
 			expr = sqlparser.ReplaceExpr(expr, sqi.ast, sqlparser.NewArgument(sqName))
-			pullouts = append(pullouts, newPulloutSubquery(engine.PulloutValue, sqName, hasValues, sqi.plan))
+			pullouts = append(pullouts, newPulloutSubquery(popcode.PulloutValue, sqName, hasValues, sqi.plan))
 			continue
 		}
 		switch construct := construct.(type) {
@@ -165,7 +165,7 @@ func (pb *primitiveBuilder) findOrigin(expr sqlparser.Expr, reservedVars *sqlpar
 					Right: right,
 				}
 				expr = sqlparser.ReplaceExpr(expr, construct, newExpr)
-				pullouts = append(pullouts, newPulloutSubquery(engine.PulloutIn, sqName, hasValues, sqi.plan))
+				pullouts = append(pullouts, newPulloutSubquery(popcode.PulloutIn, sqName, hasValues, sqi.plan))
 			} else {
 				// a not in (subquery) -> (:__sq_has_values = 0 or (a not in ::__sq))
 				left := &sqlparser.ComparisonExpr{
@@ -183,18 +183,18 @@ func (pb *primitiveBuilder) findOrigin(expr sqlparser.Expr, reservedVars *sqlpar
 					Right: right,
 				}
 				expr = sqlparser.ReplaceExpr(expr, construct, newExpr)
-				pullouts = append(pullouts, newPulloutSubquery(engine.PulloutNotIn, sqName, hasValues, sqi.plan))
+				pullouts = append(pullouts, newPulloutSubquery(popcode.PulloutNotIn, sqName, hasValues, sqi.plan))
 			}
 		case *sqlparser.ExistsExpr:
 			// exists (subquery) -> :__sq_has_values
 			expr = sqlparser.ReplaceExpr(expr, construct, sqlparser.NewArgument(hasValues))
-			pullouts = append(pullouts, newPulloutSubquery(engine.PulloutExists, sqName, hasValues, sqi.plan))
+			pullouts = append(pullouts, newPulloutSubquery(popcode.PulloutExists, sqName, hasValues, sqi.plan))
 		}
 	}
 	return pullouts, highestOrigin, expr, nil
 }
 
-var dummyErr = vterrors.Errorf(vtrpcpb.Code_INTERNAL, "dummy")
+var dummyErr = vterrors.VT13001("dummy")
 
 func hasSubquery(node sqlparser.SQLNode) bool {
 	has := false
@@ -209,13 +209,14 @@ func hasSubquery(node sqlparser.SQLNode) bool {
 	return has
 }
 
-func (pb *primitiveBuilder) finalizeUnshardedDMLSubqueries(reservedVars *sqlparser.ReservedVars, nodes ...sqlparser.SQLNode) bool {
+func (pb *primitiveBuilder) finalizeUnshardedDMLSubqueries(reservedVars *sqlparser.ReservedVars, nodes ...sqlparser.SQLNode) (bool, []*vindexes.Table) {
 	var keyspace string
+	var tables []*vindexes.Table
 	if rb, ok := pb.plan.(*route); ok {
 		keyspace = rb.eroute.Keyspace.Name
 	} else {
 		// This code is unreachable because the caller checks.
-		return false
+		return false, nil
 	}
 
 	for _, node := range nodes {
@@ -247,6 +248,11 @@ func (pb *primitiveBuilder) finalizeUnshardedDMLSubqueries(reservedVars *sqlpars
 				for _, sub := range innerRoute.substitutions {
 					*sub.oldExpr = *sub.newExpr
 				}
+				spbTables, err := spb.st.AllVschemaTableNames()
+				if err != nil {
+					return false, err
+				}
+				tables = append(tables, spbTables...)
 			case *sqlparser.Union:
 				if !inSubQuery {
 					return true, nil
@@ -270,10 +276,10 @@ func (pb *primitiveBuilder) finalizeUnshardedDMLSubqueries(reservedVars *sqlpars
 			return true, nil
 		}, node)
 		if !samePlan {
-			return false
+			return false, nil
 		}
 	}
-	return true
+	return true, tables
 }
 
 func valEqual(a, b sqlparser.Expr) bool {
@@ -282,12 +288,12 @@ func valEqual(a, b sqlparser.Expr) bool {
 		if b, ok := b.(*sqlparser.ColName); ok {
 			return a.Metadata == b.Metadata
 		}
-	case sqlparser.Argument:
-		b, ok := b.(sqlparser.Argument)
+	case *sqlparser.Argument:
+		b, ok := b.(*sqlparser.Argument)
 		if !ok {
 			return false
 		}
-		return a == b
+		return a.Name == b.Name
 	case *sqlparser.Literal:
 		b, ok := b.(*sqlparser.Literal)
 		if !ok {

@@ -40,6 +40,10 @@ func (r *switcher) deleteRoutingRules(ctx context.Context) error {
 	return r.ts.deleteRoutingRules(ctx)
 }
 
+func (r *switcher) deleteShardRoutingRules(ctx context.Context) error {
+	return r.ts.deleteShardRoutingRules(ctx)
+}
+
 func (r *switcher) dropSourceDeniedTables(ctx context.Context) error {
 	return r.ts.dropSourceDeniedTables(ctx)
 }
@@ -135,4 +139,8 @@ func (r *switcher) dropTargetShards(ctx context.Context) error {
 
 func (r *switcher) logs() *[]string {
 	return nil
+}
+
+func (r *switcher) resetSequences(ctx context.Context) error {
+	return r.ts.resetSequences(ctx)
 }

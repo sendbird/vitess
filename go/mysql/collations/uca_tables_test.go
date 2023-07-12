@@ -26,8 +26,9 @@ import (
 	"unsafe"
 
 	"github.com/stretchr/testify/require"
+	"gotest.tools/assert"
 
-	"vitess.io/vitess/go/mysql/collations/internal/charset"
+	"vitess.io/vitess/go/mysql/collations/charset"
 	"vitess.io/vitess/go/mysql/collations/internal/uca"
 )
 
@@ -57,9 +58,8 @@ func verifyAllCodepoints(t *testing.T, expected map[rune][]uint16, weights uca.W
 
 			for i := range vitessWeights {
 				a, b := mysqlWeights[i], vitessWeights[i]
-				if a != b {
-					t.Errorf("weight mismatch for U+%04X (collation entity %d): mysql=%v vitess=%v", cp, i+1, a, b)
-				}
+				assert.Equal(t, b, a, "weight mismatch for U+%04X (collation entity %d): mysql=%v vitess=%v", cp, i+1, a, b)
+
 			}
 		}
 	}
@@ -131,7 +131,7 @@ func TestTailoringPatchApplication(t *testing.T) {
 
 		switch col := col.(type) {
 		case *Collation_uca_legacy:
-			if _, utf8 := col.charset.(charset.Charset_utf8mb4); !utf8 {
+			if _, utf8 := col.Charset().(charset.Charset_utf8mb4); !utf8 {
 				continue
 			}
 			weightTable, tableLayout = col.uca.Weights()

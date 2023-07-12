@@ -42,7 +42,6 @@ type VtctlClientProcess struct {
 type VtctlClientParams struct {
 	DDLStrategy      string
 	MigrationContext string
-	SkipPreflight    bool
 	UUIDList         string
 	CallerID         string
 }
@@ -88,9 +87,6 @@ func (vtctlclient *VtctlClientProcess) ApplySchemaWithOutput(Keyspace string, SQ
 	if params.UUIDList != "" {
 		args = append(args, "--uuid_list", params.UUIDList)
 	}
-	if params.SkipPreflight {
-		args = append(args, "--skip_preflight")
-	}
 
 	if params.CallerID != "" {
 		args = append(args, "--caller_id", params.CallerID)
@@ -101,7 +97,7 @@ func (vtctlclient *VtctlClientProcess) ApplySchemaWithOutput(Keyspace string, SQ
 
 // ApplySchema applies SQL schema to the keyspace
 func (vtctlclient *VtctlClientProcess) ApplySchema(Keyspace string, SQL string) error {
-	message, err := vtctlclient.ApplySchemaWithOutput(Keyspace, SQL, VtctlClientParams{DDLStrategy: "direct -allow-zero-in-date", SkipPreflight: true})
+	message, err := vtctlclient.ApplySchemaWithOutput(Keyspace, SQL, VtctlClientParams{DDLStrategy: "direct -allow-zero-in-date"})
 
 	return vterrors.Wrap(err, message)
 }
@@ -118,6 +114,11 @@ func (vtctlclient *VtctlClientProcess) ApplyVSchema(Keyspace string, JSON string
 // ApplyRoutingRules does it
 func (vtctlclient *VtctlClientProcess) ApplyRoutingRules(JSON string) (err error) {
 	return vtctlclient.ExecuteCommand("ApplyRoutingRules", "--", "--rules", JSON)
+}
+
+// ApplyRoutingRules does it
+func (vtctlclient *VtctlClientProcess) ApplyShardRoutingRules(JSON string) (err error) {
+	return vtctlclient.ExecuteCommand("ApplyShardRoutingRules", "--", "--rules", JSON)
 }
 
 // OnlineDDLShowRecent responds with recent schema migration list
@@ -214,7 +215,7 @@ func (vtctlclient *VtctlClientProcess) ExecuteCommandWithOutput(args ...string) 
 		}
 		time.Sleep(retryDelay)
 	}
-	return filterResultWhenRunsForCoverage(resultStr), err
+	return filterResultForWarning(filterResultWhenRunsForCoverage(resultStr)), err
 }
 
 // VtctlClientProcessInstance returns a VtctlProcess handle for vtctlclient process
@@ -258,8 +259,5 @@ func (vtctlclient *VtctlClientProcess) InitTablet(tablet *Vttablet, cell string,
 // shouldRetry tells us if the command should be retried based on the results/output -- meaning that it
 // is likely an ephemeral or recoverable issue that is likely to succeed when retried.
 func shouldRetry(cmdResults string) bool {
-	if strings.Contains(cmdResults, "Deadlock found when trying to get lock; try restarting transaction") {
-		return true
-	}
-	return false
+	return strings.Contains(cmdResults, "Deadlock found when trying to get lock; try restarting transaction")
 }

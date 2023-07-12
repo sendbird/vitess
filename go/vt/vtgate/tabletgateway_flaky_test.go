@@ -33,11 +33,11 @@ import (
 // TestGatewayBufferingWhenPrimarySwitchesServingState is used to test that the buffering mechanism buffers the queries when a primary goes to a non serving state and
 // stops buffering when the primary is healthy again
 func TestGatewayBufferingWhenPrimarySwitchesServingState(t *testing.T) {
-	*bufferImplementation = "keyspace_events"
+	bufferImplementation = "keyspace_events"
 	buffer.SetBufferingModeInTestingEnv(true)
 	defer func() {
 		buffer.SetBufferingModeInTestingEnv(false)
-		*bufferImplementation = "healthcheck"
+		bufferImplementation = "healthcheck"
 	}()
 
 	keyspace := "ks1"
@@ -116,11 +116,11 @@ func TestGatewayBufferingWhenPrimarySwitchesServingState(t *testing.T) {
 // TestGatewayBufferingWhileReparenting is used to test that the buffering mechanism buffers the queries when a PRS happens
 // the healthchecks that happen during a PRS are simulated in this test
 func TestGatewayBufferingWhileReparenting(t *testing.T) {
-	*bufferImplementation = "keyspace_events"
+	bufferImplementation = "keyspace_events"
 	buffer.SetBufferingModeInTestingEnv(true)
 	defer func() {
 		buffer.SetBufferingModeInTestingEnv(false)
-		*bufferImplementation = "healthcheck"
+		bufferImplementation = "healthcheck"
 	}()
 
 	keyspace := "ks1"
@@ -197,6 +197,8 @@ func TestGatewayBufferingWhileReparenting(t *testing.T) {
 		queryChan <- struct{}{}
 	}()
 
+	require.Len(t, tg.hc.GetHealthyTabletStats(target), 0, "GetHealthyTabletStats has tablets even though it shouldn't")
+
 	// set the serving type for the new primary tablet true and broadcast it so that the buffering code registers this change
 	// this should stop the buffering and the query executed in the go routine should work. This should be done with some delay so
 	// that we know that the query was buffered
@@ -208,11 +210,105 @@ func TestGatewayBufferingWhileReparenting(t *testing.T) {
 	hc.SetServing(replicaTablet, true)
 	hc.Broadcast(replicaTablet)
 
+	timeout := time.After(1 * time.Minute)
+outer:
+	for {
+		select {
+		case <-timeout:
+			require.Fail(t, "timed out - could not verify the new primary")
+		case <-time.After(10 * time.Millisecond):
+			newPrimary, notServing := tg.kev.PrimaryIsNotServing(target)
+			if newPrimary != nil && newPrimary.Uid == 1 && !notServing {
+				break outer
+			}
+		}
+	}
+
 	// wait for the query to execute before checking for results
 	select {
 	case <-queryChan:
 		require.NoError(t, err)
-		require.Equal(t, res, sqlResult1)
+		require.Equal(t, sqlResult1, res)
+	case <-time.After(15 * time.Second):
+		t.Fatalf("timed out waiting for query to execute")
+	}
+}
+
+// TestInconsistentStateDetectedBuffering simulates the case where we have used up all our buffering retries and in the
+// last attempt we are in an inconsistent state. Meaning that we initially thought that there are no available tablets
+// but after a moment the primary is found to be serving.
+// This is inconsistent and we want to fail properly. This scenario used to panic since no error and no results were
+// returned.
+func TestInconsistentStateDetectedBuffering(t *testing.T) {
+	bufferImplementation = "keyspace_events"
+	buffer.SetBufferingModeInTestingEnv(true)
+	defer func() {
+		buffer.SetBufferingModeInTestingEnv(false)
+		bufferImplementation = "healthcheck"
+	}()
+
+	keyspace := "ks1"
+	shard := "-80"
+	tabletType := topodatapb.TabletType_PRIMARY
+	host := "1.1.1.1"
+	port := int32(1001)
+	target := &querypb.Target{
+		Keyspace:   keyspace,
+		Shard:      shard,
+		TabletType: tabletType,
+	}
+
+	ts := &fakeTopoServer{}
+	// create a new fake health check. We want to check the buffering code which uses Subscribe, so we must also pass a channel
+	hc := discovery.NewFakeHealthCheck(make(chan *discovery.TabletHealth))
+	// create a new tablet gateway
+	tg := NewTabletGateway(context.Background(), hc, ts, "cell")
+
+	tg.retryCount = 0
+
+	// add a primary tabelt which is serving
+	sbc := hc.AddTestTablet("cell", host, port, keyspace, shard, tabletType, true, 10, nil)
+
+	// add a result to the sandbox connection
+	sqlResult1 := &sqltypes.Result{
+		Fields: []*querypb.Field{{
+			Name: "col1",
+			Type: sqltypes.VarChar,
+		}},
+		RowsAffected: 1,
+		Rows: [][]sqltypes.Value{{
+			sqltypes.MakeTrusted(sqltypes.VarChar, []byte("bb")),
+		}},
+	}
+	sbc.SetResults([]*sqltypes.Result{sqlResult1})
+
+	// get the primary and replica tablet from the fake health check
+	tablets := hc.GetAllTablets()
+	var primaryTablet *topodatapb.Tablet
+
+	for _, tablet := range tablets {
+		if tablet.Type == topodatapb.TabletType_PRIMARY {
+			primaryTablet = tablet
+		}
+	}
+	require.NotNil(t, primaryTablet)
+	hc.SetServing(primaryTablet, true)
+	hc.Broadcast(primaryTablet)
+	hc.SetServing(primaryTablet, false)
+
+	var res *sqltypes.Result
+	var err error
+	queryChan := make(chan struct{})
+	go func() {
+		res, err = tg.Execute(context.Background(), target, "query", nil, 0, 0, nil)
+		queryChan <- struct{}{}
+	}()
+
+	select {
+	case <-queryChan:
+		require.Nil(t, res)
+		require.Error(t, err)
+		require.Equal(t, "target: ks1.-80.primary: inconsistent state detected, primary is serving but initially found no available tablet", err.Error())
 	case <-time.After(15 * time.Second):
 		t.Fatalf("timed out waiting for query to execute")
 	}

@@ -90,7 +90,8 @@ type Resource string
 
 // Resource definitions.
 const (
-	ClusterResource Resource = "Cluster"
+	ClusterResource  Resource = "Cluster"
+	TopologyResource Resource = "Topology"
 
 	/* generic topo resources */
 
@@ -104,8 +105,12 @@ const (
 
 	/* vschema resources */
 
-	SrvVSchemaResource Resource = "SrvVSchema"
-	VSchemaResource    Resource = "VSchema"
+	VSchemaResource Resource = "VSchema"
+
+	/* serving graph resources */
+
+	SrvKeyspaceResource Resource = "SrvKeyspace"
+	SrvVSchemaResource  Resource = "SrvVSchema"
 
 	/* misc resources */
 
@@ -115,4 +120,6 @@ const (
 	WorkflowResource                 Resource = "Workflow"
 
 	VTExplainResource Resource = "VTExplain"
+
+	TabletFullStatusResource Resource = "TabletFullStatus"
 )

@@ -19,7 +19,6 @@ package servenv
 import (
 	"fmt"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -49,7 +48,12 @@ func Run(port int) {
 	if err != nil {
 		log.Exit(err)
 	}
-	go http.Serve(l, nil)
+	go func() {
+		err := HTTPServe(l)
+		if err != nil {
+			log.Errorf("http serve returned unexpected error: %v", err)
+		}
+	}()
 
 	ExitChan = make(chan os.Signal, 1)
 	signal.Notify(ExitChan, syscall.SIGTERM, syscall.SIGINT)
@@ -58,18 +62,18 @@ func Run(port int) {
 	l.Close()
 
 	startTime := time.Now()
-	log.Infof("Entering lameduck mode for at least %v", *lameduckPeriod)
+	log.Infof("Entering lameduck mode for at least %v", lameduckPeriod)
 	log.Infof("Firing asynchronous OnTerm hooks")
 	go onTermHooks.Fire()
 
-	fireOnTermSyncHooks(*onTermTimeout)
-	if remain := *lameduckPeriod - time.Since(startTime); remain > 0 {
+	fireOnTermSyncHooks(onTermTimeout)
+	if remain := lameduckPeriod - time.Since(startTime); remain > 0 {
 		log.Infof("Sleeping an extra %v after OnTermSync to finish lameduck period", remain)
 		time.Sleep(remain)
 	}
 
 	log.Info("Shutting down gracefully")
-	fireOnCloseHooks(*onCloseTimeout)
+	fireOnCloseHooks(onCloseTimeout)
 }
 
 // Close runs any registered exit hooks in parallel.

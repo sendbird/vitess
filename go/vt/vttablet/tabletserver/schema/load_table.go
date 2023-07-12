@@ -26,6 +26,7 @@ import (
 	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
@@ -33,8 +34,8 @@ import (
 )
 
 // LoadTable creates a Table from the schema info in the database.
-func LoadTable(conn *connpool.DBConn, databaseName, tableName string, comment string) (*Table, error) {
-	ta := NewTable(tableName)
+func LoadTable(conn *connpool.DBConn, databaseName, tableName, tableType string, comment string) (*Table, error) {
+	ta := NewTable(tableName, NoType)
 	sqlTableName := sqlparser.String(ta.Name)
 	if err := fetchColumns(ta, conn, databaseName, sqlTableName); err != nil {
 		return nil, err
@@ -48,6 +49,8 @@ func LoadTable(conn *connpool.DBConn, databaseName, tableName string, comment st
 			return nil, err
 		}
 		ta.Type = Message
+	case strings.Contains(tableType, tmutils.TableView):
+		ta.Type = View
 	}
 	return ta, nil
 }
@@ -125,7 +128,7 @@ func loadMessageInfo(ta *Table, comment string) error {
 
 	// make sure required columns exist in the table schema
 	for _, col := range requiredCols {
-		num := ta.FindColumn(sqlparser.NewColIdent(col))
+		num := ta.FindColumn(sqlparser.NewIdentifierCI(col))
 		if num == -1 {
 			return fmt.Errorf("%s missing from message table: %s", col, ta.Name.String())
 		}
@@ -137,7 +140,7 @@ func loadMessageInfo(ta *Table, comment string) error {
 	if len(specifiedCols) > 0 {
 		// make sure that all the specified columns exist in the table schema
 		for _, col := range specifiedCols {
-			num := ta.FindColumn(sqlparser.NewColIdent(col))
+			num := ta.FindColumn(sqlparser.NewIdentifierCI(col))
 			if num == -1 {
 				return fmt.Errorf("%s missing from message table: %s", col, ta.Name.String())
 			}

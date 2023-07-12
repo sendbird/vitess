@@ -19,14 +19,6 @@ FROM vitess/base:${VT_BASE_VER} AS base
 
 FROM debian:${DEBIAN_VER}
 
-# TODO: remove when https://github.com/vitessio/vitess/issues/3553 is fixed
-RUN apt-get update && \
-   apt-get upgrade -qq && \
-   apt-get install default-mysql-client -qq --no-install-recommends && \
-   apt-get autoremove && \
-   apt-get clean && \
-   rm -rf /var/lib/apt/lists/*
-
 # Set up Vitess environment (just enough to run pre-built Go binaries)
 ENV VTROOT /vt/src/vitess.io/vitess
 ENV VTDATAROOT /vtdataroot
@@ -49,7 +41,6 @@ COPY --from=base /vt/bin/vtctl /vt/bin/
 COPY --from=base /vt/bin/vtctlclient /vt/bin/
 COPY --from=base /vt/bin/vtgate /vt/bin/
 COPY --from=base /vt/bin/vttablet /vt/bin/
-COPY --from=base /vt/bin/vtworker /vt/bin/
 COPY --from=base /vt/bin/vtbackup /vt/bin/
 COPY --from=base /vt/bin/vtadmin /vt/bin/
 

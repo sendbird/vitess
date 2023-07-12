@@ -25,6 +25,7 @@ import (
 	"vitess.io/vitess/go/vt/dbconfigs"
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 )
 
 // resultStreamer streams the results of the requested query
@@ -37,7 +38,7 @@ type resultStreamer struct {
 
 	cp        dbconfigs.Connector
 	query     string
-	tableName sqlparser.TableIdent
+	tableName sqlparser.IdentifierCS
 	send      func(*binlogdatapb.VStreamResultsResponse) error
 	vse       *Engine
 	pktsize   PacketSizer
@@ -72,7 +73,10 @@ func (rs *resultStreamer) Stream() error {
 		return err
 	}
 	defer conn.Close()
-	gtid, err := conn.streamWithSnapshot(rs.ctx, rs.tableName.String(), rs.query)
+	gtid, rotatedLog, err := conn.streamWithSnapshot(rs.ctx, rs.tableName.String(), rs.query)
+	if rotatedLog {
+		rs.vse.vstreamerFlushedBinlogs.Add(1)
+	}
 	if err != nil {
 		return err
 	}
@@ -101,7 +105,7 @@ func (rs *resultStreamer) Stream() error {
 		}
 
 		// check throttler.
-		if !rs.vse.throttlerClient.ThrottleCheckOKOrWait(rs.ctx) {
+		if !rs.vse.throttlerClient.ThrottleCheckOKOrWaitAppName(rs.ctx, throttlerapp.ResultStreamerName) {
 			continue
 		}
 

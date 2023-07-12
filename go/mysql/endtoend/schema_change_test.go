@@ -22,6 +22,7 @@ import (
 	"strings"
 	"testing"
 
+	"vitess.io/vitess/go/vt/sidecardb"
 	"vitess.io/vitess/go/vt/sqlparser"
 
 	"github.com/stretchr/testify/require"
@@ -32,7 +33,6 @@ import (
 var ctx = context.Background()
 
 const (
-	createDb        = `create database if not exists _vt`
 	createUserTable = `create table vttest.product (id bigint(20) primary key, name char(10) CHARACTER SET utf8 COLLATE utf8_unicode_ci, created bigint(20))`
 	dropTestTable   = `drop table if exists product`
 )
@@ -42,10 +42,9 @@ func TestChangeSchemaIsNoticed(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.Close()
 
-	_, err = conn.ExecuteFetch(createDb, 1000, true)
-	require.NoError(t, err)
-	_, err = conn.ExecuteFetch(mysql.CreateSchemaCopyTable, 1000, true)
-	require.NoError(t, err)
+	clearQuery := sqlparser.BuildParsedQuery(mysql.ClearSchemaCopy, sidecardb.GetIdentifier()).Query
+	insertQuery := sqlparser.BuildParsedQuery(mysql.InsertIntoSchemaCopy, sidecardb.GetIdentifier()).Query
+	detectQuery := sqlparser.BuildParsedQuery(mysql.DetectSchemaChange, sidecardb.GetIdentifier()).Query
 
 	tests := []struct {
 		name    string
@@ -91,18 +90,18 @@ func TestChangeSchemaIsNoticed(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// reset schemacopy
-			_, err := conn.ExecuteFetch(mysql.ClearSchemaCopy, 1000, true)
+			_, err := conn.ExecuteFetch(clearQuery, 1000, true)
 			require.NoError(t, err)
 			_, err = conn.ExecuteFetch(dropTestTable, 1000, true)
 			require.NoError(t, err)
 			_, err = conn.ExecuteFetch(createUserTable, 1000, true)
 			require.NoError(t, err)
-			rs, err := conn.ExecuteFetch(mysql.InsertIntoSchemaCopy, 1000, true)
+			rs, err := conn.ExecuteFetch(insertQuery, 1000, true)
 			require.NoError(t, err)
 			require.NotZero(t, rs.RowsAffected)
 
 			// make sure no changes are detected
-			rs, err = conn.ExecuteFetch(mysql.DetectSchemaChange, 1000, true)
+			rs, err = conn.ExecuteFetch(detectQuery, 1000, true)
 			require.NoError(t, err)
 			require.Empty(t, rs.Rows)
 
@@ -113,7 +112,7 @@ func TestChangeSchemaIsNoticed(t *testing.T) {
 			}
 
 			// make sure the change is detected
-			rs, err = conn.ExecuteFetch(mysql.DetectSchemaChange, 1000, true)
+			rs, err = conn.ExecuteFetch(detectQuery, 1000, true)
 			require.NoError(t, err)
 			require.NotEmpty(t, rs.Rows)
 
@@ -123,8 +122,8 @@ func TestChangeSchemaIsNoticed(t *testing.T) {
 				tables = append(tables, "table_name = "+sqlparser.String(apa))
 			}
 			tableNamePredicates := strings.Join(tables, " OR ")
-			del := fmt.Sprintf("%s AND %s", mysql.ClearSchemaCopy, tableNamePredicates)
-			upd := fmt.Sprintf("%s AND %s", mysql.InsertIntoSchemaCopy, tableNamePredicates)
+			del := fmt.Sprintf("%s AND %s", clearQuery, tableNamePredicates)
+			upd := fmt.Sprintf("%s AND %s", insertQuery, tableNamePredicates)
 
 			_, err = conn.ExecuteFetch(del, 1000, true)
 			require.NoError(t, err)
@@ -132,7 +131,7 @@ func TestChangeSchemaIsNoticed(t *testing.T) {
 			require.NoError(t, err)
 
 			// make sure the change is detected
-			rs, err = conn.ExecuteFetch(mysql.DetectSchemaChange, 1000, true)
+			rs, err = conn.ExecuteFetch(detectQuery, 1000, true)
 			require.NoError(t, err)
 			require.Empty(t, rs.Rows)
 		})

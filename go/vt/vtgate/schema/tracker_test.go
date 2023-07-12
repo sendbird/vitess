@@ -17,7 +17,9 @@ limitations under the License.
 package schema
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -31,19 +33,47 @@ import (
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/log"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/sidecardb"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 	"vitess.io/vitess/go/vt/vttablet/sandboxconn"
 )
 
+var (
+	keyspace = "ks"
+	cell     = "aa"
+)
+
+func TestMain(m *testing.M) {
+	exitCode := func() int {
+		ts := memorytopo.NewServer(cell)
+		ts.CreateKeyspace(context.Background(), keyspace, &topodatapb.Keyspace{})
+		_, created := sidecardb.NewIdentifierCache(func(ctx context.Context, keyspace string) (string, error) {
+			ki, err := ts.GetKeyspace(ctx, keyspace)
+			if err != nil {
+				return "", err
+			}
+			return ki.SidecarDbName, nil
+		})
+		if !created {
+			log.Error("Failed to create a new sidecar database identifier cache as one already existed!")
+			return 1
+		}
+		return m.Run()
+	}()
+	os.Exit(exitCode)
+}
+
 func TestTracking(t *testing.T) {
 	target := &querypb.Target{
-		Keyspace:   "ks",
+		Keyspace:   keyspace,
 		Shard:      "-80",
 		TabletType: topodatapb.TabletType_PRIMARY,
-		Cell:       "aa",
+		Cell:       cell,
 	}
 	tablet := &topodatapb.Tablet{
 		Keyspace: target.Keyspace,
@@ -106,34 +136,34 @@ func TestTracking(t *testing.T) {
 		deltas: []delta{d0, d1},
 		exp: map[string][]vindexes.Column{
 			"t1": {
-				{Name: sqlparser.NewColIdent("id"), Type: querypb.Type_INT32},
-				{Name: sqlparser.NewColIdent("name"), Type: querypb.Type_VARCHAR, CollationName: "utf8_bin"}},
+				{Name: sqlparser.NewIdentifierCI("id"), Type: querypb.Type_INT32},
+				{Name: sqlparser.NewIdentifierCI("name"), Type: querypb.Type_VARCHAR, CollationName: "utf8_bin"}},
 			"t2": {
-				{Name: sqlparser.NewColIdent("id"), Type: querypb.Type_VARCHAR, CollationName: "utf8_bin"}},
+				{Name: sqlparser.NewIdentifierCI("id"), Type: querypb.Type_VARCHAR, CollationName: "utf8_bin"}},
 			"prior": {
-				{Name: sqlparser.NewColIdent("id"), Type: querypb.Type_INT32}},
+				{Name: sqlparser.NewIdentifierCI("id"), Type: querypb.Type_INT32}},
 		},
 	}, {
 		tName:  "delete t1 and prior, updated t2 and new t3",
 		deltas: []delta{d0, d1, d2},
 		exp: map[string][]vindexes.Column{
 			"t2": {
-				{Name: sqlparser.NewColIdent("id"), Type: querypb.Type_VARCHAR, CollationName: "utf8_bin"},
-				{Name: sqlparser.NewColIdent("name"), Type: querypb.Type_VARCHAR, CollationName: "utf8_bin"}},
+				{Name: sqlparser.NewIdentifierCI("id"), Type: querypb.Type_VARCHAR, CollationName: "utf8_bin"},
+				{Name: sqlparser.NewIdentifierCI("name"), Type: querypb.Type_VARCHAR, CollationName: "utf8_bin"}},
 			"t3": {
-				{Name: sqlparser.NewColIdent("id"), Type: querypb.Type_DATETIME}},
+				{Name: sqlparser.NewIdentifierCI("id"), Type: querypb.Type_DATETIME}},
 		},
 	}, {
 		tName:  "new t4",
 		deltas: []delta{d0, d1, d2, d3},
 		exp: map[string][]vindexes.Column{
 			"t2": {
-				{Name: sqlparser.NewColIdent("id"), Type: querypb.Type_VARCHAR, CollationName: "utf8_bin"},
-				{Name: sqlparser.NewColIdent("name"), Type: querypb.Type_VARCHAR, CollationName: "utf8_bin"}},
+				{Name: sqlparser.NewIdentifierCI("id"), Type: querypb.Type_VARCHAR, CollationName: "utf8_bin"},
+				{Name: sqlparser.NewIdentifierCI("name"), Type: querypb.Type_VARCHAR, CollationName: "utf8_bin"}},
 			"t3": {
-				{Name: sqlparser.NewColIdent("id"), Type: querypb.Type_DATETIME}},
+				{Name: sqlparser.NewIdentifierCI("id"), Type: querypb.Type_DATETIME}},
 			"t4": {
-				{Name: sqlparser.NewColIdent("name"), Type: querypb.Type_VARCHAR, CollationName: "utf8_bin"}},
+				{Name: sqlparser.NewIdentifierCI("name"), Type: querypb.Type_VARCHAR, CollationName: "utf8_bin"}},
 		},
 	},
 	}
@@ -141,7 +171,7 @@ func TestTracking(t *testing.T) {
 		t.Run(fmt.Sprintf("%d - %s", i, tcase.tName), func(t *testing.T) {
 			sbc := sandboxconn.NewSandboxConn(tablet)
 			ch := make(chan *discovery.TabletHealth)
-			tracker := NewTracker(ch, nil)
+			tracker := NewTracker(ch, "", false)
 			tracker.consumeDelay = 1 * time.Millisecond
 			tracker.Start()
 			defer tracker.Stop()
@@ -197,10 +227,10 @@ func TestTracking(t *testing.T) {
 
 func TestTrackingUnHealthyTablet(t *testing.T) {
 	target := &querypb.Target{
-		Keyspace:   "ks",
+		Keyspace:   keyspace,
 		Shard:      "-80",
 		TabletType: topodatapb.TabletType_PRIMARY,
-		Cell:       "aa",
+		Cell:       cell,
 	}
 	tablet := &topodatapb.Tablet{
 		Keyspace: target.Keyspace,
@@ -210,7 +240,7 @@ func TestTrackingUnHealthyTablet(t *testing.T) {
 
 	sbc := sandboxconn.NewSandboxConn(tablet)
 	ch := make(chan *discovery.TabletHealth)
-	tracker := NewTracker(ch, nil)
+	tracker := NewTracker(ch, "", false)
 	tracker.consumeDelay = 1 * time.Millisecond
 	tracker.Start()
 	defer tracker.Stop()
@@ -260,7 +290,9 @@ func TestTrackingUnHealthyTablet(t *testing.T) {
 	}
 
 	require.False(t, waitTimeout(&wg, 5*time.Second), "schema was updated but received no signal")
-	require.Equal(t, []string{mysql.FetchTables, mysql.FetchUpdatedTables, mysql.FetchTables}, sbc.StringQueries())
+	require.Equal(t, []string{sqlparser.BuildParsedQuery(mysql.FetchTables, sidecardb.DefaultName).Query,
+		sqlparser.BuildParsedQuery(mysql.FetchUpdatedTables, sidecardb.DefaultName).Query,
+		sqlparser.BuildParsedQuery(mysql.FetchTables, sidecardb.DefaultName).Query}, sbc.StringQueries())
 }
 
 func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
@@ -307,4 +339,87 @@ func TestTrackerGetKeyspaceUpdateController(t *testing.T) {
 	assert.NotNil(t, ks1.reloadKeyspace, "ks1 needs to be initialized")
 	assert.NotNil(t, ks2.reloadKeyspace, "ks2 needs to be initialized")
 	assert.Nil(t, ks3.reloadKeyspace, "ks3 already initialized")
+}
+
+// TestViewsTracking tests that the tracker is able to track views.
+func TestViewsTracking(t *testing.T) {
+	target := &querypb.Target{Cell: cell, Keyspace: keyspace, Shard: "-80", TabletType: topodatapb.TabletType_PRIMARY}
+	tablet := &topodatapb.Tablet{Keyspace: target.Keyspace, Shard: target.Shard, Type: target.TabletType}
+
+	schemaDefResult := []map[string]string{{
+		"prior": "create view prior as select 1 from tbl",
+		"t1":    "create view t1 as select 1 from tbl1",
+		"t2":    "create view t2 as select 1 from tbl2",
+	}, {
+		"t2": "create view t2 as select 1,2 from tbl2",
+		"t3": "create view t3 as select 1 from tbl3",
+	}, {
+		"t4": "create view t4 as select 1 from tbl4",
+	}}
+
+	testcases := []struct {
+		testName string
+		updView  []string
+		exp      map[string]string
+	}{{
+		testName: "new views",
+		updView:  []string{"prior", "t1", "t2"},
+		exp: map[string]string{
+			"t1":    "select 1 from tbl1",
+			"t2":    "select 1 from tbl2",
+			"prior": "select 1 from tbl"},
+	}, {
+		testName: "delete prior, updated t2 and new t3",
+		updView:  []string{"prior", "t2", "t3"},
+		exp: map[string]string{
+			"t1": "select 1 from tbl1",
+			"t2": "select 1, 2 from tbl2",
+			"t3": "select 1 from tbl3"},
+	}, {
+		testName: "new t4",
+		updView:  []string{"t4"},
+		exp: map[string]string{
+			"t1": "select 1 from tbl1",
+			"t2": "select 1, 2 from tbl2",
+			"t3": "select 1 from tbl3",
+			"t4": "select 1 from tbl4"},
+	}}
+
+	ch := make(chan *discovery.TabletHealth)
+	tracker := NewTracker(ch, "", true)
+	tracker.tables = nil // making tables map nil - so load keyspace does not try to load the tables information.
+	tracker.consumeDelay = 1 * time.Millisecond
+	tracker.Start()
+	defer tracker.Stop()
+
+	wg := sync.WaitGroup{}
+	tracker.RegisterSignalReceiver(func() {
+		wg.Done()
+	})
+
+	sbc := sandboxconn.NewSandboxConn(tablet)
+	sbc.SetSchemaResult(schemaDefResult)
+
+	for count, tcase := range testcases {
+		t.Run(tcase.testName, func(t *testing.T) {
+			wg.Add(1)
+			ch <- &discovery.TabletHealth{
+				Conn:    sbc,
+				Tablet:  tablet,
+				Target:  target,
+				Serving: true,
+				Stats:   &querypb.RealtimeStats{ViewSchemaChanged: tcase.updView},
+			}
+
+			require.False(t, waitTimeout(&wg, time.Second), "schema was updated but received no signal")
+			require.EqualValues(t, count+1, sbc.GetSchemaCount.Load())
+
+			_, keyspacePresent := tracker.tracked[target.Keyspace]
+			require.Equal(t, true, keyspacePresent)
+
+			for k, v := range tcase.exp {
+				utils.MustMatch(t, v, sqlparser.String(tracker.GetViews(keyspace, k)), "mismatch for table: ", k)
+			}
+		})
+	}
 }

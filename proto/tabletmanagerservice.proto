@@ -66,6 +66,8 @@ service TabletManager {
 
   rpc ApplySchema(tabletmanagerdata.ApplySchemaRequest) returns (tabletmanagerdata.ApplySchemaResponse) {};
 
+  rpc ResetSequences(tabletmanagerdata.ResetSequencesRequest) returns (tabletmanagerdata.ResetSequencesResponse) {};
+
   rpc LockTables(tabletmanagerdata.LockTablesRequest) returns (tabletmanagerdata.LockTablesResponse) {};
 
   rpc UnlockTables(tabletmanagerdata.UnlockTablesRequest) returns (tabletmanagerdata.UnlockTablesResponse) {};
@@ -114,6 +116,7 @@ service TabletManager {
   // VReplication API
   rpc VReplicationExec(tabletmanagerdata.VReplicationExecRequest) returns(tabletmanagerdata.VReplicationExecResponse) {};
   rpc VReplicationWaitForPos(tabletmanagerdata.VReplicationWaitForPosRequest) returns(tabletmanagerdata.VReplicationWaitForPosResponse) {};
+  rpc UpdateVRWorkflow(tabletmanagerdata.UpdateVRWorkflowRequest) returns(tabletmanagerdata.UpdateVRWorkflowResponse) {};
 
   // VDiff API
   rpc VDiff(tabletmanagerdata.VDiffRequest) returns(tabletmanagerdata.VDiffResponse) {};
@@ -144,6 +147,12 @@ service TabletManager {
   // ReplicaWasPromoted tells the remote tablet it is now the primary
   rpc ReplicaWasPromoted(tabletmanagerdata.ReplicaWasPromotedRequest) returns (tabletmanagerdata.ReplicaWasPromotedResponse) {};
 
+  // ResetReplicationParameters resets the replica replication parameters
+  rpc ResetReplicationParameters(tabletmanagerdata.ResetReplicationParametersRequest) returns (tabletmanagerdata.ResetReplicationParametersResponse) {};
+
+  // FullStatus collects and returns the full status of MySQL including the replication information, semi-sync information, GTID information among others
+  rpc FullStatus(tabletmanagerdata.FullStatusRequest) returns (tabletmanagerdata.FullStatusResponse) {};
+
   // SetReplicationSource tells the replica to reparent
   rpc SetReplicationSource(tabletmanagerdata.SetReplicationSourceRequest) returns (tabletmanagerdata.SetReplicationSourceResponse) {};
 
@@ -166,6 +175,4 @@ service TabletManager {
   // RestoreFromBackup deletes all local data and restores it from the latest backup.
   rpc RestoreFromBackup(tabletmanagerdata.RestoreFromBackupRequest) returns (stream tabletmanagerdata.RestoreFromBackupResponse) {};
 
-  // Generic VExec request. Can be used for various purposes
-  rpc VExec(tabletmanagerdata.VExecRequest) returns(tabletmanagerdata.VExecResponse) {};
 }

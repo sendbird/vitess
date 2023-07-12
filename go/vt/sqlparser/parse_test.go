@@ -29,6 +29,8 @@ import (
 	"sync"
 	"testing"
 
+	"vitess.io/vitess/go/test/utils"
+
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/stretchr/testify/assert"
@@ -42,9 +44,8 @@ var (
 		partialDDL           bool
 		ignoreNormalizerTest bool
 	}{{
-		input:      "create table x(location GEOMETRYCOLLECTION DEFAULT POINT(7.0, 3.0))",
-		output:     "create table x",
-		partialDDL: true,
+		input:  "create table x(location GEOMETRYCOLLECTION DEFAULT (POINT(7.0, 3.0)))",
+		output: "create table x (\n\tlocation GEOMETRYCOLLECTION default (point(7.0, 3.0))\n)",
 	}, {
 		input:  "create table t (id int primary key, dt datetime DEFAULT (CURRENT_TIMESTAMP))",
 		output: "create table t (\n\tid int primary key,\n\tdt datetime default current_timestamp()\n)",
@@ -71,7 +72,7 @@ var (
 		output: "select 1 from t1 where exists (select 1 from dual) = 1",
 	}, {
 		input:  "create table x(location GEOMETRY DEFAULT (POINT(7.0, 3.0)))",
-		output: "create table x (\n\tlocation GEOMETRY default (POINT(7.0, 3.0))\n)",
+		output: "create table x (\n\tlocation GEOMETRY default (point(7.0, 3.0))\n)",
 	}, {
 		input:  "select 1",
 		output: "select 1 from dual",
@@ -161,28 +162,343 @@ var (
 		output: "create table x (\n\tlocation POINT default (7.0)\n)",
 	}, {
 		input:  "create table x(location LINESTRING DEFAULT (POINT(7.0, 3.0)))",
-		output: "create table x (\n\tlocation LINESTRING default (POINT(7.0, 3.0))\n)",
+		output: "create table x (\n\tlocation LINESTRING default (point(7.0, 3.0))\n)",
+	}, {
+		input:  "select linestring(pt1, pt2) from geom",
+		output: "select linestring(pt1, pt2) from geom",
 	}, {
 		input:  "create table x(location POLYGON DEFAULT (POINT(7.0, 3.0)))",
-		output: "create table x (\n\tlocation POLYGON default (POINT(7.0, 3.0))\n)",
+		output: "create table x (\n\tlocation POLYGON default (point(7.0, 3.0))\n)",
 	}, {
 		input:  "create table x(location MULTIPOINT DEFAULT (POINT(7.0, 3.0)))",
-		output: "create table x (\n\tlocation MULTIPOINT default (POINT(7.0, 3.0))\n)",
+		output: "create table x (\n\tlocation MULTIPOINT default (point(7.0, 3.0))\n)",
 	}, {
 		input:  "create table x(location MULTILINESTRING DEFAULT (POINT(7.0, 3.0)))",
-		output: "create table x (\n\tlocation MULTILINESTRING default (POINT(7.0, 3.0))\n)",
+		output: "create table x (\n\tlocation MULTILINESTRING default (point(7.0, 3.0))\n)",
 	}, {
 		input:  "create table x(location MULTIPOLYGON DEFAULT (POINT(7.0, 3.0)))",
-		output: "create table x (\n\tlocation MULTIPOLYGON default (POINT(7.0, 3.0))\n)",
+		output: "create table x (\n\tlocation MULTIPOLYGON default (point(7.0, 3.0))\n)",
 	}, {
 		input:  "create table x(location GEOMETRYCOLLECTION DEFAULT (POINT(7.0, 3.0)))",
-		output: "create table x (\n\tlocation GEOMETRYCOLLECTION default (POINT(7.0, 3.0))\n)",
+		output: "create table x (\n\tlocation GEOMETRYCOLLECTION default (point(7.0, 3.0))\n)",
+	}, {
+		input:  "create table x(location GEOMETRYCOLLECTION DEFAULT (LINESTRING(POINT(4, 5), POINT(4.6, 7.9), POINT(4.6, 7.9))))",
+		output: "create table x (\n\tlocation GEOMETRYCOLLECTION default (linestring(point(4, 5), point(4.6, 7.9), point(4.6, 7.9)))\n)",
+	}, {
+		input:  "create table x(location GEOMETRYCOLLECTION DEFAULT (LINESTRING(POINT(7.0, 3.0))))",
+		output: "create table x (\n\tlocation GEOMETRYCOLLECTION default (linestring(point(7.0, 3.0)))\n)",
+	}, {
+		input:  "create table x(location GEOMETRYCOLLECTION DEFAULT (POLYGON(LINESTRING(POINT(4, 5), POINT(4.6, 7.9), POINT(4.6, 7.9)))))",
+		output: "create table x (\n\tlocation GEOMETRYCOLLECTION default (polygon(linestring(point(4, 5), point(4.6, 7.9), point(4.6, 7.9))))\n)",
+	}, {
+		input:  "select ST_ASTEXT(POLYGON(linestrings)) from linestringTable",
+		output: "select st_astext(polygon(linestrings)) from linestringTable",
+	}, {
+		input:  "create table x(location GEOMETRYCOLLECTION DEFAULT (MULTIPOINT(POINT(4, 5), POINT(4.6, 7.9), POINT(4.6, 7.9))))",
+		output: "create table x (\n\tlocation GEOMETRYCOLLECTION default (multipoint(point(4, 5), point(4.6, 7.9), point(4.6, 7.9)))\n)",
+	}, {
+		input:  "select ST_ASTEXT(MULTIPOINT(points)) from pointsTable",
+		output: "select st_astext(multipoint(points)) from pointsTable",
+	}, {
+		input:  "create table x(location GEOMETRYCOLLECTION DEFAULT (MULTILINESTRING(LINESTRING(POINT(8,9), POINT(8,9)))))",
+		output: "create table x (\n\tlocation GEOMETRYCOLLECTION default (multilinestring(linestring(point(8, 9), point(8, 9))))\n)",
+	}, {
+		input:  "select ST_ASTEXT(MULTILINESTRING(linestrings)) from linestringsTable",
+		output: "select st_astext(multilinestring(linestrings)) from linestringsTable",
+	}, {
+		input:  "create table x(location GEOMETRYCOLLECTION DEFAULT (MULTIPOLYGON(POINT(7.0, 3.0), POINT(7.0, 3.0))))",
+		output: "create table x (\n\tlocation GEOMETRYCOLLECTION default (multipolygon(point(7.0, 3.0), point(7.0, 3.0)))\n)",
+	}, {
+		input:  "select ST_ASTEXT(MULTIPOLYGON(polygons)) from polygonTable",
+		output: "select st_astext(multipolygon(polygons)) from polygonTable",
+	}, {
+		input:  "SELECT ST_AsText(ST_GeomCollFromText('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))'))",
+		output: "select st_astext(st_geometrycollectionfromtext('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_GeomCollFromText('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))', 4326))",
+		output: "select st_astext(st_geometrycollectionfromtext('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))', 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_GeomCollFromText('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))', 4326, 'axis-order=lat-long'))",
+		output: "select st_astext(st_geometrycollectionfromtext('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))', 4326, 'axis-order=lat-long')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_GeomFromText('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))'))",
+		output: "select st_astext(st_geometryfromtext('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_GeomFromText('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))', 4326))",
+		output: "select st_astext(st_geometryfromtext('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))', 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_GeomFromText('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))', 4326, 'axis-order=lat-long'))",
+		output: "select st_astext(st_geometryfromtext('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))', 4326, 'axis-order=lat-long')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultilinestringFromText('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))'))",
+		output: "select st_astext(st_multilinestringfromtext('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultilinestringFromText('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))', 4326))",
+		output: "select st_astext(st_multilinestringfromtext('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))', 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultilinestringFromText('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))', 4326, 'axis-order=lat-long'))",
+		output: "select st_astext(st_multilinestringfromtext('MULTILINESTRING((10 10, 11 11), (9 9, 10 10))', 4326, 'axis-order=lat-long')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_LinestringFromText('LINESTRING((10 10, 11 11))'))",
+		output: "select st_astext(st_linestringfromtext('LINESTRING((10 10, 11 11))')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_LinestringFromText('LINESTRING((10 10, 11 11))', 4326))",
+		output: "select st_astext(st_linestringfromtext('LINESTRING((10 10, 11 11))', 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_LinestringFromText('LINESTRING((10 10, 11 11))', 4326, 'axis-order=lat-long'))",
+		output: "select st_astext(st_linestringfromtext('LINESTRING((10 10, 11 11))', 4326, 'axis-order=lat-long')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_PointFromText('POINT(10 10)'))",
+		output: "select st_astext(st_pointfromtext('POINT(10 10)')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_PointFromText('POINT(10 10)', 4326))",
+		output: "select st_astext(st_pointfromtext('POINT(10 10)', 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultiPointFromText('MULTIPOINT((10 10, 11 11))'))",
+		output: "select st_astext(st_multipointfromtext('MULTIPOINT((10 10, 11 11))')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultiPointFromText('MULTIPOINT((10 10, 11 11))', 4326))",
+		output: "select st_astext(st_multipointfromtext('MULTIPOINT((10 10, 11 11))', 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultiPointFromText('MULTIPOINT((10 10, 11 11))', 4326, 'axis-order=lat-long'))",
+		output: "select st_astext(st_multipointfromtext('MULTIPOINT((10 10, 11 11))', 4326, 'axis-order=lat-long')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultiPolygonFromText(@g))",
+		output: "select st_astext(st_multipolygonfromtext(@g)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultiPolygonFromText(@g, 4326))",
+		output: "select st_astext(st_multipolygonfromtext(@g, 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultiPolygonFromText(@g, 4326, 'axis-order=lat-long'))",
+		output: "select st_astext(st_multipolygonfromtext(@g, 4326, 'axis-order=lat-long')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_PolygonFromText(@g))",
+		output: "select st_astext(st_polygonfromtext(@g)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_PolygonFromText(@g, 4326))",
+		output: "select st_astext(st_polygonfromtext(@g, 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_PolygonFromText(@g, 4326, 'axis-order=long-lat'))",
+		output: "select st_astext(st_polygonfromtext(@g, 4326, 'axis-order=long-lat')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_GeomCollFromWKB(0x010100000000000000000022400000000000002240))",
+		output: "select st_astext(st_geometrycollectionfromwkb(0x010100000000000000000022400000000000002240)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_GeomCollFromWKB(g, 4326))",
+		output: "select st_astext(st_geometrycollectionfromwkb(g, 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_GeomCollFromText(g, 4326, 'axis-order=lat-long'))",
+		output: "select st_astext(st_geometrycollectionfromtext(g, 4326, 'axis-order=lat-long')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_GeomFromWKB(g))",
+		output: "select st_astext(st_geometryfromwkb(g)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_GeomFromWKB(g, 4326))",
+		output: "select st_astext(st_geometryfromwkb(g, 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_GeomFromWKB(g, 4326, 'axis-order=lat-long'))",
+		output: "select st_astext(st_geometryfromwkb(g, 4326, 'axis-order=lat-long')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultilinestringFromWKB(g))",
+		output: "select st_astext(st_multilinestringfromwkb(g)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultilinestringFromWKB(g, 4326))",
+		output: "select st_astext(st_multilinestringfromwkb(g, 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultilinestringFromWKB(0x01050000000200000001020000000200000000000000000024400000000000002440000000000000264000000000000026400102000000020000000000000000002240000000000000224000000000000024400000000000002440, 4326, 'axis-order=lat-long'))",
+		output: "select st_astext(st_multilinestringfromwkb(0x01050000000200000001020000000200000000000000000024400000000000002440000000000000264000000000000026400102000000020000000000000000002240000000000000224000000000000024400000000000002440, 4326, 'axis-order=lat-long')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_LinestringFromWKB(g))",
+		output: "select st_astext(st_linestringfromwkb(g)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_LinestringFromWKB(g, 4326))",
+		output: "select st_astext(st_linestringfromwkb(g, 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_LinestringFromWKB(g, 4326, 'axis-order=lat-long'))",
+		output: "select st_astext(st_linestringfromwkb(g, 4326, 'axis-order=lat-long')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_PointFromWKB(mp))",
+		output: "select st_astext(st_pointfromwkb(mp)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_PointFromWKB(mp, 4326))",
+		output: "select st_astext(st_pointfromwkb(mp, 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultiPointFromWKB(mp))",
+		output: "select st_astext(st_multipointfromwkb(mp)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultiPointFromWKB(mp, 4326))",
+		output: "select st_astext(st_multipointfromwkb(mp, 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultiPointFromWKB(mp, 4326, 'axis-order=lat-long'))",
+		output: "select st_astext(st_multipointfromwkb(mp, 4326, 'axis-order=lat-long')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultiPolygonFromText(g))",
+		output: "select st_astext(st_multipolygonfromtext(g)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultiPolygonFromText(g, 4326))",
+		output: "select st_astext(st_multipolygonfromtext(g, 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_MultiPolygonFromText(g, 4326, 'axis-order=lat-long'))",
+		output: "select st_astext(st_multipolygonfromtext(g, 4326, 'axis-order=lat-long')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_PolygonFromText(g))",
+		output: "select st_astext(st_polygonfromtext(g)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_PolygonFromText(g, 4326))",
+		output: "select st_astext(st_polygonfromtext(g, 4326)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_PolygonFromText(g, 4326, 'axis-order=long-lat'), 'axis-order=long-lat')",
+		output: "select st_astext(st_polygonfromtext(g, 4326, 'axis-order=long-lat'), 'axis-order=long-lat') from dual",
+	}, {
+		input:  "SELECT ST_AsWKT(ST_GeomCollFromText(g, 4326, 'axis-order=lat-long'))",
+		output: "select st_astext(st_geometrycollectionfromtext(g, 4326, 'axis-order=lat-long')) from dual",
+	}, {
+		input:  "SELECT ST_AsBinary(ST_PolygonFromText(g, 4326, 'axis-order=long-lat'), 'axis-order=long-lat')",
+		output: "select st_asbinary(st_polygonfromtext(g, 4326, 'axis-order=long-lat'), 'axis-order=long-lat') from dual",
+	}, {
+		input:  "SELECT ST_AsWKB(ST_GeomCollFromText(g, 4326, 'axis-order=lat-long'))",
+		output: "select st_asbinary(st_geometrycollectionfromtext(g, 4326, 'axis-order=lat-long')) from dual",
+	}, {
+		input:  "SELECT ST_Dimension(ST_GeomFromText('LineString(1 1,2 2)'))",
+		output: "select st_dimension(st_geometryfromtext('LineString(1 1,2 2)')) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_Envelope(ST_GeomFromText('LineString(1 1,2 2)')))",
+		output: "select st_astext(st_envelope(st_geometryfromtext('LineString(1 1,2 2)'))) from dual",
+	}, {
+		input:  "SELECT ST_IsSimple(ST_GeomFromText('POINT(1 1)'))",
+		output: "select st_issimple(st_geometryfromtext('POINT(1 1)')) from dual",
+	}, {
+		input:  "SELECT ST_GeometryType(ST_GeomFromText('POINT(1 1)'))",
+		output: "select st_geometrytype(st_geometryfromtext('POINT(1 1)')) from dual",
+	}, {
+		input:  "SELECT ST_IsEmpty(ST_GeomFromText('POINT(1 1)'))",
+		output: "select st_isempty(st_geometryfromtext('POINT(1 1)')) from dual",
+	}, {
+		input:  "SELECT ST_Latitude(@pt);",
+		output: "select st_latitude(@pt) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_Latitude(@pt, 10));",
+		output: "select st_astext(st_latitude(@pt, 10)) from dual",
+	}, {
+		input:  "SELECT ST_Longitude(@pt);",
+		output: "select st_longitude(@pt) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_Longitude(@pt, 10));",
+		output: "select st_astext(st_longitude(@pt, 10)) from dual",
+	}, {
+		input:  "SELECT ST_X(@pt);",
+		output: "select st_x(@pt) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_X(@pt, 10));",
+		output: "select st_astext(st_x(@pt, 10)) from dual",
+	}, {
+		input:  "SELECT ST_Y(@pt);",
+		output: "select st_y(@pt) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_Y(@pt, 10));",
+		output: "select st_astext(st_y(@pt, 10)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_EndPoint(ST_GeomFromText(@ls)));",
+		output: "select st_astext(st_endpoint(st_geometryfromtext(@ls))) from dual",
+	}, {
+		input:  "SELECT ST_IsClosed(ST_GeomFromText(@ls1));",
+		output: "select st_isclosed(st_geometryfromtext(@ls1)) from dual",
+	}, {
+		input:  "SELECT IsClosed(ST_GeomFromText(@ls1));",
+		output: "select st_isclosed(st_geometryfromtext(@ls1)) from dual",
+	}, {
+		input:  "SELECT ST_Length(@ls);",
+		output: "select st_length(@ls) from dual",
+	}, {
+		input:  "SELECT ST_Length(@ls, 'metre');",
+		output: "select st_length(@ls, 'metre') from dual",
+	}, {
+		input:  "SELECT GLength(@ls);",
+		output: "select st_length(@ls) from dual",
+	}, {
+		input:  "SELECT GLength(@ls, 'metre');",
+		output: "select st_length(@ls, 'metre') from dual",
+	}, {
+		input:  "SELECT ST_NumPoints(ST_GeomFromText(@ls));",
+		output: "select st_numpoints(st_geometryfromtext(@ls)) from dual",
+	}, {
+		input:  "SELECT Numpoints(ST_GeomFromText(@ls));",
+		output: "select st_numpoints(st_geometryfromtext(@ls)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_PointN(ST_GeomFromText(@ls),2));",
+		output: "select st_astext(st_pointn(st_geometryfromtext(@ls), 2)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(PointN(ST_GeomFromText(@ls),2));",
+		output: "select st_astext(st_pointn(st_geometryfromtext(@ls), 2)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_StartPoint(ST_GeomFromText(@ls)));",
+		output: "select st_astext(st_startpoint(st_geometryfromtext(@ls))) from dual",
+	}, {
+		input:  "SELECT ST_AsText(StartPoint(ST_GeomFromText(@ls)));",
+		output: "select st_astext(st_startpoint(st_geometryfromtext(@ls))) from dual",
+	}, {
+		input:  "SELECT ST_Area(ST_GeomFromText(@mpoly));",
+		output: "select st_area(st_geometryfromtext(@mpoly)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_GeometryN(ST_GeomFromText(@gc),1));",
+		output: "select st_astext(st_geometryn(st_geometryfromtext(@gc), 1)) from dual",
+	}, {
+		input:  "SELECT ST_NumGeometries(ST_GeomFromText(@gc));",
+		output: "select st_numgeometries(st_geometryfromtext(@gc)) from dual",
+	}, {
+		input:  "SELECT ST_GeometryType(@poly),ST_AsText(ST_Centroid(@poly));",
+		output: "select st_geometrytype(@poly), st_astext(st_centroid(@poly)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_ExteriorRing(ST_GeomFromText(@poly)));",
+		output: "select st_astext(st_exteriorring(st_geometryfromtext(@poly))) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_InteriorRingN(ST_GeomFromText(@poly),1));",
+		output: "select st_astext(st_interiorringN(st_geometryfromtext(@poly), 1)) from dual",
+	}, {
+		input:  "SELECT ST_NumInteriorRings(ST_GeomFromText(@poly));",
+		output: "select st_numinteriorrings(st_geometryfromtext(@poly)) from dual",
+	}, {
+		input:  "SELECT ST_NumInteriorRing(ST_GeomFromText(@poly));",
+		output: "select st_numinteriorrings(st_geometryfromtext(@poly)) from dual",
+	}, {
+		input:  "SELECT ST_GeoHash(180,0,10), ST_GeoHash(-180,-90,15);",
+		output: "select st_geohash(180, 0, 10), st_geohash(-180, -90, 15) from dual",
+	}, {
+		input:  "SELECT ST_GeoHash(@p,10);",
+		output: "select st_geohash(@p, 10) from dual",
+	}, {
+		input:  "SELECT ST_LatFromGeoHash(ST_GeoHash(45,-20,10));",
+		output: "select st_latfromgeohash(st_geohash(45, -20, 10)) from dual",
+	}, {
+		input:  "SELECT ST_LongFromGeoHash(ST_GeoHash(45,-20,10));",
+		output: "select st_longfromgeohash(st_geohash(45, -20, 10)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_PointFromGeoHash(@gh,0));",
+		output: "select st_astext(st_pointfromgeohash(@gh, 0)) from dual",
+	}, {
+		input:  "SELECT ST_AsGeoJSON(ST_GeomFromText('POINT(11.11111 12.22222)'));",
+		output: "select st_asgeojson(st_geometryfromtext('POINT(11.11111 12.22222)')) from dual",
+	}, {
+		input:  "SELECT ST_AsGeoJSON(ST_GeomFromText('POINT(11.11111 12.22222)'),2);",
+		output: "select st_asgeojson(st_geometryfromtext('POINT(11.11111 12.22222)'), 2) from dual",
+	}, {
+		input:  "SELECT ST_AsGeoJSON(ST_GeomFromText('POINT(11.11111 12.22222)'),2,0);",
+		output: "select st_asgeojson(st_geometryfromtext('POINT(11.11111 12.22222)'), 2, 0) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_GeomFromGeoJSON(@json));",
+		output: "select st_astext(st_geomfromgeojson(@`json`)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_SRID(ST_GeomFromGeoJSON(@json, 0),0));",
+		output: "select st_astext(ST_SRID(st_geomfromgeojson(@`json`, 0), 0)) from dual",
+	}, {
+		input:  "SELECT ST_AsText(ST_SRID(ST_GeomFromGeoJSON(@json),1,4326));",
+		output: "select st_astext(ST_SRID(st_geomfromgeojson(@`json`), 1, 4326)) from dual",
 	}, {
 		input:  "WITH RECURSIVE  odd_num_cte (id, n) AS (SELECT 1, 1 union all SELECT id+1, n+2 from odd_num_cte where id < 5) SELECT * FROM odd_num_cte",
 		output: "with recursive odd_num_cte(id, n) as (select 1, 1 from dual union all select id + 1, n + 2 from odd_num_cte where id < 5) select * from odd_num_cte",
 	}, {
 		input:  "WITH topsales2003 AS (SELECT salesRepEmployeeNumber employeeNumber, SUM(quantityOrdered * priceEach) sales FROM orders INNER JOIN orderdetails USING (orderNumber) INNER JOIN customers USING (customerNumber) WHERE YEAR(shippedDate) = 2003 AND status = 'Shipped' GROUP BY salesRepEmployeeNumber ORDER BY sales DESC LIMIT 5)SELECT employeeNumber, firstName, lastName, sales FROM employees JOIN topsales2003 USING (employeeNumber)",
-		output: "with topsales2003 as (select salesRepEmployeeNumber as employeeNumber, SUM(quantityOrdered * priceEach) as sales from orders join orderdetails using (orderNumber) join customers using (customerNumber) where YEAR(shippedDate) = 2003 and `status` = 'Shipped' group by salesRepEmployeeNumber order by sales desc limit 5) select employeeNumber, firstName, lastName, sales from employees join topsales2003 using (employeeNumber)",
+		output: "with topsales2003 as (select salesRepEmployeeNumber as employeeNumber, sum(quantityOrdered * priceEach) as sales from orders join orderdetails using (orderNumber) join customers using (customerNumber) where YEAR(shippedDate) = 2003 and `status` = 'Shipped' group by salesRepEmployeeNumber order by sales desc limit 5) select employeeNumber, firstName, lastName, sales from employees join topsales2003 using (employeeNumber)",
 	}, {
 		input: "select 1 from t",
 	}, {
@@ -201,6 +517,24 @@ var (
 	}, {
 		input:  "select name, numbers from (select * from users) as x(name, numbers)",
 		output: "select `name`, numbers from (select * from users) as x(`name`, numbers)",
+	}, {
+		input:  "select 0b010, 0b0111, b'0111', b'011'",
+		output: "select B'010', B'0111', B'0111', B'011' from dual",
+	}, {
+		input:  "select 0x010, 0x0111, x'0111'",
+		output: "select 0x010, 0x0111, X'0111' from dual",
+	}, {
+		input:  "select date'2022-10-03'",
+		output: "select date'2022-10-03' from dual",
+	}, {
+		input:  "select date, time, timestamp from t",
+		output: "select `date`, `time`, `timestamp` from t",
+	}, {
+		input:  "select time'12:34:56'",
+		output: "select time'12:34:56' from dual",
+	}, {
+		input:  "select timestamp'2012-12-31 11:30:45'",
+		output: "select timestamp'2012-12-31 11:30:45' from dual",
 	}, {
 		input:  "select * from information_schema.columns",
 		output: "select * from information_schema.`columns`",
@@ -689,7 +1023,7 @@ var (
 	}, {
 		input: "select /* utc_timestamp as func */ utc_timestamp() from t",
 	}, {
-		input: "select /* utc_timestamp with fsp */ utc_timestamp(0) from t",
+		input: "select /* utc_timestamp with fsp */ utc_timestamp(1) from t",
 	}, {
 		input: "select /* utc_time */ utc_time() from t",
 	}, {
@@ -826,10 +1160,16 @@ var (
 		input: "select /* interval keyword */ adddate('2008-01-02', interval 1 year) from t",
 	}, {
 		input:  "select /* TIMESTAMPADD */ TIMESTAMPADD(MINUTE, 1, '2008-01-04') from t",
-		output: "select /* TIMESTAMPADD */ timestampadd(MINUTE, 1, '2008-01-04') from t",
+		output: "select /* TIMESTAMPADD */ timestampadd(minute, 1, '2008-01-04') from t",
 	}, {
 		input:  "select /* TIMESTAMPDIFF */ TIMESTAMPDIFF(MINUTE, '2008-01-02', '2008-01-04') from t",
-		output: "select /* TIMESTAMPDIFF */ timestampdiff(MINUTE, '2008-01-02', '2008-01-04') from t",
+		output: "select /* TIMESTAMPDIFF */ timestampdiff(minute, '2008-01-02', '2008-01-04') from t",
+	}, {
+		input:  "select DATE_ADD(MIN(FROM_UNIXTIME(1673444922)),interval -DAYOFWEEK(MIN(FROM_UNIXTIME(1673444922)))+1 DAY)",
+		output: "select date_add(min(FROM_UNIXTIME(1673444922)), interval -DAYOFWEEK(min(FROM_UNIXTIME(1673444922))) + 1 day) from dual",
+	}, {
+		input:  "select '2020-01-01' + interval month(DATE_SUB(FROM_UNIXTIME(1234), interval 1 month))-1 month",
+		output: "select '2020-01-01' + interval month(date_sub(FROM_UNIXTIME(1234), interval 1 month)) - 1 month from dual",
 	}, {
 		input: "select /* dual */ 1 from dual",
 	}, {
@@ -946,12 +1286,16 @@ var (
 		input:  "insert into user(format, tree, vitess) values ('Chuck', 42, 'Barry')",
 		output: "insert into `user`(`format`, `tree`, `vitess`) values ('Chuck', 42, 'Barry')",
 	}, {
-		input:  "insert into customer () values ()",
-		output: "insert into customer values ()",
+		input: "insert into customer() values ()",
 	}, {
 		input: "update /* simple */ a set b = 3",
 	}, {
 		input: "update /* a.b */ a.b set b = 3",
+	}, {
+		input: "update a.b set d = @v := d + 7 where u = 42",
+	}, {
+		input:  "select @topic3_id:= 10103;",
+		output: "select @topic3_id := 10103 from dual",
 	}, {
 		input: "update /* list */ a set b = 3, c = 4",
 	}, {
@@ -1018,31 +1362,32 @@ var (
 		input:  "delete from a1, a2 using t1 as a1 inner join t2 as a2 where a1.id=a2.id",
 		output: "delete a1, a2 from t1 as a1 join t2 as a2 where a1.id = a2.id",
 	}, {
-		input: "set /* simple */ a = 3",
+		input:  "set /* simple */ a = 3",
+		output: "set /* simple */ @@a = 3",
 	}, {
-		input: "set #simple\n b = 4",
+		input:  "set #simple\n b = 4",
+		output: "set #simple\n @@b = 4",
 	}, {
-		input: "set character_set_results = utf8",
+		input:  "set character_set_results = utf8",
+		output: "set @@character_set_results = utf8",
 	}, {
-		input: "set @@session.autocommit = true",
+		input:  "set @@session.autocommit = true",
+		output: "set @@autocommit = true",
 	}, {
-		input: "set @@session.`autocommit` = true",
-	}, {
-		input: "set @@session.'autocommit' = true",
-	}, {
-		input: "set @@session.\"autocommit\" = true",
+		input:  "set @@session.`autocommit` = true",
+		output: "set @@autocommit = true",
 	}, {
 		input:  "set @@session.autocommit = ON",
-		output: "set @@session.autocommit = 'on'",
+		output: "set @@autocommit = 'on'",
 	}, {
 		input:  "set @@session.autocommit= OFF",
-		output: "set @@session.autocommit = 'off'",
+		output: "set @@autocommit = 'off'",
 	}, {
 		input:  "set autocommit = on",
-		output: "set autocommit = 'on'",
+		output: "set @@autocommit = 'on'",
 	}, {
 		input:  "set autocommit = off",
-		output: "set autocommit = 'off'",
+		output: "set @@autocommit = 'off'",
 	}, {
 		input:  "set names utf8 collate foo",
 		output: "set names 'utf8'",
@@ -1057,7 +1402,7 @@ var (
 		output: "set charset 'utf8'",
 	}, {
 		input:  "set s = 1--4",
-		output: "set s = 1 - -4",
+		output: "set @@s = 1 - -4",
 	}, {
 		input:  "set character set \"utf8\"",
 		output: "set charset 'utf8'",
@@ -1066,65 +1411,100 @@ var (
 		output: "set charset default",
 	}, {
 		input:  "set session wait_timeout = 3600",
-		output: "set session wait_timeout = 3600",
+		output: "set @@wait_timeout = 3600",
 	}, {
 		input:  "set session wait_timeout = 3600, session autocommit = off",
-		output: "set session wait_timeout = 3600, session autocommit = 'off'",
+		output: "set @@wait_timeout = 3600, @@autocommit = 'off'",
 	}, {
 		input:  "set session wait_timeout = 3600, @@global.autocommit = off",
-		output: "set session wait_timeout = 3600, @@global.autocommit = 'off'",
+		output: "set @@wait_timeout = 3600, @@global.autocommit = 'off'",
 	}, {
-		input: "set /* list */ a = 3, b = 4",
+		input:  "set local wait_timeout = 3600",
+		output: "set @@wait_timeout = 3600",
 	}, {
-		input: "set /* mixed list */ a = 3, names 'utf8', charset 'ascii', b = 4",
+		input:  "set @@local.wait_timeout = 3600",
+		output: "set @@wait_timeout = 3600",
 	}, {
-		input: "set session transaction isolation level repeatable read",
+		input:  "set /* list */ a = 3, b = 4",
+		output: "set /* list */ @@a = 3, @@b = 4",
 	}, {
-		input: "set transaction isolation level repeatable read",
+		input:  "set /* mixed list */ a = 3, names 'utf8', charset 'ascii', b = 4",
+		output: "set /* mixed list */ @@a = 3, names 'utf8', charset 'ascii', @@b = 4",
 	}, {
-		input: "set global transaction isolation level repeatable read",
+		input:  "set session transaction isolation level repeatable read",
+		output: "set @@session.transaction_isolation = 'repeatable-read'",
 	}, {
-		input: "set transaction isolation level repeatable read",
+		input:  "set transaction isolation level repeatable read",
+		output: "set @@transaction_isolation = 'repeatable-read'",
 	}, {
-		input: "set transaction isolation level read committed",
+		input:  "set global transaction isolation level repeatable read",
+		output: "set @@global.transaction_isolation = 'repeatable-read'",
 	}, {
-		input: "set transaction isolation level read uncommitted",
+		input:  "set transaction isolation level repeatable read",
+		output: "set @@transaction_isolation = 'repeatable-read'",
 	}, {
-		input: "set transaction isolation level serializable",
+		input:  "set transaction isolation level read committed",
+		output: "set @@transaction_isolation = 'read-committed'",
 	}, {
-		input: "set transaction read write",
+		input:  "set transaction isolation level read uncommitted",
+		output: "set @@transaction_isolation = 'read-uncommitted'",
 	}, {
-		input: "set transaction read only",
+		input:  "set transaction isolation level serializable",
+		output: "set @@transaction_isolation = 'serializable'",
 	}, {
-		input: "set tx_read_only = 1",
+		input:  "set transaction read write",
+		output: "set @@transaction_read_only = 'off'",
 	}, {
-		input: "set tx_read_only = 0",
+		input:  "set transaction read only",
+		output: "set @@transaction_read_only = 'on'",
 	}, {
-		input: "set transaction_read_only = 1",
+		input:  "set session transaction read only, isolation level serializable",
+		output: "set @@session.transaction_read_only = 'on', @@session.transaction_isolation = 'serializable'",
 	}, {
-		input: "set transaction_read_only = 0",
+		input:  "set tx_read_only = 1",
+		output: "set @@tx_read_only = 1",
 	}, {
-		input: "set tx_isolation = 'repeatable read'",
+		input:  "set tx_read_only = 0",
+		output: "set @@tx_read_only = 0",
 	}, {
-		input: "set tx_isolation = 'read committed'",
+		input:  "set transaction_read_only = 1",
+		output: "set @@session.transaction_read_only = 1",
 	}, {
-		input: "set tx_isolation = 'read uncommitted'",
+		input:  "set transaction_read_only = 0",
+		output: "set @@session.transaction_read_only = 0",
 	}, {
-		input: "set tx_isolation = 'serializable'",
+		input: "set @@transaction_read_only = 1",
 	}, {
-		input: "set sql_safe_updates = 0",
+		input: "set @@transaction_isolation = 'read-committed'",
 	}, {
-		input: "set sql_safe_updates = 1",
+		input:  "set tx_isolation = 'repeatable read'",
+		output: "set @@tx_isolation = 'repeatable read'",
+	}, {
+		input:  "set tx_isolation = 'read committed'",
+		output: "set @@tx_isolation = 'read committed'",
+	}, {
+		input:  "set tx_isolation = 'read uncommitted'",
+		output: "set @@tx_isolation = 'read uncommitted'",
+	}, {
+		input:  "set tx_isolation = 'serializable'",
+		output: "set @@tx_isolation = 'serializable'",
+	}, {
+		input:  "set sql_safe_updates = 0",
+		output: "set @@sql_safe_updates = 0",
+	}, {
+		input:  "set sql_safe_updates = 1",
+		output: "set @@sql_safe_updates = 1",
 	}, {
 		input: "set @variable = 42",
 	}, {
-		input: "set @period.variable = 42",
+		input:  "set @period.variable = 42",
+		output: "set @`period.variable` = 42",
 	}, {
 		input:  "set S= +++-++-+(4+1)",
-		output: "set S = - -(4 + 1)",
+		output: "set @@S = - -(4 + 1)",
 	}, {
 		input:  "set S= +- - - - -(4+1)",
-		output: "set S = - - - - -(4 + 1)",
+		output: "set @@S = - - - - -(4 + 1)",
 	}, {
 		input:  "alter table a add foo int references b (a) on delete restrict first",
 		output: "alter table a add column foo int references b (a) on delete restrict first",
@@ -1177,6 +1557,12 @@ var (
 		input: "alter table a convert to character set utf32",
 	}, {
 		input: "alter table `By` add column foo int, algorithm = default",
+	}, {
+		input: "alter table `By` add column foo int, algorithm = copy",
+	}, {
+		input: "alter table `By` add column foo int, algorithm = inplace",
+	}, {
+		input: "alter table `By` add column foo int, algorithm = INPLACE",
 	}, {
 		input: "alter table `By` add column foo int, algorithm = instant",
 	}, {
@@ -1399,6 +1785,18 @@ var (
 		input:  "create table a (\n\ta float not null default -2.1\n)",
 		output: "create table a (\n\ta float not null default -2.1\n)",
 	}, {
+		input:  "create table a (\n\ta float(24) not null default -1\n)",
+		output: "create table a (\n\ta float(24) not null default -1\n)",
+	}, {
+		input:  "create table a (\n\ta float(24,10) not null default -1\n)",
+		output: "create table a (\n\ta float(24,10) not null default -1\n)",
+	}, {
+		input:  "create table a (\n\ta float4 not null default -1\n)",
+		output: "create table a (\n\ta float4 not null default -1\n)",
+	}, {
+		input:  "create table a (\n\ta float8 not null default -1\n)",
+		output: "create table a (\n\ta float8 not null default -1\n)",
+	}, {
 		input:  "create table a (a int not null default 0, primary key(a))",
 		output: "create table a (\n\ta int not null default 0,\n\tprimary key (a)\n)",
 	}, {
@@ -1449,6 +1847,9 @@ var (
 	}, {
 		input:  "create table t (id int) partition by key (id) partitions 2",
 		output: "create table t (\n\tid int\n)\npartition by key (id) partitions 2",
+	}, {
+		input:  "create table t (id int, primary key(id)) partition by key () partitions 2",
+		output: "create table t (\n\tid int,\n\tprimary key (id)\n)\npartition by key () partitions 2",
 	}, {
 		input:  "create table t (id int) partition by key algorithm = 1 (id)",
 		output: "create table t (\n\tid int\n)\npartition by key algorithm = 1 (id)",
@@ -1675,7 +2076,7 @@ var (
 		output: "rename table x.a to b, b to c",
 	}, {
 		input:  "drop view a,B,c",
-		output: "drop view a, b, c",
+		output: "drop view a, B, c",
 	}, {
 		input: "drop /*vt+ strategy=online */ view if exists v",
 	}, {
@@ -1720,11 +2121,14 @@ var (
 		input:  "flush no_write_to_binlog slow logs, status, user_resources, relay logs, relay logs for channel s",
 		output: "flush local slow logs, status, user_resources, relay logs, relay logs for channel s",
 	}, {
-		input:  "show binary logs",
-		output: "show binary logs",
+		input: "show binary logs",
 	}, {
 		input:  "show binlog events",
 		output: "show binlog",
+	}, {
+		input: "purge binary logs to 'x'",
+	}, {
+		input: "purge binary logs before '2020-02-02 20:20:20'",
 	}, {
 		input:  "show character set",
 		output: "show charset",
@@ -1975,7 +2379,17 @@ var (
 	}, {
 		input: "alter vitess_migration '9748c3b7_7fdb_11eb_ac2c_f875a4d24e90' cleanup",
 	}, {
+		input: "alter vitess_migration '9748c3b7_7fdb_11eb_ac2c_f875a4d24e90' launch",
+	}, {
+		input: "alter vitess_migration '9748c3b7_7fdb_11eb_ac2c_f875a4d24e90' launch vitess_shards '-40'",
+	}, {
+		input: "alter vitess_migration '9748c3b7_7fdb_11eb_ac2c_f875a4d24e90' launch vitess_shards '-40,40-80'",
+	}, {
+		input: "alter vitess_migration launch all",
+	}, {
 		input: "alter vitess_migration '9748c3b7_7fdb_11eb_ac2c_f875a4d24e90' complete",
+	}, {
+		input: "alter vitess_migration complete all",
 	}, {
 		input: "alter vitess_migration '9748c3b7_7fdb_11eb_ac2c_f875a4d24e90' cancel",
 	}, {
@@ -2000,6 +2414,10 @@ var (
 		input: "alter vitess_migration throttle all ratio 0.7",
 	}, {
 		input: "alter vitess_migration throttle all expire '1h' ratio 0.7",
+	}, {
+		input: "show vitess_throttled_apps",
+	}, {
+		input: "show vitess_throttler status",
 	}, {
 		input: "show warnings",
 	}, {
@@ -2033,6 +2451,9 @@ var (
 		input:  "describe select * from t",
 		output: "explain select * from t",
 	}, {
+		input:  "describe /*vt+ execute_dml_queries */ select * from t",
+		output: "explain /*vt+ execute_dml_queries */ select * from t",
+	}, {
 		input:  "desc select * from t",
 		output: "explain select * from t",
 	}, {
@@ -2049,16 +2470,30 @@ var (
 	}, {
 		input: "explain format = traditional select * from t",
 	}, {
+		input: "vexplain queries select * from t",
+	}, {
+		input: "vexplain all select * from t",
+	}, {
+		input: "vexplain plan select * from t",
+	}, {
+		input:  "vexplain select * from t",
+		output: "vexplain plan select * from t",
+	}, {
 		input: "explain analyze select * from t",
 	}, {
 		input: "explain format = tree select * from t",
 	}, {
 		input: "explain format = json select * from t",
 	}, {
+		input: "explain format = vtexplain select * from t",
+	}, {
 		input: "explain format = vitess select * from t",
 	}, {
 		input:  "describe format = vitess select * from t",
 		output: "explain format = vitess select * from t",
+	}, {
+		input:  "describe format = vtexplain select * from t",
+		output: "explain format = vtexplain select * from t",
 	}, {
 		input: "explain delete from t",
 	}, {
@@ -2124,7 +2559,8 @@ var (
 	}, {
 		input: "select * from t group by a collate utf8_general_ci",
 	}, {
-		input: "select MAX(k collate latin1_german2_ci) from t1",
+		input:  "select MAX(k collate latin1_german2_ci) from t1",
+		output: "select max(k collate latin1_german2_ci) from t1",
 	}, {
 		input: "select distinct k collate latin1_german2_ci from t1",
 	}, {
@@ -2206,6 +2642,8 @@ var (
 		input:  "select name, group_concat(distinct id, score order by id desc separator ':' limit 10, 2) from t group by name",
 		output: "select `name`, group_concat(distinct id, score order by id desc separator ':' limit 10, 2) from t group by `name`",
 	}, {
+		input: "select foo, any_value(id) from tbl group by foo",
+	}, {
 		input: "select * from t partition (p0)",
 	}, {
 		input: "select * from t partition (p0, p1)",
@@ -2237,6 +2675,14 @@ var (
 	}, {
 		input:  "start transaction",
 		output: "begin",
+	}, {
+		input: "start transaction with consistent snapshot",
+	}, {
+		input: "start transaction read write",
+	}, {
+		input: "start transaction read only",
+	}, {
+		input: "start transaction read only, with consistent snapshot",
 	}, {
 		input: "commit",
 	}, {
@@ -2403,10 +2849,10 @@ var (
 		output: "deallocate prepare stmt1",
 	}, {
 		input:  "DROP PREPARE stmt1",
-		output: "drop prepare stmt1",
+		output: "deallocate prepare stmt1",
 	}, {
 		input:  "DROP /* comment */ PREPARE stmt1",
-		output: "drop /* comment */ prepare stmt1",
+		output: "deallocate /* comment */ prepare stmt1",
 	}, {
 		input:  `SELECT JSON_PRETTY('{"a":"10","b":"15","x":"25"}')`,
 		output: `select json_pretty('{\"a\":\"10\",\"b\":\"15\",\"x\":\"25\"}') from dual`,
@@ -2566,7 +3012,7 @@ var (
 		output: "select json_array(BIN(11)) from dual",
 	}, {
 		input:  `SELECT JSON_ARRAY(1, "abc", NULL, TRUE, CURTIME());`,
-		output: `select json_array(1, 'abc', null, true, CURTIME()) from dual`,
+		output: `select json_array(1, 'abc', null, true, curtime()) from dual`,
 	}, {
 		input:  "SELECT JSON_OBJECT(1,2)",
 		output: "select json_object(1, 2) from dual",
@@ -2654,6 +3100,9 @@ var (
 	}, {
 		input:  `SELECT JSON_EXTRACT('{"a": 1, "b": 2, "c": {"d": 4}}', '$.a', @j)`,
 		output: `select json_extract('{\"a\": 1, \"b\": 2, \"c\": {\"d\": 4}}', '$.a', @j) from dual`,
+	}, {
+		input:  "SELECT JSON_EXTRACT(@k, TRIM('abc'))",
+		output: `select json_extract(@k, trim('abc')) from dual`,
 	}, {
 		input:  `SELECT JSON_KEYS('{\"a\": 1, \"b\": 2, \"c\": {\"d\": 4}}', '$.a')`,
 		output: `select json_keys('{\"a\": 1, \"b\": 2, \"c\": {\"d\": 4}}', '$.a') from dual`,
@@ -2997,6 +3446,18 @@ var (
 		input:  "SELECT TRIM('Michael!') RLIKE @j",
 		output: "select trim('Michael!') regexp @j from dual",
 	}, {
+		input:  "SELECT INSERT('Quadratic', 3, 4, 'What')",
+		output: "select insert('Quadratic', 3, 4, 'What') from dual",
+	}, {
+		input:  "SELECT INTERVAL(1, 3, 4)",
+		output: "select interval(1, 3, 4) from dual",
+	}, {
+		input:  "SELECT POSITION('bar' IN 'foobarbar')",
+		output: "select locate('bar', 'foobarbar') from dual",
+	}, {
+		input:  "SELECT CHAR(77,121,83,81,'76' USING utf8mb4)",
+		output: "select char(77, 121, 83, 81, '76' using utf8mb4) from dual",
+	}, {
 		input:  "SELECT val, CUME_DIST() OVER w, ROW_NUMBER() OVER w, DENSE_RANK() OVER w, PERCENT_RANK() OVER w, RANK() OVER w AS 'cd' FROM numbers",
 		output: "select val, cume_dist() over w, row_number() over w, dense_rank() over w, percent_rank() over w, rank() over w as cd from numbers",
 	}, {
@@ -3024,8 +3485,8 @@ var (
 		input:  "SELECT NTILE(NULL) OVER w FROM numbers",
 		output: "select ntile(null) over w from numbers",
 	}, {
-		input:  "SELECT NTILE(val) OVER W, NTILE(@val) OVER w FROM numbers",
-		output: "select ntile(val) over W, ntile(@val) over w from numbers",
+		input:  "SELECT NTILE(@val) OVER w FROM numbers",
+		output: "select ntile(@val) over w from numbers",
 	}, {
 		input:  "SELECT NTH_VALUE(@z,1) OVER w, NTH_VALUE('val',0) OVER w FROM numbers",
 		output: "select nth_value(@z, 1) over w, nth_value('val', 0) over w from numbers",
@@ -3052,13 +3513,13 @@ var (
 		output: "select `time`, subject, val, first_value(val) over w as `first`, last_value(val) over w as `last`, nth_value(val, 2) over w as `second`, nth_value(val, 4) over w as fourth from observations window w AS ( partition by subject order by `time` asc range 10 preceding)",
 	}, {
 		input:  "SELECT time, subject, val, FIRST_VALUE(val)  OVER w AS 'first', LAST_VALUE(val) OVER w AS 'last', NTH_VALUE(val, 2) OVER w AS 'second', NTH_VALUE(val, 4) OVER w AS 'fourth' FROM observations WINDOW w AS (PARTITION BY subject ORDER BY time ROWS INTERVAL 5 DAY PRECEDING);",
-		output: "select `time`, subject, val, first_value(val) over w as `first`, last_value(val) over w as `last`, nth_value(val, 2) over w as `second`, nth_value(val, 4) over w as fourth from observations window w AS ( partition by subject order by `time` asc rows interval 5 DAY preceding)",
+		output: "select `time`, subject, val, first_value(val) over w as `first`, last_value(val) over w as `last`, nth_value(val, 2) over w as `second`, nth_value(val, 4) over w as fourth from observations window w AS ( partition by subject order by `time` asc rows interval 5 day preceding)",
 	}, {
 		input:  "SELECT time, subject, val, FIRST_VALUE(val)  OVER w AS 'first', LAST_VALUE(val) OVER w AS 'last', NTH_VALUE(val, 2) OVER w AS 'second', NTH_VALUE(val, 4) OVER w AS 'fourth' FROM observations WINDOW w AS (PARTITION BY subject ORDER BY time RANGE 5 FOLLOWING);",
 		output: "select `time`, subject, val, first_value(val) over w as `first`, last_value(val) over w as `last`, nth_value(val, 2) over w as `second`, nth_value(val, 4) over w as fourth from observations window w AS ( partition by subject order by `time` asc range 5 following)",
 	}, {
 		input:  "SELECT time, subject, val, FIRST_VALUE(val)  OVER w AS 'first', LAST_VALUE(val) OVER w AS 'last', NTH_VALUE(val, 2) OVER w AS 'second', NTH_VALUE(val, 4) OVER w AS 'fourth' FROM observations WINDOW w AS (PARTITION BY subject ORDER BY time ROWS INTERVAL '2:30' MINUTE_SECOND FOLLOWING);",
-		output: "select `time`, subject, val, first_value(val) over w as `first`, last_value(val) over w as `last`, nth_value(val, 2) over w as `second`, nth_value(val, 4) over w as fourth from observations window w AS ( partition by subject order by `time` asc rows interval '2:30' MINUTE_SECOND following)",
+		output: "select `time`, subject, val, first_value(val) over w as `first`, last_value(val) over w as `last`, nth_value(val, 2) over w as `second`, nth_value(val, 4) over w as fourth from observations window w AS ( partition by subject order by `time` asc rows interval '2:30' minute_second following)",
 	}, {
 		input:  "SELECT time, subject, val, FIRST_VALUE(val)  OVER w AS 'first', LAST_VALUE(val) OVER w AS 'last', NTH_VALUE(val, 2) OVER w AS 'second', NTH_VALUE(val, 4) OVER w AS 'fourth' FROM observations WINDOW w AS (PARTITION BY subject ORDER BY time ASC RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING);",
 		output: "select `time`, subject, val, first_value(val) over w as `first`, last_value(val) over w as `last`, nth_value(val, 2) over w as `second`, nth_value(val, 4) over w as fourth from observations window w AS ( partition by subject order by `time` asc range between 10 preceding and 10 following)",
@@ -3079,6 +3540,122 @@ var (
 		output: "select updatexml('<a><d></d><b>ccc</b><d></d></a>', '/a/d', '<e>fff</e>') as val5 from dual",
 	}, {
 		input: "select get_lock('a', 10), is_free_lock('b'), is_used_lock('c'), release_all_locks(), release_lock('d') from dual",
+	}, {
+		input: "select /* function with distinct */ count(a) from t",
+	}, {
+		input:  "select /* function with distinct */ count(a) 'total col' from t",
+		output: "select /* function with distinct */ count(a) as `total col` from t",
+	}, {
+		input: "select /* function with distinct */ count(distinct a) from t",
+	}, {
+		input:  "select /* function with distinct */ count(distinct(a)) from t",
+		output: "select /* function with distinct */ count(distinct a) from t",
+	}, {
+		input: "select /* function with distinct */ count(*) from t",
+	}, {
+		input: "select avg(a) from products",
+	}, {
+		input:  "select avg(distinct(a)) from products",
+		output: "select avg(distinct a) from products",
+	}, {
+		input:  "select avg(a) 'Avg Price' from products",
+		output: "select avg(a) as `Avg Price` from products",
+	}, {
+		input: "select format(avg(distinct a), 2) from products",
+	}, {
+		input: "select max(a) from products",
+	}, {
+		input: "select min(a) from products",
+	}, {
+		input: "select sum(a) from products",
+	}, {
+		input:  "select sum(distinct(a)) from products",
+		output: "select sum(distinct a) from products",
+	}, {
+		input: "select sum(distinct a) from products",
+	}, {
+		input:  "select sum(a) 'sum Price' from products",
+		output: "select sum(a) as `sum Price` from products",
+	}, {
+		input: "select sum(a * b) from products",
+	}, {
+		input: "select bit_and(a) from products",
+	}, {
+		input: "select bit_or(a) from products",
+	}, {
+		input: "select bit_xor(a) from products",
+	}, {
+		input: "select std(a) from products",
+	}, {
+		input: "select stddev(a) from products",
+	}, {
+		input: "select stddev_pop(a) from products",
+	}, {
+		input: "select stddev_samp(a) from products",
+	}, {
+		input: "select var_pop(a) from products",
+	}, {
+		input: "select var_samp(a) from products",
+	}, {
+		input: "select variance(a) from products",
+	}, {
+		input:  "SELECT FORMAT_BYTES(512), FORMAT_BYTES(18446644073709551615), FORMAT_BYTES(@j), FORMAT_BYTES('asd'), FORMAT_BYTES(TRIM('str'))",
+		output: "select format_bytes(512), format_bytes(18446644073709551615), format_bytes(@j), format_bytes('asd'), format_bytes(trim('str')) from dual",
+	}, {
+		input:  "SELECT FORMAT_PICO_TIME(512), FORMAT_PICO_TIME(18446644073709551615), FORMAT_PICO_TIME(@j), FORMAT_PICO_TIME('asd'), FORMAT_PICO_TIME(TRIM('str'))",
+		output: "select format_pico_time(512), format_pico_time(18446644073709551615), format_pico_time(@j), format_pico_time('asd'), format_pico_time(trim('str')) from dual",
+	}, {
+		input:  "SELECT PS_CURRENT_THREAD_ID()",
+		output: "select ps_current_thread_id() from dual",
+	}, {
+		input:  "SELECT PS_THREAD_ID(512), PS_THREAD_ID(18446644073709551615), PS_THREAD_ID(@j), PS_THREAD_ID('asd'), PS_THREAD_ID(TRIM('str'))",
+		output: "select ps_thread_id(512), ps_thread_id(18446644073709551615), ps_thread_id(@j), ps_thread_id('asd'), ps_thread_id(trim('str')) from dual",
+	}, {
+		input:  "SELECT GTID_SUBSET('3E11FA47-71CA-11E1-9E33-C80AA9429562:23','3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57')",
+		output: "select gtid_subset('3E11FA47-71CA-11E1-9E33-C80AA9429562:23', '3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57') from dual",
+	}, {
+		input:  "SELECT GTID_SUBSET(@j,TRIM('3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57'))",
+		output: "select gtid_subset(@j, trim('3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57')) from dual",
+	}, {
+		input:  "SELECT GTID_SUBTRACT('3E11FA47-71CA-11E1-9E33-C80AA9429562:23','3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57')",
+		output: "select gtid_subtract('3E11FA47-71CA-11E1-9E33-C80AA9429562:23', '3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57') from dual",
+	}, {
+		input:  "SELECT GTID_SUBTRACT(@j,TRIM('3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57'))",
+		output: "select gtid_subtract(@j, trim('3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57')) from dual",
+	}, {
+		input:  "SELECT WAIT_FOR_EXECUTED_GTID_SET('3E11FA47-71CA-11E1-9E33-C80AA9429562:23')",
+		output: "select wait_for_executed_gtid_set('3E11FA47-71CA-11E1-9E33-C80AA9429562:23') from dual",
+	}, {
+		input:  "SELECT WAIT_FOR_EXECUTED_GTID_SET(TRIM('3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57'), @j)",
+		output: "select wait_for_executed_gtid_set(trim('3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57'), @j) from dual",
+	}, {
+		input:  "SELECT WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS('3E11FA47-71CA-11E1-9E33-C80AA9429562:23')",
+		output: "select wait_until_sql_thread_after_gtids('3E11FA47-71CA-11E1-9E33-C80AA9429562:23') from dual",
+	}, {
+		input:  "SELECT WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS(TRIM('3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57'), @j)",
+		output: "select wait_until_sql_thread_after_gtids(trim('3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57'), @j) from dual",
+	}, {
+		input:  "SELECT WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS(TRIM('3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57'), 10, @i)",
+		output: "select wait_until_sql_thread_after_gtids(trim('3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57'), 10, @i) from dual",
+	}, {
+		// Offset as part of expressions
+		input: "select a, b from c where :1 + :2 = :302 and sum(:34) < :24",
+	}, {
+		input:  "select * from (((select 1))) as tbl",
+		output: "select * from (select 1 from dual) as tbl",
+	}, {
+		input:  `select * from t1 where col1 like 'ks\%' and col2 = 'ks\%' and col1 like 'ks%' and col2 = 'ks%'`,
+		output: `select * from t1 where col1 like 'ks\%' and col2 = 'ks\%' and col1 like 'ks%' and col2 = 'ks%'`,
+	}, {
+		input:  `select * from t1 where col1 like 'ks\_' and col2 = 'ks\_' and col1 like 'ks_' and col2 = 'ks_'`,
+		output: `select * from t1 where col1 like 'ks\_' and col2 = 'ks\_' and col1 like 'ks_' and col2 = 'ks_'`,
+	}, {
+		input: `kill connection 18446744073709551615`,
+	}, {
+		input: `kill query 18446744073709551615`,
+	}, {
+		input:  `kill 18446744073709551615`,
+		output: `kill connection 18446744073709551615`,
 	}}
 )
 
@@ -3152,7 +3729,7 @@ func TestInvalid(t *testing.T) {
 		err:   "syntax error",
 	}, {
 		input: "/*!*/",
-		err:   "query was empty",
+		err:   "Query was empty",
 	}, {
 		input: "select /* union with limit on lhs */ 1 from t limit 1 union select 1 from t",
 		err:   "syntax error at position 60 near 'union'",
@@ -3213,9 +3790,6 @@ func TestInvalid(t *testing.T) {
 	}, {
 		input: "SELECT JSON_CONTAINS_PATH(@j, @j2)",
 		err:   "syntax error at position 35",
-	}, {
-		input: "SELECT JSON_EXTRACT(@k, TRIM('abc'))",
-		err:   "syntax error at position 30",
 	}, {
 		input: "SELECT JSON_EXTRACT(@k)",
 		err:   "syntax error at position 24",
@@ -3285,16 +3859,57 @@ func TestInvalid(t *testing.T) {
 	}, {
 		input: "SELECT time, subject, val, FIRST_VALUE(val)  OVER w AS 'first', LAST_VALUE(val) OVER w AS 'last', NTH_VALUE(val, 2) OVER w AS 'second', NTH_VALUE(val, 4) OVER w AS 'fourth' FROM observations WINDOW w AS (PARTITION BY subject ORDER BY time ROWS -10 FOLLOWING);",
 		err:   "syntax error at position 246",
-	}}
+	}, {
+		input: "SELECT BIT_AND(DISTINCT a) FROM products",
+		err:   "syntax error at position 24 near 'DISTINCT'",
+	}, {
+		input: "SELECT BIT_OR(DISTINCT a) FROM products",
+		err:   "syntax error at position 23 near 'DISTINCT'",
+	}, {
+		input: "SELECT BIT_XOR(DISTINCT a) FROM products",
+		err:   "syntax error at position 24 near 'DISTINCT'",
+	}, {
+		input: "SELECT STD(DISTINCT a) FROM products",
+		err:   "syntax error at position 20 near 'DISTINCT'",
+	}, {
+		input: "SELECT STDDEV(DISTINCT a) FROM products",
+		err:   "syntax error at position 23 near 'DISTINCT'",
+	}, {
+		input: "SELECT STDDEV_POP(DISTINCT a) FROM products",
+		err:   "syntax error at position 27 near 'DISTINCT'",
+	}, {
+		input: "SELECT STDDEV_SAMP(DISTINCT a) FROM products",
+		err:   "syntax error at position 28 near 'DISTINCT'",
+	}, {
+		input: "SELECT VAR_POP(DISTINCT a) FROM products",
+		err:   "syntax error at position 24 near 'DISTINCT'",
+	}, {
+		input: "SELECT VAR_SAMP(DISTINCT a) FROM products",
+		err:   "syntax error at position 25 near 'DISTINCT'",
+	}, {
+		input: "SELECT VARIANCE(DISTINCT a) FROM products",
+		err:   "syntax error at position 25 near 'DISTINCT'",
+	}, {
+		input: "SELECT COUNT(DISTINCT *) FROM user",
+		err:   "syntax error at position 24",
+	}, {
+		input: "SELECT x'018' FROM user",
+		err:   "syntax error at position 14",
+	}, {
+		input: "SELECT b'012' FROM user",
+		err:   "syntax error at position 12",
+	}, {
+		input: "SELECT 0b2 FROM user",
+		err:   "syntax error at position 11",
+	},
+	}
 
 	for _, tcase := range invalidSQL {
-		_, err := Parse(tcase.input)
-		if err == nil {
-			t.Errorf("Parse invalid query(%q), got: nil, want: %s...", tcase.input, tcase.err)
-		}
-		if err != nil && !strings.Contains(err.Error(), tcase.err) {
-			t.Errorf("Parse invalid query(%q), got: %v, want: %s...", tcase.input, err, tcase.err)
-		}
+		t.Run(tcase.input, func(t *testing.T) {
+			_, err := Parse(tcase.input)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tcase.err)
+		})
 	}
 }
 
@@ -3459,9 +4074,7 @@ func TestCaseSensitivity(t *testing.T) {
 		input:  "alter table A convert unparsable",
 		output: "alter table A",
 	}, {
-		// View names get lower-cased.
-		input:  "alter view A as select * from t",
-		output: "alter view a as select * from t",
+		input: "alter view A as select * from t",
 	}, {
 		input:  "alter table A rename to B",
 		output: "alter table A rename B",
@@ -3500,8 +4113,6 @@ func TestCaseSensitivity(t *testing.T) {
 	}, {
 		input: "select A(B, C) from b",
 	}, {
-		input: "select A(distinct B, C) from b",
-	}, {
 		// IF is an exception. It's always lower-cased.
 		input:  "select IF(B, C) from b",
 		output: "select if(B, C) from b",
@@ -3513,14 +4124,11 @@ func TestCaseSensitivity(t *testing.T) {
 		input:  "CREATE TABLE A (\n\t`A` int\n)",
 		output: "create table A (\n\tA int\n)",
 	}, {
-		input:  "create view A as select * from b",
-		output: "create view a as select * from b",
+		input: "create view A as select * from b",
 	}, {
-		input:  "drop view A",
-		output: "drop view a",
+		input: "drop view A",
 	}, {
-		input:  "drop view if exists A",
-		output: "drop view if exists a",
+		input: "drop view if exists A",
 	}, {
 		input:  "select /* lock in SHARE MODE */ 1 from t lock in SHARE MODE",
 		output: "select /* lock in SHARE MODE */ 1 from t lock in share mode",
@@ -3598,7 +4206,7 @@ func TestKeywords(t *testing.T) {
 	}, {
 		input: "select left(a, 5) from t",
 	}, {
-		input: "update t set d = adddate(date('2003-12-31 01:02:03'), interval 5 days)",
+		input: "update t set d = adddate(date('2003-12-31 01:02:03'), interval 5 day)",
 	}, {
 		input: "insert into t(a, b) values (left('foo', 1), 'b')",
 	}, {
@@ -3650,8 +4258,7 @@ func TestConvert(t *testing.T) {
 		input  string
 		output string
 	}{{
-		input:  "select cast('abc' as date) from t",
-		output: "select convert('abc', date) from t",
+		input: "select cast('abc' as date) from t",
 	}, {
 		input: "select convert('abc', binary(4)) from t",
 	}, {
@@ -3704,10 +4311,7 @@ func TestConvert(t *testing.T) {
 	}, {
 		input: "select convert('abc', json) from t",
 	}, {
-		input: "select convert(json_keys(c), char(64) array) from t",
-	}, {
-		input:  "select cast(json_keys(c) as char(64) array) from t",
-		output: "select convert(json_keys(c), char(64) array) from t",
+		input: "select cast(json_keys(c) as char(64) array) from t",
 	}}
 
 	for _, tcase := range validSQL {
@@ -3744,9 +4348,6 @@ func TestConvert(t *testing.T) {
 		input:  "select convert('abc', decimal(4+9)) from t",
 		output: "syntax error at position 33",
 	}, {
-		input:  "/* a comment */",
-		output: "query was empty",
-	}, {
 		input:  "set transaction isolation level 12345",
 		output: "syntax error at position 38 near '12345'",
 	}, {
@@ -3755,6 +4356,9 @@ func TestConvert(t *testing.T) {
 	}, {
 		input:  "@@",
 		output: "syntax error at position 3",
+	}, {
+		input:  "select A(distinct B, C) from b",
+		output: "syntax error at position 18 near 'distinct'",
 	}}
 
 	for _, tcase := range invalidSQL {
@@ -4159,6 +4763,17 @@ func TestCreateTable(t *testing.T) {
 	unique key by_abc (a, b, c),
 	unique key (a, b, c),
 	key by_email (email(10), username)
+)`,
+		},
+		// geometrycollection & geomcollection alias
+		{
+			input: `create table t (
+	id int auto_increment,
+	col_geometrycollection1 geometrycollection,
+	col_geometrycollection2 geometrycollection not null,
+	col_geometrycollection3 geomcollection,
+	col_geometrycollection4 geomcollection not null,
+	primary key (id)
 )`,
 		},
 		// foreign keys
@@ -5044,7 +5659,7 @@ partition by range (YEAR(purchased)) subpartition by hash (TO_DAYS(purchased))
 		},
 		{
 			input:  "create table t (id int, info JSON, INDEX zips((CAST(info->'$.field' AS unsigned ARRAY))))",
-			output: "create table t (\n\tid int,\n\tinfo JSON,\n\tINDEX zips ((convert(info -> '$.field', unsigned array)))\n)",
+			output: "create table t (\n\tid int,\n\tinfo JSON,\n\tINDEX zips ((cast(info -> '$.field' as unsigned array)))\n)",
 		},
 	}
 	for _, test := range createTableQueries {
@@ -5168,8 +5783,8 @@ var (
 		input:  "select x'777' from t",
 		output: "syntax error at position 14 near '777'",
 	}, {
-		input:  "select * from t where :1 = 2",
-		output: "syntax error at position 24 near ':'",
+		input:  "select * from t where :1f = 2",
+		output: "syntax error at position 26 near 'f'",
 	}, {
 		input:  "select * from t where :. = 2",
 		output: "syntax error at position 24 near ':'",
@@ -5191,17 +5806,7 @@ var (
 			"(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(" +
 			"F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F" +
 			"(F(F(F(F(F(F(F(F(F(F(F(F(",
-		output: "max nesting level reached at position 406",
-	}, {
-		input: "select(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F" +
-			"(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(" +
-			"F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F" +
-			"(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(" +
-			"F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F" +
-			"(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(" +
-			"F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F(F" +
-			"(F(F(F(F(F(F(F(F(F(F(F(",
-		output: "syntax error at position 404",
+		output: "syntax error at position 406",
 	}, {
 		// This construct is considered invalid due to a grammar conflict.
 		input:  "insert into a select * from b join c on duplicate key update d=e",
@@ -5269,6 +5874,21 @@ var (
 		input:        "create table 2t.3t2 (c1 bigint not null, c2 text, primary key(c1))",
 		output:       "syntax error at position 18 near '.3'",
 		excludeMulti: true,
+	}, {
+		input:  "execute stmt1 using a, @b",
+		output: "syntax error at position 22 near 'a'",
+	}, {
+		input:  "create index @a on b (col1)",
+		output: "syntax error at position 16 near 'a'",
+	}, {
+		input:  "create database test_db default collate @a",
+		output: "syntax error at position 43 near 'a'",
+	}, {
+		input:  "create database test_db default charset @a",
+		output: "syntax error at position 43 near 'a'",
+	}, {
+		input:  "create database test_db default encryption @a",
+		output: "syntax error at position 46 near 'a'",
 	}}
 )
 
@@ -5277,7 +5897,7 @@ func TestErrors(t *testing.T) {
 		t.Run(tcase.input, func(t *testing.T) {
 			_, err := ParseStrictDDL(tcase.input)
 			require.Error(t, err, tcase.output)
-			require.Equal(t, err.Error(), tcase.output)
+			require.Equal(t, tcase.output, err.Error())
 		})
 	}
 }
@@ -5386,9 +6006,9 @@ partition by range (id)
 
 	for _, testcase := range testcases {
 		t.Run(testcase.input+":"+testcase.mysqlVersion, func(t *testing.T) {
-			oldMySQLVersion := MySQLVersion
-			defer func() { MySQLVersion = oldMySQLVersion }()
-			MySQLVersion = testcase.mysqlVersion
+			oldMySQLVersion := mySQLParserVersion
+			defer func() { mySQLParserVersion = oldMySQLVersion }()
+			mySQLParserVersion = testcase.mysqlVersion
 			tree, err := Parse(testcase.input)
 			require.NoError(t, err, testcase.input)
 			out := String(tree)
@@ -5491,11 +6111,25 @@ func BenchmarkParse3(b *testing.B) {
 }
 
 func TestValidUnionCases(t *testing.T) {
-	testFile(t, "union_cases.txt", t.TempDir())
+	testFile(t, "union_cases.txt", makeTestOutput(t))
 }
 
 func TestValidSelectCases(t *testing.T) {
-	testFile(t, "select_cases.txt", t.TempDir())
+	testFile(t, "select_cases.txt", makeTestOutput(t))
+}
+
+func makeTestOutput(t *testing.T) string {
+	testOutputTempDir := utils.MakeTestOutput(t, "testdata", "parse_test")
+
+	t.Cleanup(func() {
+		if !t.Failed() {
+			_ = os.RemoveAll(testOutputTempDir)
+		} else {
+			t.Logf("Errors found. If the output is correct, run `cp %s/* testdata/` to update test expectations", testOutputTempDir)
+		}
+	})
+
+	return testOutputTempDir
 }
 
 type testCase struct {
@@ -5516,7 +6150,7 @@ func testFile(t *testing.T, filename, tempDir string) {
 		fail := false
 		expected := strings.Builder{}
 		for tcase := range iterateExecFile(filename) {
-			t.Run(fmt.Sprintf("%d : %s", tcase.lineno, tcase.comments), func(t *testing.T) {
+			t.Run(fmt.Sprintf("%d : %s", tcase.lineno, tcase.input), func(t *testing.T) {
 				if tcase.output == "" && tcase.errStr == "" {
 					tcase.output = tcase.input
 				}
@@ -5536,7 +6170,7 @@ func testFile(t *testing.T, filename, tempDir string) {
 					if err != nil {
 						expected.WriteString(fmt.Sprintf("ERROR\n%s\nEND\n", escapeNewLines(err.Error())))
 						fail = true
-						t.Errorf("File: %s, Line: %d\nDiff:\n%s\n[%s] \n[%s]", filename, tcase.lineno, cmp.Diff(tcase.errStr, err.Error()), tcase.errStr, err.Error())
+						t.Errorf("File: %s:%d\nDiff:\n%s\n[%s] \n[%s]", filename, tcase.lineno, cmp.Diff(tcase.errStr, err.Error()), tcase.errStr, err.Error())
 					} else {
 						out := String(tree)
 						expected.WriteString(fmt.Sprintf("OUTPUT\n%s\nEND\n", escapeNewLines(out)))

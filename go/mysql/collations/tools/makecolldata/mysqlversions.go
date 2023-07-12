@@ -18,7 +18,6 @@ package main
 
 import (
 	"bufio"
-	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -28,6 +27,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/mysql/collations/tools/makecolldata/codegen"
 )
@@ -51,7 +52,7 @@ var CharsetAliases = map[string]string{
 }
 
 func makeversions(output string) {
-	flag.Parse()
+	pflag.Parse()
 
 	versionfiles, err := filepath.Glob("testdata/versions/collations_*.csv")
 	if err != nil {
@@ -92,6 +93,10 @@ func makeversions(output string) {
 			for from, to := range CharsetAliases {
 				if strings.HasPrefix(collname, from+"_") {
 					aliased := strings.Replace(collname, from+"_", to+"_", 1)
+					vi.alias[aliased] |= 1 << v
+				}
+				if strings.HasPrefix(collname, to+"_") {
+					aliased := strings.Replace(collname, to+"_", from+"_", 1)
 					vi.alias[aliased] |= 1 << v
 				}
 			}

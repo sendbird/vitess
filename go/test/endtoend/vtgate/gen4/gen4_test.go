@@ -132,34 +132,28 @@ func TestDistinctAggregationFunc(t *testing.T) {
 	defer closer()
 
 	// insert some data.
-	utils.Exec(t, mcmp.VtConn, `insert into t2(id, tcol1, tcol2) values (1, 'A', 'A'),(2, 'B', 'C'),(3, 'A', 'C'),(4, 'C', 'A'),(5, 'A', 'A'),(6, 'B', 'C'),(7, 'B', 'A'),(8, 'C', 'A')`)
+	mcmp.Exec(`insert into t2(id, tcol1, tcol2) values (1, 'A', 'A'),(2, 'B', 'C'),(3, 'A', 'C'),(4, 'C', 'A'),(5, 'A', 'A'),(6, 'B', 'C'),(7, 'B', 'A'),(8, 'C', 'A')`)
 
 	// count on primary vindex
-	utils.AssertMatches(t, mcmp.VtConn, `select tcol1, count(distinct id) from t2 group by tcol1`,
-		`[[VARCHAR("A") INT64(3)] [VARCHAR("B") INT64(3)] [VARCHAR("C") INT64(2)]]`)
+	mcmp.Exec(`select tcol1, count(distinct id) from t2 group by tcol1`)
 
 	// count on any column
-	utils.AssertMatches(t, mcmp.VtConn, `select tcol1, count(distinct tcol2) from t2 group by tcol1`,
-		`[[VARCHAR("A") INT64(2)] [VARCHAR("B") INT64(2)] [VARCHAR("C") INT64(1)]]`)
+	mcmp.Exec(`select tcol1, count(distinct tcol2) from t2 group by tcol1`)
 
 	// sum of columns
-	utils.AssertMatches(t, mcmp.VtConn, `select sum(id), sum(tcol1) from t2`,
-		`[[DECIMAL(36) FLOAT64(0)]]`)
+	mcmp.Exec(`select sum(id), sum(tcol1) from t2`)
 
 	// sum on primary vindex
-	utils.AssertMatches(t, mcmp.VtConn, `select tcol1, sum(distinct id) from t2 group by tcol1`,
-		`[[VARCHAR("A") DECIMAL(9)] [VARCHAR("B") DECIMAL(15)] [VARCHAR("C") DECIMAL(12)]]`)
+	mcmp.Exec(`select tcol1, sum(distinct id) from t2 group by tcol1`)
 
 	// sum on any column
-	utils.AssertMatches(t, mcmp.VtConn, `select tcol1, sum(distinct tcol2) from t2 group by tcol1`,
-		`[[VARCHAR("A") DECIMAL(0)] [VARCHAR("B") DECIMAL(0)] [VARCHAR("C") DECIMAL(0)]]`)
+	mcmp.Exec(`select tcol1, sum(distinct tcol2) from t2 group by tcol1`)
 
 	// insert more data to get values on sum
-	utils.Exec(t, mcmp.VtConn, `insert into t2(id, tcol1, tcol2) values (9, 'AA', null),(10, 'AA', '4'),(11, 'AA', '4'),(12, null, '5'),(13, null, '6'),(14, 'BB', '10'),(15, 'BB', '20'),(16, 'BB', 'X')`)
+	mcmp.Exec(`insert into t2(id, tcol1, tcol2) values (9, 'AA', null),(10, 'AA', '4'),(11, 'AA', '4'),(12, null, '5'),(13, null, '6'),(14, 'BB', '10'),(15, 'BB', '20'),(16, 'BB', 'X')`)
 
 	// multi distinct
-	utils.AssertMatches(t, mcmp.VtConn, `select tcol1, count(distinct tcol2), sum(distinct tcol2) from t2 group by tcol1`,
-		`[[NULL INT64(2) DECIMAL(11)] [VARCHAR("A") INT64(2) DECIMAL(0)] [VARCHAR("AA") INT64(1) DECIMAL(4)] [VARCHAR("B") INT64(2) DECIMAL(0)] [VARCHAR("BB") INT64(3) DECIMAL(30)] [VARCHAR("C") INT64(1) DECIMAL(0)]]`)
+	mcmp.Exec(`select tcol1, count(distinct tcol2), sum(distinct tcol2) from t2 group by tcol1`)
 }
 
 func TestDistinct(t *testing.T) {
@@ -430,9 +424,9 @@ func TestOuterJoin(t *testing.T) {
 }
 
 func TestUsingJoin(t *testing.T) {
-	require.NoError(t, utils.WaitForAuthoritative(t, clusterInstance, shardedKs, "t1"))
-	require.NoError(t, utils.WaitForAuthoritative(t, clusterInstance, shardedKs, "t2"))
-	require.NoError(t, utils.WaitForAuthoritative(t, clusterInstance, shardedKs, "t3"))
+	require.NoError(t, utils.WaitForAuthoritative(t, shardedKs, "t1", clusterInstance.VtgateProcess.ReadVSchema))
+	require.NoError(t, utils.WaitForAuthoritative(t, shardedKs, "t2", clusterInstance.VtgateProcess.ReadVSchema))
+	require.NoError(t, utils.WaitForAuthoritative(t, shardedKs, "t3", clusterInstance.VtgateProcess.ReadVSchema))
 
 	mcmp, closer := start(t)
 	defer closer()
@@ -453,4 +447,74 @@ func TestUsingJoin(t *testing.T) {
 			`[VARCHAR("134") INT64(5) VARCHAR("123") INT64(5) VARCHAR("123")]]`)
 	mcmp.AssertMatchesNoOrderInclColumnNames(`select * from t2 join t3 using (tcol1) having tcol1 = 12`,
 		`[[VARCHAR("12") INT64(1) VARCHAR("12") INT64(1) VARCHAR("12")]]`)
+}
+
+// TestInsertFunction tests the INSERT function
+func TestInsertFunction(t *testing.T) {
+	mcmp, closer := start(t)
+	defer closer()
+
+	mcmp.Exec(`insert into t2(id, tcol1, tcol2) values (1, "Test", "This"),(2, "Testing", "Is"),(3, "TEST", "A")`)
+	mcmp.AssertMatches(`SELECT INSERT('Quadratic', 3, 4, 'What')`, `[[VARCHAR("QuWhattic")]]`)
+	mcmp.AssertMatches(`SELECT INSERT(tcol1, id, 3, tcol2) from t2`, `[[VARCHAR("Thist")] [VARCHAR("TIsing")] [VARCHAR("TEA")]]`)
+}
+
+// TestGTIDFunctions tests the gtid functions
+func TestGTIDFunctions(t *testing.T) {
+	mcmp, closer := start(t)
+	defer closer()
+
+	mcmp.AssertMatches(`select gtid_subset('3E11FA47-71CA-11E1-9E33-C80AA9429562:23','3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57')`, `[[INT64(1)]]`)
+	mcmp.AssertMatches(`select gtid_subtract('3E11FA47-71CA-11E1-9E33-C80AA9429562:23-78','3E11FA47-71CA-11E1-9E33-C80AA9429562:21-57')`, `[[VARCHAR("3e11fa47-71ca-11e1-9e33-c80aa9429562:58-78")]]`)
+}
+
+func TestFilterOnLeftOuterJoin(t *testing.T) {
+	mcmp, closer := start(t)
+	defer closer()
+
+	// insert some data.
+	mcmp.Exec(`insert into team (id, name) values (11, 'Acme'), (22, 'B'), (33, 'C')`)
+	mcmp.Exec(`insert into team_fact (id, team, fact) values (1, 11, 'A'), (2, 22, 'A'), (3, 33, 'A')`)
+
+	// Gen4 only supported query.
+	query := `select team.id
+				from team_fact
+				  join team on team.id = team_fact.team
+				  left outer join team_member on team_member.team = team.id
+				where (
+				  team_fact.fact = 'A'
+				  and team_member.user is null
+				  and team_fact.team >= 22
+				)`
+
+	mcmp.AssertMatches(query, "[[INT32(22)] [INT32(33)]]")
+}
+
+func TestPercentageAndUnderscore(t *testing.T) {
+	mcmp, closer := start(t)
+	defer closer()
+
+	// insert some data.
+	mcmp.Exec(`insert into t2(id, tcol1, tcol2) values (1, 'A%B', 'A%B'),(2, 'C_D', 'E'),(3, 'AB', 'C1D'),(4, 'E', 'A%B'),(5, 'A%B', 'AB'),(6, 'C1D', 'E'),(7, 'C_D', 'A%B'),(8, 'E', 'C_D')`)
+
+	// Verify that %, _ and their escaped counter-parts work in Vitess in the like clause as well as equality clause
+	mcmp.Exec(`select * from t2 where tcol1 like "A%B"`)
+	mcmp.Exec(`select * from t2 where tcol1 like "A\%B"`)
+	mcmp.Exec(`select * from t2 where tcol1 like "C_D"`)
+	mcmp.Exec(`select * from t2 where tcol1 like "C\_D"`)
+
+	mcmp.Exec(`select * from t2 where tcol1 = "A%B"`)
+	mcmp.Exec(`select * from t2 where tcol1 = "A\%B"`)
+	mcmp.Exec(`select * from t2 where tcol1 = "C_D"`)
+	mcmp.Exec(`select * from t2 where tcol1 = "C\_D"`)
+
+	// Verify that %, _ and their escaped counter-parts work with filtering on VTGate level
+	mcmp.Exec(`select a.tcol1 from t2 a join t2 b where a.tcol1 = b.tcol2 group by a.tcol1 having repeat(a.tcol1,min(a.id)) like "A\%B" order by a.tcol1`)
+	mcmp.Exec(`select a.tcol1 from t2 a join t2 b where a.tcol1 = b.tcol2 group by a.tcol1 having repeat(a.tcol1,min(a.id)) like "A%B" order by a.tcol1`)
+	mcmp.Exec(`select a.tcol1 from t2 a join t2 b where a.tcol1 = b.tcol2 group by a.tcol1 having repeat(a.tcol1,min(a.id)) = "A\%B" order by a.tcol1`)
+	mcmp.Exec(`select a.tcol1 from t2 a join t2 b where a.tcol1 = b.tcol2 group by a.tcol1 having repeat(a.tcol1,min(a.id)) = "A%B" order by a.tcol1`)
+	mcmp.Exec(`select a.tcol1 from t2 a join t2 b where a.tcol1 = b.tcol2 group by a.tcol1 having repeat(a.tcol1,min(a.id)) like "C_D%" order by a.tcol1`)
+	mcmp.Exec(`select a.tcol1 from t2 a join t2 b where a.tcol1 = b.tcol2 group by a.tcol1 having repeat(a.tcol1,min(a.id)) like "C\_D%" order by a.tcol1`)
+	mcmp.Exec(`select a.tcol1 from t2 a join t2 b where a.tcol1 = b.tcol2 group by a.tcol1 having repeat(a.tcol1,min(a.id)) = "C_DC_D" order by a.tcol1`)
+	mcmp.Exec(`select a.tcol1 from t2 a join t2 b where a.tcol1 = b.tcol2 group by a.tcol1 having repeat(a.tcol1,min(a.id)) = "C\_DC\_D" order by a.tcol1`)
 }

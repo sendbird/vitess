@@ -17,29 +17,97 @@ limitations under the License.
 package primaryfailure
 
 import (
+	"bufio"
+	"fmt"
+	"os"
+	"path"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
-
-	"vitess.io/vitess/go/test/endtoend/vtorc/utils"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/test/endtoend/vtorc/utils"
+	"vitess.io/vitess/go/vt/vtorc/logic"
 )
 
 // bring down primary, let orc promote replica
 // covers the test case master-failover from orchestrator
+// Also tests that VTOrc can handle multiple failures, if the durability policies allow it
 func TestDownPrimary(t *testing.T) {
 	defer cluster.PanicHandler(t)
-	utils.SetupVttabletsAndVtorc(t, clusterInfo, 2, 1, nil, cluster.VtorcConfiguration{
+	utils.SetupVttabletsAndVTOrcs(t, clusterInfo, 2, 1, []string{"--remote_operation_timeout=10s"}, cluster.VTOrcConfiguration{
 		PreventCrossDataCenterPrimaryFailover: true,
-	}, 1, "")
+	}, 1, "semi_sync")
 	keyspace := &clusterInfo.ClusterInstance.Keyspaces[0]
 	shard0 := &keyspace.Shards[0]
 	// find primary from topo
 	curPrimary := utils.ShardPrimaryTablet(t, clusterInfo, keyspace, shard0)
 	assert.NotNil(t, curPrimary, "should have elected a primary")
+	vtOrcProcess := clusterInfo.ClusterInstance.VTOrcProcesses[0]
+	utils.WaitForSuccessfulRecoveryCount(t, vtOrcProcess, logic.ElectNewPrimaryRecoveryName, 1)
+
+	// find the replica and rdonly tablets
+	var replica, rdonly *cluster.Vttablet
+	for _, tablet := range shard0.Vttablets {
+		// we know we have only two replcia tablets, so the one not the primary must be the other replica
+		if tablet.Alias != curPrimary.Alias && tablet.Type == "replica" {
+			replica = tablet
+		}
+		if tablet.Type == "rdonly" {
+			rdonly = tablet
+		}
+	}
+	assert.NotNil(t, replica, "could not find replica tablet")
+	assert.NotNil(t, rdonly, "could not find rdonly tablet")
+
+	// Start a cross-cell replica
+	crossCellReplica := utils.StartVttablet(t, clusterInfo, utils.Cell2, false)
+
+	// check that the replication is setup correctly before we failover
+	utils.CheckReplication(t, clusterInfo, curPrimary, []*cluster.Vttablet{rdonly, replica, crossCellReplica}, 10*time.Second)
+	// since all tablets are up and running, InstancePollSecondsExceeded should have `0` zero value
+	utils.WaitForInstancePollSecondsExceededCount(t, vtOrcProcess, "InstancePollSecondsExceeded", 0, true)
+	// Make the rdonly vttablet unavailable
+	err := rdonly.VttabletProcess.TearDown()
+	require.NoError(t, err)
+	err = rdonly.MysqlctlProcess.Stop()
+	require.NoError(t, err)
+	// We have bunch of Vttablets down. Therefore we expect at least 1 occurrence of InstancePollSecondsExceeded
+	utils.WaitForInstancePollSecondsExceededCount(t, vtOrcProcess, "InstancePollSecondsExceeded", 1, false)
+	// Make the current primary vttablet unavailable.
+	err = curPrimary.VttabletProcess.TearDown()
+	require.NoError(t, err)
+	err = curPrimary.MysqlctlProcess.Stop()
+	require.NoError(t, err)
+	defer func() {
+		// we remove the tablet from our global list
+		utils.PermanentlyRemoveVttablet(clusterInfo, curPrimary)
+		utils.PermanentlyRemoveVttablet(clusterInfo, rdonly)
+	}()
+
+	// check that the replica gets promoted
+	utils.CheckPrimaryTablet(t, clusterInfo, replica, true)
+
+	// also check that the replication is working correctly after failover
+	utils.VerifyWritesSucceed(t, clusterInfo, replica, []*cluster.Vttablet{crossCellReplica}, 10*time.Second)
+	utils.WaitForSuccessfulRecoveryCount(t, vtOrcProcess, logic.RecoverDeadPrimaryRecoveryName, 1)
+}
+
+// bring down primary before VTOrc has started, let vtorc repair.
+func TestDownPrimaryBeforeVTOrc(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	utils.SetupVttabletsAndVTOrcs(t, clusterInfo, 2, 1, nil, cluster.VTOrcConfiguration{}, 0, "none")
+	keyspace := &clusterInfo.ClusterInstance.Keyspaces[0]
+	shard0 := &keyspace.Shards[0]
+	curPrimary := shard0.Vttablets[0]
+
+	// Promote the first tablet as the primary
+	err := clusterInfo.ClusterInstance.VtctlclientProcess.InitializeShard(keyspace.Name, shard0.Name, clusterInfo.ClusterInstance.Cell, curPrimary.TabletUID)
+	require.NoError(t, err)
 
 	// find the replica and rdonly tablets
 	var replica, rdonly *cluster.Vttablet
@@ -58,25 +126,117 @@ func TestDownPrimary(t *testing.T) {
 	// check that the replication is setup correctly before we failover
 	utils.CheckReplication(t, clusterInfo, curPrimary, []*cluster.Vttablet{rdonly, replica}, 10*time.Second)
 
-	// Make the current primary database unavailable.
-	err := curPrimary.MysqlctlProcess.Stop()
+	// Make the current primary vttablet unavailable.
+	_ = curPrimary.VttabletProcess.TearDown()
+	err = curPrimary.MysqlctlProcess.Stop()
 	require.NoError(t, err)
+
+	// Start a VTOrc instance
+	utils.StartVTOrcs(t, clusterInfo, []string{"--remote_operation_timeout=10s"}, cluster.VTOrcConfiguration{
+		PreventCrossDataCenterPrimaryFailover: true,
+	}, 1)
+
+	vtOrcProcess := clusterInfo.ClusterInstance.VTOrcProcesses[0]
+
 	defer func() {
-		// we remove the tablet from our global list since its mysqlctl process has stopped and cannot be reused for other tests
+		// we remove the tablet from our global list
 		utils.PermanentlyRemoveVttablet(clusterInfo, curPrimary)
 	}()
 
 	// check that the replica gets promoted
 	utils.CheckPrimaryTablet(t, clusterInfo, replica, true)
+
 	// also check that the replication is working correctly after failover
 	utils.VerifyWritesSucceed(t, clusterInfo, replica, []*cluster.Vttablet{rdonly}, 10*time.Second)
+	utils.WaitForSuccessfulRecoveryCount(t, vtOrcProcess, logic.RecoverDeadPrimaryRecoveryName, 1)
+}
+
+// TestDeadPrimaryRecoversImmediately test Vtorc ability to recover immediately if primary is dead.
+// Reason is, unlike other recoveries, in DeadPrimary we don't call DiscoverInstance since we know
+// that primary is unreachable. This help us save few seconds depending on value of `RemoteOperationTimeout` flag.
+func TestDeadPrimaryRecoversImmediately(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	// We specify the --wait-replicas-timeout to a small value because we spawn a cross-cell replica later in the test.
+	// If that replica is more advanced than the same-cell-replica, then we try to promote the cross-cell replica as an intermediate source.
+	// If we don't specify a small value of --wait-replicas-timeout, then we would end up waiting for 30 seconds for the dead-primary to respond, failing this test.
+	utils.SetupVttabletsAndVTOrcs(t, clusterInfo, 2, 1, []string{"--remote_operation_timeout=10s", "--wait-replicas-timeout=5s"}, cluster.VTOrcConfiguration{
+		PreventCrossDataCenterPrimaryFailover: true,
+	}, 1, "semi_sync")
+	keyspace := &clusterInfo.ClusterInstance.Keyspaces[0]
+	shard0 := &keyspace.Shards[0]
+	// find primary from topo
+	curPrimary := utils.ShardPrimaryTablet(t, clusterInfo, keyspace, shard0)
+	assert.NotNil(t, curPrimary, "should have elected a primary")
+	vtOrcProcess := clusterInfo.ClusterInstance.VTOrcProcesses[0]
+	utils.WaitForSuccessfulRecoveryCount(t, vtOrcProcess, logic.ElectNewPrimaryRecoveryName, 1)
+
+	// find the replica and rdonly tablets
+	var replica, rdonly *cluster.Vttablet
+	for _, tablet := range shard0.Vttablets {
+		// we know we have only two replcia tablets, so the one not the primary must be the other replica
+		if tablet.Alias != curPrimary.Alias && tablet.Type == "replica" {
+			replica = tablet
+		}
+		if tablet.Type == "rdonly" {
+			rdonly = tablet
+		}
+	}
+	assert.NotNil(t, replica, "could not find replica tablet")
+	assert.NotNil(t, rdonly, "could not find rdonly tablet")
+
+	// Start a cross-cell replica
+	crossCellReplica := utils.StartVttablet(t, clusterInfo, utils.Cell2, false)
+
+	// check that the replication is setup correctly before we failover
+	utils.CheckReplication(t, clusterInfo, curPrimary, []*cluster.Vttablet{rdonly, replica, crossCellReplica}, 10*time.Second)
+
+	// Make the current primary vttablet unavailable.
+	curPrimary.VttabletProcess.Kill()
+	err := curPrimary.MysqlctlProcess.Stop()
+	require.NoError(t, err)
+	defer func() {
+		// we remove the tablet from our global list
+		utils.PermanentlyRemoveVttablet(clusterInfo, curPrimary)
+	}()
+
+	// check that the replica gets promoted
+	utils.CheckPrimaryTablet(t, clusterInfo, replica, true)
+	utils.WaitForInstancePollSecondsExceededCount(t, vtOrcProcess, "InstancePollSecondsExceeded", 2, false)
+	// also check that the replication is working correctly after failover
+	utils.VerifyWritesSucceed(t, clusterInfo, replica, []*cluster.Vttablet{crossCellReplica}, 10*time.Second)
+	utils.WaitForSuccessfulRecoveryCount(t, vtOrcProcess, logic.RecoverDeadPrimaryRecoveryName, 1)
+
+	// Parse log file and find out how much time it took for DeadPrimary to recover.
+	logFile := path.Join(vtOrcProcess.LogDir, vtOrcProcess.LogFileName)
+	// log prefix printed at the end of analysis where we conclude we have DeadPrimary
+	t1 := extractTimeFromLog(t, logFile, "Proceeding with DeadPrimary recovery")
+	// log prefix printed at the end of recovery
+	t2 := extractTimeFromLog(t, logFile, "auditType:recover-dead-primary")
+	curr := time.Now().Format("2006-01-02")
+	timeLayout := "2006-01-02 15:04:05.000000"
+	timeStr1 := fmt.Sprintf("%s %s", curr, t1)
+	timeStr2 := fmt.Sprintf("%s %s", curr, t2)
+	time1, err := time.Parse(timeLayout, timeStr1)
+	if err != nil {
+		t.Errorf("unable to parse time %s", err.Error())
+	}
+	time2, err := time.Parse(timeLayout, timeStr2)
+	if err != nil {
+		t.Errorf("unable to parse time %s", err.Error())
+	}
+	diff := time2.Sub(time1)
+	fmt.Printf("The difference between %s and %s is %v seconds.\n", t1, t2, diff.Seconds())
+	// assert that it takes less than `remote_operation_timeout` to recover from `DeadPrimary`
+	// use the value provided in `remote_operation_timeout` flag to compare with.
+	// We are testing against 9.5 seconds to be safe and prevent flakiness.
+	assert.Less(t, diff.Seconds(), 9.5)
 }
 
 // Failover should not be cross data centers, according to the configuration file
 // covers part of the test case master-failover-lost-replicas from orchestrator
 func TestCrossDataCenterFailure(t *testing.T) {
 	defer cluster.PanicHandler(t)
-	utils.SetupVttabletsAndVtorc(t, clusterInfo, 2, 1, nil, cluster.VtorcConfiguration{
+	utils.SetupVttabletsAndVTOrcs(t, clusterInfo, 2, 1, nil, cluster.VTOrcConfiguration{
 		PreventCrossDataCenterPrimaryFailover: true,
 	}, 1, "")
 	keyspace := &clusterInfo.ClusterInstance.Keyspaces[0]
@@ -100,7 +260,7 @@ func TestCrossDataCenterFailure(t *testing.T) {
 	assert.NotNil(t, rdonly, "could not find rdonly tablet")
 
 	crossCellReplica := utils.StartVttablet(t, clusterInfo, utils.Cell2, false)
-	// newly started tablet does not replicate from anyone yet, we will allow orchestrator to fix this too
+	// newly started tablet does not replicate from anyone yet, we will allow vtorc to fix this too
 	utils.CheckReplication(t, clusterInfo, curPrimary, []*cluster.Vttablet{crossCellReplica, replicaInSameCell, rdonly}, 25*time.Second)
 
 	// Make the current primary database unavailable.
@@ -121,7 +281,7 @@ func TestCrossDataCenterFailure(t *testing.T) {
 // In case of no viable candidates, we should error out
 func TestCrossDataCenterFailureError(t *testing.T) {
 	defer cluster.PanicHandler(t)
-	utils.SetupVttabletsAndVtorc(t, clusterInfo, 1, 1, nil, cluster.VtorcConfiguration{
+	utils.SetupVttabletsAndVTOrcs(t, clusterInfo, 1, 1, nil, cluster.VTOrcConfiguration{
 		PreventCrossDataCenterPrimaryFailover: true,
 	}, 1, "")
 	keyspace := &clusterInfo.ClusterInstance.Keyspaces[0]
@@ -141,7 +301,7 @@ func TestCrossDataCenterFailureError(t *testing.T) {
 
 	crossCellReplica1 := utils.StartVttablet(t, clusterInfo, utils.Cell2, false)
 	crossCellReplica2 := utils.StartVttablet(t, clusterInfo, utils.Cell2, false)
-	// newly started tablet does not replicate from anyone yet, we will allow orchestrator to fix this too
+	// newly started tablet does not replicate from anyone yet, we will allow vtorc to fix this too
 	utils.CheckReplication(t, clusterInfo, curPrimary, []*cluster.Vttablet{crossCellReplica1, crossCellReplica2, rdonly}, 25*time.Second)
 
 	// Make the current primary database unavailable.
@@ -167,7 +327,7 @@ func TestLostRdonlyOnPrimaryFailure(t *testing.T) {
 	// were detected by vtorc and could be configured to have their sources detached
 	t.Skip()
 	defer cluster.PanicHandler(t)
-	utils.SetupVttabletsAndVtorc(t, clusterInfo, 2, 2, nil, cluster.VtorcConfiguration{
+	utils.SetupVttabletsAndVTOrcs(t, clusterInfo, 2, 2, nil, cluster.VTOrcConfiguration{
 		PreventCrossDataCenterPrimaryFailover: true,
 	}, 1, "")
 	keyspace := &clusterInfo.ClusterInstance.Keyspaces[0]
@@ -248,7 +408,7 @@ func TestLostRdonlyOnPrimaryFailure(t *testing.T) {
 // covers the test case master-failover-fail-promotion-lag-minutes-success from orchestrator
 func TestPromotionLagSuccess(t *testing.T) {
 	defer cluster.PanicHandler(t)
-	utils.SetupVttabletsAndVtorc(t, clusterInfo, 2, 1, nil, cluster.VtorcConfiguration{
+	utils.SetupVttabletsAndVTOrcs(t, clusterInfo, 2, 1, nil, cluster.VTOrcConfiguration{
 		ReplicationLagQuery:              "select 59",
 		FailPrimaryPromotionOnLagMinutes: 1,
 	}, 1, "")
@@ -297,7 +457,7 @@ func TestPromotionLagFailure(t *testing.T) {
 	// was smaller than the configured value, otherwise it would fail the promotion
 	t.Skip()
 	defer cluster.PanicHandler(t)
-	utils.SetupVttabletsAndVtorc(t, clusterInfo, 3, 1, nil, cluster.VtorcConfiguration{
+	utils.SetupVttabletsAndVTOrcs(t, clusterInfo, 3, 1, nil, cluster.VTOrcConfiguration{
 		ReplicationLagQuery:              "select 61",
 		FailPrimaryPromotionOnLagMinutes: 1,
 	}, 1, "")
@@ -349,7 +509,7 @@ func TestPromotionLagFailure(t *testing.T) {
 // That is the replica which should be promoted in case of primary failure
 func TestDownPrimaryPromotionRule(t *testing.T) {
 	defer cluster.PanicHandler(t)
-	utils.SetupVttabletsAndVtorc(t, clusterInfo, 2, 1, nil, cluster.VtorcConfiguration{
+	utils.SetupVttabletsAndVTOrcs(t, clusterInfo, 2, 1, nil, cluster.VTOrcConfiguration{
 		LockShardTimeoutSeconds: 5,
 	}, 1, "test")
 	keyspace := &clusterInfo.ClusterInstance.Keyspaces[0]
@@ -373,7 +533,7 @@ func TestDownPrimaryPromotionRule(t *testing.T) {
 	assert.NotNil(t, rdonly, "could not find rdonly tablet")
 
 	crossCellReplica := utils.StartVttablet(t, clusterInfo, utils.Cell2, false)
-	// newly started tablet does not replicate from anyone yet, we will allow orchestrator to fix this too
+	// newly started tablet does not replicate from anyone yet, we will allow vtorc to fix this too
 	utils.CheckReplication(t, clusterInfo, curPrimary, []*cluster.Vttablet{crossCellReplica, rdonly, replica}, 25*time.Second)
 
 	// Make the current primary database unavailable.
@@ -396,7 +556,7 @@ func TestDownPrimaryPromotionRule(t *testing.T) {
 // It should also be caught up when it is promoted
 func TestDownPrimaryPromotionRuleWithLag(t *testing.T) {
 	defer cluster.PanicHandler(t)
-	utils.SetupVttabletsAndVtorc(t, clusterInfo, 2, 1, nil, cluster.VtorcConfiguration{
+	utils.SetupVttabletsAndVTOrcs(t, clusterInfo, 2, 1, nil, cluster.VTOrcConfiguration{
 		LockShardTimeoutSeconds: 5,
 	}, 1, "test")
 	keyspace := &clusterInfo.ClusterInstance.Keyspaces[0]
@@ -421,7 +581,7 @@ func TestDownPrimaryPromotionRuleWithLag(t *testing.T) {
 	assert.NotNil(t, rdonly, "could not find rdonly tablet")
 
 	crossCellReplica := utils.StartVttablet(t, clusterInfo, utils.Cell2, false)
-	// newly started tablet does not replicate from anyone yet, we will allow orchestrator to fix this too
+	// newly started tablet does not replicate from anyone yet, we will allow vtorc to fix this too
 	utils.CheckReplication(t, clusterInfo, curPrimary, []*cluster.Vttablet{crossCellReplica, replica, rdonly}, 25*time.Second)
 
 	// revoke super privileges from vtorc on crossCellReplica so that it is unable to repair the replication
@@ -475,7 +635,7 @@ func TestDownPrimaryPromotionRuleWithLag(t *testing.T) {
 // It should also be caught up when it is promoted
 func TestDownPrimaryPromotionRuleWithLagCrossCenter(t *testing.T) {
 	defer cluster.PanicHandler(t)
-	utils.SetupVttabletsAndVtorc(t, clusterInfo, 2, 1, nil, cluster.VtorcConfiguration{
+	utils.SetupVttabletsAndVTOrcs(t, clusterInfo, 2, 1, nil, cluster.VTOrcConfiguration{
 		LockShardTimeoutSeconds:               5,
 		PreventCrossDataCenterPrimaryFailover: true,
 	}, 1, "test")
@@ -501,7 +661,7 @@ func TestDownPrimaryPromotionRuleWithLagCrossCenter(t *testing.T) {
 	assert.NotNil(t, rdonly, "could not find rdonly tablet")
 
 	crossCellReplica := utils.StartVttablet(t, clusterInfo, utils.Cell2, false)
-	// newly started tablet does not replicate from anyone yet, we will allow orchestrator to fix this too
+	// newly started tablet does not replicate from anyone yet, we will allow vtorc to fix this too
 	utils.CheckReplication(t, clusterInfo, curPrimary, []*cluster.Vttablet{crossCellReplica, replica, rdonly}, 25*time.Second)
 
 	// revoke super privileges from vtorc on replica so that it is unable to repair the replication
@@ -547,4 +707,30 @@ func TestDownPrimaryPromotionRuleWithLagCrossCenter(t *testing.T) {
 
 	// check that rdonly and crossCellReplica are able to replicate from the replica
 	utils.VerifyWritesSucceed(t, clusterInfo, replica, []*cluster.Vttablet{crossCellReplica, rdonly}, 15*time.Second)
+}
+
+func extractTimeFromLog(t *testing.T, logFile string, logStatement string) string {
+	file, err := os.Open(logFile)
+	if err != nil {
+		t.Errorf("fail to extract time from log statement %s", err.Error())
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, logStatement) {
+			// Regular expression pattern for date format
+			pattern := `\d{2}:\d{2}:\d{2}\.\d{6}`
+			re := regexp.MustCompile(pattern)
+			match := re.FindString(line)
+			return match
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		t.Errorf("fail to extract time from log statement %s", err.Error())
+	}
+	return ""
 }

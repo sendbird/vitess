@@ -19,9 +19,9 @@ limitations under the License.
 package collations
 
 import (
-	"flag"
 	"sync"
 
+	"vitess.io/vitess/go/internal/flag"
 	"vitess.io/vitess/go/vt/servenv"
 )
 
@@ -35,11 +35,7 @@ func Local() *Environment {
 		if !flag.Parsed() {
 			panic("collations.Local() called too early")
 		}
-		if *servenv.MySQLServerVersion == "" {
-			defaultEnv = fetchCacheEnvironment(collverMySQL80)
-		} else {
-			defaultEnv = NewEnvironment(*servenv.MySQLServerVersion)
-		}
+		defaultEnv = NewEnvironment(servenv.MySQLServerVersion())
 	})
 	return defaultEnv
 }

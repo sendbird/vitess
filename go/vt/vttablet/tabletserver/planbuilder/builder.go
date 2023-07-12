@@ -19,11 +19,9 @@ package planbuilder
 import (
 	"strings"
 
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
-	"vitess.io/vitess/go/vt/vtgate/semantics"
-
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
@@ -31,9 +29,8 @@ import (
 
 func analyzeSelect(sel *sqlparser.Select, tables map[string]*schema.Table) (plan *Plan, err error) {
 	plan = &Plan{
-		PlanID:     PlanSelect,
-		FieldQuery: GenerateFieldQuery(sel),
-		FullQuery:  GenerateLimitQuery(sel),
+		PlanID:    PlanSelect,
+		FullQuery: GenerateLimitQuery(sel),
 	}
 	plan.Table, plan.AllTables = lookupTables(sel.From, tables)
 
@@ -51,13 +48,17 @@ func analyzeSelect(sel *sqlparser.Select, tables map[string]*schema.Table) (plan
 			return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "%s is not a sequence", sqlparser.ToString(sel.From))
 		}
 		plan.PlanID = PlanNextval
-		v, err := evalengine.Translate(nextVal.Expr, semantics.EmptySemTable())
+		v, err := evalengine.Translate(nextVal.Expr, nil)
 		if err != nil {
 			return nil, err
 		}
 		plan.NextCount = v
-		plan.FieldQuery = nil
 		plan.FullQuery = nil
+	}
+
+	if hasLockFunc(sel) {
+		plan.PlanID = PlanSelectLockFunc
+		plan.NeedsReservedConn = true
 	}
 	return plan, nil
 }
@@ -122,15 +123,21 @@ func analyzeInsert(ins *sqlparser.Insert, tables map[string]*schema.Table) (plan
 		FullQuery: GenerateFullQuery(ins),
 	}
 
-	tableName := sqlparser.GetTableName(ins.Table)
-	plan.Table = tables[tableName.String()]
+	tableName, err := ins.Table.TableName()
+	if err != nil {
+		return nil, err
+	}
+	plan.Table = tables[sqlparser.GetTableName(tableName).String()]
 	return plan, nil
 }
 
 func analyzeShow(show *sqlparser.Show, dbName string) (plan *Plan, err error) {
 	switch showInternal := show.Internal.(type) {
 	case *sqlparser.ShowBasic:
-		if showInternal.Command == sqlparser.Table {
+		switch showInternal.Command {
+		case sqlparser.VitessMigrations:
+			return &Plan{PlanID: PlanShowMigrations, FullStmt: show}, nil
+		case sqlparser.Table:
 			// rewrite WHERE clause if it exists
 			// `where Tables_in_Keyspace` => `where Tables_in_DbName`
 			if showInternal.Filter != nil {
@@ -143,7 +150,7 @@ func analyzeShow(show *sqlparser.Show, dbName string) (plan *Plan, err error) {
 		}, nil
 	case *sqlparser.ShowCreate:
 		if showInternal.Command == sqlparser.CreateDb && !sqlparser.SystemSchema(showInternal.Op.Name.String()) {
-			showInternal.Op.Name = sqlparser.NewTableIdent(dbName)
+			showInternal.Op.Name = sqlparser.NewIdentifierCS(dbName)
 		}
 		return &Plan{
 			PlanID:    PlanShow,
@@ -158,7 +165,7 @@ func showTableRewrite(show *sqlparser.ShowBasic, dbName string) {
 	if filter == nil {
 		return
 	}
-	_ = sqlparser.Rewrite(filter, func(cursor *sqlparser.Cursor) bool {
+	_ = sqlparser.SafeRewrite(filter, nil, func(cursor *sqlparser.Cursor) bool {
 		switch n := cursor.Node().(type) {
 		case *sqlparser.ColName:
 			if n.Qualifier.IsEmpty() && strings.HasPrefix(n.Name.Lowered(), "tables_in_") {
@@ -166,13 +173,14 @@ func showTableRewrite(show *sqlparser.ShowBasic, dbName string) {
 			}
 		}
 		return true
-	}, nil)
+	})
 }
 
 func analyzeSet(set *sqlparser.Set) (plan *Plan) {
 	return &Plan{
-		PlanID:    PlanSet,
-		FullQuery: GenerateFullQuery(set),
+		PlanID:            PlanSet,
+		FullQuery:         GenerateFullQuery(set),
+		NeedsReservedConn: true,
 	}
 }
 
@@ -198,4 +206,16 @@ func lookupSingleTable(tableExpr sqlparser.TableExpr, tables map[string]*schema.
 		return nil
 	}
 	return tables[tableName.String()]
+}
+
+func analyzeDDL(stmt sqlparser.DDLStatement) (*Plan, error) {
+	// DDLs and some other statements below don't get fully parsed.
+	// We have to use the original query at the time of execution.
+	// We are in the process of changing this
+	var fullQuery *sqlparser.ParsedQuery
+	// If the query is fully parsed, then use the ast and store the fullQuery
+	if stmt.IsFullyParsed() {
+		fullQuery = GenerateFullQuery(stmt)
+	}
+	return &Plan{PlanID: PlanDDL, FullQuery: fullQuery, FullStmt: stmt, NeedsReservedConn: stmt.IsTemporary()}, nil
 }

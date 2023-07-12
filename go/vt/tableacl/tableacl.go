@@ -88,16 +88,16 @@ var currentTableACL tableACL
 // The config file can be binary-proto-encoded, or json-encoded.
 // In the json case, it looks like this:
 //
-// {
-//   "table_groups": [
-//     {
-//       "table_names_or_prefixes": ["name1"],
-//       "readers": ["client1"],
-//       "writers": ["client1"],
-//       "admins": ["client1"]
-//     }
-//   ]
-// }
+//	{
+//	  "table_groups": [
+//	    {
+//	      "table_names_or_prefixes": ["name1"],
+//	      "readers": ["client1"],
+//	      "writers": ["client1"],
+//	      "admins": ["client1"]
+//	    }
+//	  ]
+//	}
 func Init(configFile string, aclCB func()) error {
 	return currentTableACL.init(configFile, aclCB)
 }
@@ -113,7 +113,7 @@ func (tacl *tableACL) init(configFile string, aclCB func()) error {
 		return err
 	}
 	config := &tableaclpb.Config{}
-	if err := proto.Unmarshal(data, config); err != nil {
+	if err := config.UnmarshalVT(data); err != nil {
 		// try to parse tableacl as json file
 		if jsonErr := json2.Unmarshal(data, config); jsonErr != nil {
 			log.Infof("unable to parse tableACL config file as a protobuf or json file.  protobuf err: %v  json err: %v", err, jsonErr)

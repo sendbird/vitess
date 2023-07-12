@@ -17,16 +17,13 @@ limitations under the License.
 package planbuilder
 
 import (
+	"fmt"
 	"strconv"
 
-	"vitess.io/vitess/go/mysql/collations"
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
-	"vitess.io/vitess/go/vt/vterrors"
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
-	"vitess.io/vitess/go/vt/vtgate/semantics"
-
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 )
 
@@ -252,9 +249,9 @@ func (rb *route) procureValues(plan logicalPlan, jt *jointab, val sqlparser.Expr
 		return evalengine.NewTupleExpr(exprs...), nil
 	case *sqlparser.ColName:
 		joinVar := jt.Procure(plan, typedVal, rb.Order())
-		return evalengine.NewBindVar(joinVar, collations.TypedCollation{}), nil
+		return evalengine.NewBindVar(joinVar), nil
 	default:
-		return evalengine.Translate(typedVal, semantics.EmptySemTable())
+		return evalengine.Translate(typedVal, nil)
 	}
 }
 
@@ -321,15 +318,15 @@ func (rb *route) SupplyWeightString(colNumber int, alsoAddToGroupBy bool) (weigh
 	rc := rb.resultColumns[colNumber]
 	s, ok := rb.Select.(*sqlparser.Select)
 	if !ok {
-		return 0, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unexpected AST struct for query")
+		return 0, vterrors.VT13001("unexpected AST struct for query")
 	}
 
 	aliasExpr, ok := s.SelectExprs[colNumber].(*sqlparser.AliasedExpr)
 	if !ok {
-		return 0, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unexpected AST struct for query %T", s.SelectExprs[colNumber])
+		return 0, vterrors.VT13001(fmt.Sprintf("unexpected AST struct for query %T", s.SelectExprs[colNumber]))
 	}
 	weightStringExpr := &sqlparser.FuncExpr{
-		Name: sqlparser.NewColIdent("weight_string"),
+		Name: sqlparser.NewIdentifierCI("weight_string"),
 		Exprs: []sqlparser.SelectExpr{
 			&sqlparser.AliasedExpr{
 				Expr: aliasExpr.Expr,
@@ -342,7 +339,7 @@ func (rb *route) SupplyWeightString(colNumber int, alsoAddToGroupBy bool) (weigh
 	if alsoAddToGroupBy {
 		sel, isSelect := rb.Select.(*sqlparser.Select)
 		if !isSelect {
-			return 0, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "cannot add weight string in %T", rb.Select)
+			return 0, vterrors.VT13001(fmt.Sprintf("cannot add weight string in %T", rb.Select))
 		}
 		sel.AddGroupBy(weightStringExpr)
 	}
@@ -363,7 +360,7 @@ func (rb *route) SupplyWeightString(colNumber int, alsoAddToGroupBy bool) (weigh
 // Rewrite implements the logicalPlan interface
 func (rb *route) Rewrite(inputs ...logicalPlan) error {
 	if len(inputs) != 0 {
-		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "route: wrong number of inputs")
+		return vterrors.VT13001("route: wrong number of inputs")
 	}
 	return nil
 }
@@ -850,11 +847,10 @@ func (rb *route) exprIsValue(expr sqlparser.Expr) bool {
 }
 
 // queryTimeout returns DirectiveQueryTimeout value if set, otherwise returns 0.
-func queryTimeout(d sqlparser.CommentDirectives) int {
-	if val, ok := d[sqlparser.DirectiveQueryTimeout]; ok {
-		if intVal, err := strconv.Atoi(val); err == nil {
-			return intVal
-		}
+func queryTimeout(d *sqlparser.CommentDirectives) int {
+	val, _ := d.GetString(sqlparser.DirectiveQueryTimeout, "0")
+	if intVal, err := strconv.Atoi(val); err == nil {
+		return intVal
 	}
 	return 0
 }

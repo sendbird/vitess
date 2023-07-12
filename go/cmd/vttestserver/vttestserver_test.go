@@ -36,6 +36,7 @@ import (
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/tlstest"
 	"vitess.io/vitess/go/vt/vtctl/vtctlclient"
 	"vitess.io/vitess/go/vt/vttest"
@@ -80,8 +81,14 @@ func TestPersistentMode(t *testing.T) {
 	cluster, err := startPersistentCluster(dir)
 	assert.NoError(t, err)
 
-	// basic sanity checks similar to TestRunsVschemaMigrations
+	// Add a new "ad-hoc" vindex via vtgate once the cluster is up, to later make sure it is persisted across teardowns
+	err = addColumnVindex(cluster, "test_keyspace", "alter vschema on persistence_test add vindex my_vdx(id)")
+	assert.NoError(t, err)
+
+	// Basic sanity checks similar to TestRunsVschemaMigrations
+	// See go/cmd/vttestserver/data/schema/app_customer/* and go/cmd/vttestserver/data/schema/test_keyspace/*
 	assertColumnVindex(t, cluster, columnVindex{keyspace: "test_keyspace", table: "test_table", vindex: "my_vdx", vindexType: "hash", column: "id"})
+	assertColumnVindex(t, cluster, columnVindex{keyspace: "test_keyspace", table: "persistence_test", vindex: "my_vdx", vindexType: "hash", column: "id"})
 	assertColumnVindex(t, cluster, columnVindex{keyspace: "app_customer", table: "customers", vindex: "hash", vindexType: "hash", column: "id"})
 
 	// insert some data to ensure persistence across teardowns
@@ -110,8 +117,9 @@ func TestPersistentMode(t *testing.T) {
 	defer cluster.TearDown()
 	assert.NoError(t, err)
 
-	// rerun our sanity checks to make sure vschema migrations are run during every startup
+	// rerun our sanity checks to make sure vschema is persisted correctly
 	assertColumnVindex(t, cluster, columnVindex{keyspace: "test_keyspace", table: "test_table", vindex: "my_vdx", vindexType: "hash", column: "id"})
+	assertColumnVindex(t, cluster, columnVindex{keyspace: "test_keyspace", table: "persistence_test", vindex: "my_vdx", vindexType: "hash", column: "id"})
 	assertColumnVindex(t, cluster, columnVindex{keyspace: "app_customer", table: "customers", vindex: "hash", vindexType: "hash", column: "id"})
 
 	// ensure previous data was successfully persisted
@@ -178,7 +186,7 @@ func TestForeignKeysAndDDLModes(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestCanVtGateExecute(t *testing.T) {
+func TestCanGetKeyspaces(t *testing.T) {
 	args := os.Args
 	conf := config
 	defer resetFlags(args, conf)
@@ -187,7 +195,7 @@ func TestCanVtGateExecute(t *testing.T) {
 	assert.NoError(t, err)
 	defer cluster.TearDown()
 
-	assertVtGateExecute(t, cluster)
+	assertGetKeyspaces(t, cluster)
 }
 
 func TestExternalTopoServerConsul(t *testing.T) {
@@ -213,7 +221,7 @@ func TestExternalTopoServerConsul(t *testing.T) {
 	assert.NoError(t, err)
 	defer cluster.TearDown()
 
-	assertVtGateExecute(t, cluster)
+	assertGetKeyspaces(t, cluster)
 }
 
 func TestMtlsAuth(t *testing.T) {
@@ -303,13 +311,20 @@ func startPersistentCluster(dir string, flags ...string) (vttest.LocalCluster, e
 	return startCluster(flags...)
 }
 
+var clusterKeyspaces = []string{
+	"test_keyspace",
+	"app_customer",
+}
+
 func startCluster(flags ...string) (vttest.LocalCluster, error) {
+	os.Args = []string{"vttestserver"}
 	schemaDirArg := "--schema_dir=data/schema"
 	tabletHostname := "--tablet_hostname=localhost"
-	keyspaceArg := "--keyspaces=test_keyspace,app_customer"
+	keyspaceArg := "--keyspaces=" + strings.Join(clusterKeyspaces, ",")
 	numShardsArg := "--num_shards=2,2"
 	vschemaDDLAuthorizedUsers := "--vschema_ddl_authorized_users=%"
-	os.Args = append(os.Args, []string{schemaDirArg, keyspaceArg, numShardsArg, tabletHostname, vschemaDDLAuthorizedUsers}...)
+	alsoLogToStderr := "--alsologtostderr" // better debugging
+	os.Args = append(os.Args, []string{schemaDirArg, keyspaceArg, numShardsArg, tabletHostname, vschemaDDLAuthorizedUsers, alsoLogToStderr}...)
 	os.Args = append(os.Args, flags...)
 	return runCluster()
 }
@@ -373,39 +388,44 @@ func randomPort() int {
 	return int(v + 10000)
 }
 
-func assertVtGateExecute(t *testing.T, cluster vttest.LocalCluster) {
+func assertGetKeyspaces(t *testing.T, cluster vttest.LocalCluster) {
 	client, err := vtctlclient.New(fmt.Sprintf("localhost:%v", cluster.GrpcPort()))
 	assert.NoError(t, err)
 	defer client.Close()
 	stream, err := client.ExecuteVtctlCommand(
 		context.Background(),
 		[]string{
-			"VtGateExecute",
+			"GetKeyspaces",
 			"--server",
 			fmt.Sprintf("localhost:%v", cluster.GrpcPort()),
-			"select 'success';",
 		},
 		30*time.Second,
 	)
 	assert.NoError(t, err)
 
-	var b strings.Builder
-	b.Grow(1024)
+	resp, err := consumeEventStream(stream)
+	require.NoError(t, err)
 
-Out:
-	for {
-		e, err := stream.Recv()
-		switch err {
-		case nil:
-			b.WriteString(e.Value)
-		case io.EOF:
-			break Out
-		default:
-			assert.FailNow(t, err.Error())
-		}
+	keyspaces := strings.Split(resp, "\n")
+	if keyspaces[len(keyspaces)-1] == "" { // trailing newlines make Split annoying
+		keyspaces = keyspaces[:len(keyspaces)-1]
 	}
 
-	assert.Contains(t, b.String(), "success")
+	assert.ElementsMatch(t, clusterKeyspaces, keyspaces)
+}
+
+func consumeEventStream(stream logutil.EventStream) (string, error) {
+	var buf strings.Builder
+	for {
+		switch e, err := stream.Recv(); err {
+		case nil:
+			buf.WriteString(e.Value)
+		case io.EOF:
+			return buf.String(), nil
+		default:
+			return "", err
+		}
+	}
 }
 
 // startConsul starts a consul subprocess, and waits for it to be ready.

@@ -41,7 +41,7 @@ import (
 	"vitess.io/vitess/go/vt/vtgate/vtgateconn"
 )
 
-var testMessage = "{\"message\":\"hello world\"}"
+var testMessage = "{\"message\": \"hello world\"}"
 var testShardedMessagef = "{\"message\": \"hello world\", \"id\": %d}"
 
 var createMessage = `
@@ -648,8 +648,13 @@ func parseDebugVars(t *testing.T, output interface{}, vttablet *cluster.Vttablet
 	if err != nil {
 		t.Fatalf("failed to fetch %q: %v", debugVarURL, err)
 	}
+	defer resp.Body.Close()
 
-	respByte, _ := io.ReadAll(resp.Body)
+	respByte, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read body %q: %v", debugVarURL, err)
+	}
+
 	if resp.StatusCode != 200 {
 		t.Fatalf("status code %d while fetching %q:\n%s", resp.StatusCode, debugVarURL, respByte)
 	}

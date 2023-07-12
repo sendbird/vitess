@@ -17,8 +17,6 @@ limitations under the License.
 package tmutils
 
 import (
-	"crypto/md5"
-	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strings"
@@ -119,7 +117,7 @@ func NewTableFilter(tables, excludeTables []string, includeViews bool) (*TableFi
 					return nil, fmt.Errorf("cannot compile regexp %v for excludeTable: %v", table, err)
 				}
 
-				f.excludeTableREs = append(f.tableREs, re)
+				f.excludeTableREs = append(f.excludeTableREs, re)
 			} else {
 				f.excludeTableNames = append(f.excludeTableNames, table)
 			}
@@ -192,25 +190,7 @@ func FilterTables(sd *tabletmanagerdatapb.SchemaDefinition, tables, excludeTable
 			copy.TableDefinitions = append(copy.TableDefinitions, table)
 		}
 	}
-
-	// Regenerate hash over tables because it may have changed.
-	if copy.Version != "" {
-		GenerateSchemaVersion(copy)
-	}
-
 	return copy, nil
-}
-
-// GenerateSchemaVersion return a unique schema version string based on
-// its TableDefinitions.
-func GenerateSchemaVersion(sd *tabletmanagerdatapb.SchemaDefinition) {
-	hasher := md5.New()
-	for _, td := range sd.TableDefinitions {
-		if _, err := hasher.Write([]byte(td.Schema)); err != nil {
-			panic(err) // extremely unlikely
-		}
-	}
-	sd.Version = hex.EncodeToString(hasher.Sum(nil))
 }
 
 // SchemaDefinitionGetTable returns TableDefinition for a given table name.

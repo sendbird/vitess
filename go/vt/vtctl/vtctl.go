@@ -63,9 +63,7 @@ COMMAND ARGUMENT DEFINITIONS
              for backup purposes
   -- batch: A replicated copy of data for OLAP load patterns (typically for
             MapReduce jobs)
-  -- drained: A tablet that is reserved for a background process. For example,
-              a tablet used by a vtworker process, where the tablet is likely
-              lagging in replication.
+  -- drained: A tablet that is reserved for a background process.
   -- experimental: A replica copy of data that is ready but not serving query
                    traffic. The value indicates a special characteristic of
                    the tablet that indicates the tablet should not be
@@ -85,7 +83,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"math"
@@ -96,60 +93,58 @@ import (
 	"sync"
 	"time"
 
+	"github.com/spf13/pflag"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
-
-	"vitess.io/vitess/go/textutil"
 
 	"vitess.io/vitess/go/cmd/vtctldclient/cli"
 	"vitess.io/vitess/go/flagutil"
 	"vitess.io/vitess/go/json2"
 	"vitess.io/vitess/go/protoutil"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/textutil"
 	hk "vitess.io/vitess/go/vt/hook"
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/logutil"
-	"vitess.io/vitess/go/vt/schema"
-	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/topo"
-	"vitess.io/vitess/go/vt/topo/topoproto"
-	"vitess.io/vitess/go/vt/topotools"
-	"vitess.io/vitess/go/vt/vtctl/workflow"
-	"vitess.io/vitess/go/vt/vterrors"
-	"vitess.io/vitess/go/vt/wrangler"
-
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/proto/vttime"
-
-	// Include deprecation warnings for soon-to-be-unsupported flag invocations.
-	_flag "vitess.io/vitess/go/internal/flag"
+	"vitess.io/vitess/go/vt/schema"
+	"vitess.io/vitess/go/vt/sidecardb"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/topotools"
+	"vitess.io/vitess/go/vt/vtctl/workflow"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vtgate/vindexes"
+	"vitess.io/vitess/go/vt/wrangler"
 )
 
-var (
-	// ErrUnknownCommand is returned for an unknown command
-	ErrUnknownCommand = errors.New("unknown command")
-)
+// ErrUnknownCommand is returned for an unknown command.
+var ErrUnknownCommand = errors.New("unknown command")
 
-// Flags are exported for use in go/vt/vtctld.
-var (
-	HealthCheckTopologyRefresh = flag.Duration("vtctl_healthcheck_topology_refresh", 30*time.Second, "refresh interval for re-reading the topology")
-	HealthcheckRetryDelay      = flag.Duration("vtctl_healthcheck_retry_delay", 5*time.Second, "delay before retrying a failed healthcheck")
-	HealthCheckTimeout         = flag.Duration("vtctl_healthcheck_timeout", time.Minute, "the health check timeout period")
-)
+const errWorkflowUpdateWithoutChanges = "no updates were provided; use --cells, --tablet-types, or --on-ddl to specify new values"
 
 type command struct {
 	name   string
-	method func(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error
+	method func(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error
 	params string
 	help   string // if help is empty, won't list the command
 
 	// if set, PrintAllCommands will not show this command
 	hidden bool
+
+	// (ajm188) - before we transition to cobra, we need to know whether to
+	// strip off a -- after the action (i.e. "command") name in RunCommand so
+	// that parsing continues to work.
+	disableFlagInterspersal bool
 
 	// deprecation support
 	deprecated   bool
@@ -251,13 +246,6 @@ var commands = []commandGroup{
 				help:   "Runs a health check on a remote tablet.",
 			},
 			{
-				name:       "IgnoreHealthError",
-				method:     commandIgnoreHealthError,
-				params:     "<tablet alias> <ignore regexp>",
-				help:       "Sets the regexp for health check errors to ignore on the specified tablet. The pattern has implicit ^$ anchors. Set to empty string or restart vttablet to stop ignoring anything.",
-				deprecated: true,
-			},
-			{
 				name:   "Sleep",
 				method: commandSleep,
 				params: "<tablet alias> <duration>",
@@ -269,6 +257,7 @@ var commands = []commandGroup{
 				params: "<tablet alias> <hook name> [<param1=value1> <param2=value2> ...]",
 				help: "Runs the specified hook on the given tablet. A hook is a script that resides in the $VTROOT/vthook directory. You can put any script into that directory and use this command to run that script.\n" +
 					"For this command, the param=value arguments are parameters that the command passes to the specified hook.",
+				disableFlagInterspersal: true,
 			},
 			{
 				name:   "ExecuteFetchAsApp",
@@ -283,10 +272,12 @@ var commands = []commandGroup{
 				help:   "Runs the given SQL command as a DBA on the remote tablet.",
 			},
 			{
-				name:   "VReplicationExec",
-				method: commandVReplicationExec,
-				params: "[--json] <tablet alias> <sql command>",
-				help:   "Runs the given VReplication command on the remote tablet.",
+				name:         "VReplicationExec",
+				method:       commandVReplicationExec,
+				params:       "[--json] <tablet alias> <sql command>",
+				help:         "Runs the given VReplication command on the remote tablet.",
+				deprecated:   true,
+				deprecatedBy: "Workflow -- <keyspace.workflow> <action>",
 			},
 		},
 	},
@@ -341,7 +332,7 @@ var commands = []commandGroup{
 				name:   "UpdateSrvKeyspacePartition",
 				method: commandUpdateSrvKeyspacePartition,
 				params: "[--cells=c1,c2,...] [--remove] <keyspace/shard> <tablet type>",
-				help:   "Updates KeyspaceGraph partition for a shard and tablet type. Only use this for an emergency fix during an horizontal shard split. Specify the remove flag, if you want the shard to be removed from the desired partition.",
+				help:   "Updates KeyspaceGraph partition for a shard and tablet type. Only use this for emergency fixes. Specify the remove flag, if you want the shard to be removed from the desired partition.",
 			},
 			{
 				name:   "SourceShardDelete",
@@ -400,7 +391,7 @@ var commands = []commandGroup{
 			{
 				name:   "CreateKeyspace",
 				method: commandCreateKeyspace,
-				params: "[--sharding_column_name=name] [--sharding_column_type=type] [--served_from=tablettype1:ks1,tablettype2:ks2,...] [--force] [--keyspace_type=type] [--base_keyspace=base_keyspace] [--snapshot_time=time] [--durability-policy=policy_name] <keyspace name>",
+				params: "[--served_from=tablettype1:ks1,tablettype2:ks2,...] [--force] [--keyspace_type=type] [--base_keyspace=base_keyspace] [--snapshot_time=time] [--durability-policy=policy_name] [--sidecar-db-name=db_name] <keyspace name>",
 				help:   "Creates the specified keyspace. keyspace_type can be NORMAL or SNAPSHOT. For a SNAPSHOT keyspace you must specify the name of a base_keyspace, and a snapshot_time in UTC, in RFC3339 time format, e.g. 2006-01-02T15:04:05+00:00",
 			},
 			{
@@ -428,20 +419,6 @@ var commands = []commandGroup{
 				help:   "Outputs a sorted list of all keyspaces.",
 			},
 			{
-				name:       "SetKeyspaceShardingInfo",
-				method:     commandSetKeyspaceShardingInfo,
-				params:     "[--force] <keyspace name> [<column name>] [<column type>]",
-				help:       "Updates the sharding information for a keyspace.",
-				deprecated: true,
-			},
-			{
-				name:       "SetKeyspaceServedFrom",
-				method:     commandSetKeyspaceServedFrom,
-				params:     "[--source=<source keyspace name>] [--remove] [--cells=c1,c2,...] <keyspace name> <tablet type>",
-				help:       "Changes the ServedFromMap manually. This command is intended for emergency fixes. This command does not rebuild the serving graph.",
-				deprecated: true,
-			},
-			{
 				name:   "RebuildKeyspaceGraph",
 				method: commandRebuildKeyspaceGraph,
 				params: "[--cells=c1,c2,...] [--allow_partial] <keyspace> ...",
@@ -456,31 +433,25 @@ var commands = []commandGroup{
 			{
 				name:   "Reshard",
 				method: commandReshard,
-				params: "[--source_shards=<source_shards>] [--target_shards=<target_shards>] [--cells=<cells>] [--tablet_types=<source_tablet_types>]  [--skip_schema_copy] <action> 'action must be one of the following: Create, Complete, Cancel, SwitchTraffic, ReverseTrafffic, Show, or Progress' <keyspace.workflow>",
-				help:   "Start a Resharding process. Example: Reshard --cells='zone1,alias1' --tablet_types='PRIMARY,REPLICA,RDONLY'  ks.workflow001 '0' '-80,80-'",
+				params: "[--source_shards=<source_shards>] [--target_shards=<target_shards>] [--cells=<cells>] [--tablet_types=<source_tablet_types>] [--on-ddl=<ddl-action>] [--defer-secondary-keys] [--skip_schema_copy] <action> 'action must be one of the following: Create, Complete, Cancel, SwitchTraffic, ReverseTrafffic, Show, or Progress' <keyspace.workflow>",
+				help:   "Start a Resharding process.",
 			},
 			{
 				name:   "MoveTables",
 				method: commandMoveTables,
-				params: "[--source=<sourceKs>] [--tables=<tableSpecs>] [--cells=<cells>] [--tablet_types=<source_tablet_types>] [--all] [--exclude=<tables>] [--auto_start] [--stop_after_copy] <action> 'action must be one of the following: Create, Complete, Cancel, SwitchTraffic, ReverseTrafffic, Show, or Progress' <targetKs.workflow>",
+				params: "[--source=<sourceKs>] [--tables=<tableSpecs>] [--cells=<cells>] [--tablet_types=<source_tablet_types>] [--all] [--exclude=<tables>] [--auto_start] [--stop_after_copy] [--defer-secondary-keys] [--on-ddl=<ddl-action>] [--source_shards=<source_shards>] <action> 'action must be one of the following: Create, Complete, Cancel, SwitchTraffic, ReverseTrafffic, Show, or Progress' <targetKs.workflow>",
 				help:   `Move table(s) to another keyspace, table_specs is a list of tables or the tables section of the vschema for the target keyspace. Example: '{"t1":{"column_vindexes": [{"column": "id1", "name": "hash"}]}, "t2":{"column_vindexes": [{"column": "id2", "name": "hash"}]}}'.  In the case of an unsharded target keyspace the vschema for each table may be empty. Example: '{"t1":{}, "t2":{}}'.`,
 			},
 			{
 				name:   "Migrate",
 				method: commandMigrate,
-				params: "[--cells=<cells>] [--tablet_types=<source_tablet_types>] --workflow=<workflow> <source_keyspace> <target_keyspace> <table_specs>",
+				params: "[--cells=<cells>] [--tablet_types=<source_tablet_types>] [--defer-secondary-keys] --workflow=<workflow> <source_keyspace> <target_keyspace> <table_specs>",
 				help:   `Move table(s) to another keyspace, table_specs is a list of tables or the tables section of the vschema for the target keyspace. Example: '{"t1":{"column_vindexes": [{"column": "id1", "name": "hash"}]}, "t2":{"column_vindexes": [{"column": "id2", "name": "hash"}]}}'.  In the case of an unsharded target keyspace the vschema for each table may be empty. Example: '{"t1":{}, "t2":{}}'.`,
-			},
-			{
-				name:   "DropSources",
-				method: commandDropSources,
-				params: "[--dry_run] [--rename_tables] <keyspace.workflow>",
-				help:   "After a MoveTables or Resharding workflow cleanup unused artifacts like source tables, source shards and denylists",
 			},
 			{
 				name:   "CreateLookupVindex",
 				method: commandCreateLookupVindex,
-				params: "[--cell=<source_cells> DEPRECATED] [--cells=<source_cells>] [--tablet_types=<source_tablet_types>] <keyspace> <json_spec>",
+				params: "[--cells=<source_cells>] [--tablet_types=<source_tablet_types>] <keyspace> <json_spec>",
 				help:   `Create and backfill a lookup vindex. the json_spec must contain the vindex and colvindex specs for the new lookup.`,
 			},
 			{
@@ -496,77 +467,16 @@ var commands = []commandGroup{
 				help:   "Performs materialization based on the json spec. Is used directly to form VReplication rules, with an optional step to copy table structure/DDL.",
 			},
 			{
-				name:       "SplitClone",
-				method:     commandSplitClone,
-				params:     "<keyspace> <from_shards> <to_shards>",
-				help:       "Start the SplitClone process to perform horizontal resharding. Example: SplitClone ks '0' '-80,80-'",
-				deprecated: true,
-			},
-			{
-				name:       "VerticalSplitClone",
-				method:     commandVerticalSplitClone,
-				params:     "<from_keyspace> <to_keyspace> <tables>",
-				help:       "Start the VerticalSplitClone process to perform vertical resharding. Example: SplitClone from_ks to_ks 'a,/b.*/'",
-				deprecated: true,
-			},
-			{
 				name:   "VDiff",
 				method: commandVDiff,
-				params: "[--source_cell=<cell>] [--target_cell=<cell>] [--tablet_types=in_order:RDONLY,REPLICA,PRIMARY] [--filtered_replication_wait_time=30s] [--max_extra_rows_to_compare=1000] <keyspace.workflow>",
+				params: "[--source_cell=<cell>] [--target_cell=<cell>] [--tablet_types=in_order:RDONLY,REPLICA,PRIMARY] [--limit=<max rows to diff>] [--tables=<table list>] [--format=json] [--auto-retry] [--verbose] [--max_extra_rows_to_compare=1000] [--filtered_replication_wait_time=30s] [--debug_query] [--only_pks] [--wait] [--wait-update-interval=1m] <keyspace.workflow> [<action>] [<UUID>]",
 				help:   "Perform a diff of all tables in the workflow",
-			},
-			{
-				name:       "MigrateServedTypes",
-				method:     commandMigrateServedTypes,
-				params:     "[--cells=c1,c2,...] [--reverse] [--skip-refresh-state] [--filtered_replication_wait_time=30s] [--reverse_replication=false] <keyspace/shard> <served tablet type>",
-				help:       "Migrates a serving type from the source shard to the shards that it replicates to. This command also rebuilds the serving graph. The <keyspace/shard> argument can specify any of the shards involved in the migration.",
-				deprecated: true,
-			},
-			{
-				name:       "MigrateServedFrom",
-				method:     commandMigrateServedFrom,
-				params:     "[--cells=c1,c2,...] [--reverse] [--filtered_replication_wait_time=30s] <destination keyspace/shard> <served tablet type>",
-				help:       "Makes the <destination keyspace/shard> serve the given type. This command also rebuilds the serving graph.",
-				deprecated: true,
-			},
-			{
-				name:   "SwitchReads",
-				method: commandSwitchReads,
-				params: "[--cells=c1,c2,...] [--reverse] --tablet_type={replica|rdonly} [--dry_run] <keyspace.workflow>",
-				help:   "Switch read traffic for the specified workflow.",
-			},
-			{
-				name:   "SwitchWrites",
-				method: commandSwitchWrites,
-				params: "[--timeout=30s] [--reverse] [--reverse_replication=true] [--dry_run] <keyspace.workflow>",
-				help:   "Switch write traffic for the specified workflow.",
-			},
-			{
-				name:   "CancelResharding",
-				method: commandCancelResharding,
-				params: "<keyspace/shard>",
-				help:   "Permanently cancels a resharding in progress. All resharding related metadata will be deleted.",
-			},
-			{
-				name:   "ShowResharding",
-				method: commandShowResharding,
-				params: "<keyspace/shard>",
-				help:   "Displays all metadata about a resharding in progress.",
 			},
 			{
 				name:   "FindAllShardsInKeyspace",
 				method: commandFindAllShardsInKeyspace,
 				params: "<keyspace>",
 				help:   "Displays all of the shards in the specified keyspace.",
-			},
-			{
-				name:   "WaitForDrain",
-				method: commandWaitForDrain,
-				params: "[--timeout <duration>] [--retry_delay <duration>] [--initial_wait <duration>] <keyspace/shard> <served tablet type>",
-				help: "Blocks until no new queries were observed on all tablets with the given tablet type in the specified keyspace. " +
-					" This can be used as sanity check to ensure that the tablets were drained after running vtctl MigrateServedTypes " +
-					" and vtgate is no longer using them. If --timeout is set, it fails when the timeout is reached.",
-				deprecated: true,
 			},
 			{
 				name:   "Mount",
@@ -611,9 +521,9 @@ var commands = []commandGroup{
 			},
 			{
 				name: "LegacyVtctlCommand",
-				method: func(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+				method: func(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 					subFlags.Usage = func() {
-						fmt.Fprintln(subFlags.Output(), "Runs the vtctl request through the legacy vtctlclient program syntax (default).")
+						wr.Logger().Printf("Runs the vtctl request through the legacy vtctlclient program syntax (default).\n")
 					}
 
 					return subFlags.Parse(args)
@@ -623,9 +533,9 @@ var commands = []commandGroup{
 			},
 			{
 				name: "VtctldCommand",
-				method: func(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+				method: func(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 					subFlags.Usage = func() {
-						fmt.Fprintln(subFlags.Output(), "Runs the vtctl request through the new vtctldclient program syntax. This will become the default in a future version of Vitess.")
+						wr.Logger().Printf("Runs the vtctl request through the new vtctldclient program syntax. This will become the default in a future version of Vitess.\n")
 					}
 
 					return subFlags.Parse(args)
@@ -676,8 +586,8 @@ var commands = []commandGroup{
 			{
 				name:   "ApplySchema",
 				method: commandApplySchema,
-				params: "[--allow_long_unavailability] [--wait_replicas_timeout=10s] [--ddl_strategy=<ddl_strategy>] [--uuid_list=<comma_separated_uuids>] [--migration_context=<unique-request-context>] [--skip_preflight] {--sql=<sql> || --sql-file=<filename>} <keyspace>",
-				help:   "Applies the schema change to the specified keyspace on every primary, running in parallel on all shards. The changes are then propagated to replicas via replication. If --allow_long_unavailability is set, schema changes affecting a large number of rows (and possibly incurring a longer period of unavailability) will not be rejected. -ddl_strategy is used to instruct migrations via vreplication, gh-ost or pt-osc with optional parameters. -migration_context allows the user to specify a custom request context for online DDL migrations. If -skip_preflight, SQL goes directly to shards without going through sanity checks.",
+				params: "[--allow_long_unavailability] [--wait_replicas_timeout=10s] [--ddl_strategy=<ddl_strategy>] [--uuid_list=<comma_separated_uuids>] [--migration_context=<unique-request-context>] {--sql=<sql> || --sql-file=<filename>} <keyspace>",
+				help:   "Applies the schema change to the specified keyspace on every primary, running in parallel on all shards. The changes are then propagated to replicas via replication. If --allow_long_unavailability is set, schema changes affecting a large number of rows (and possibly incurring a longer period of unavailability) will not be rejected. -ddl_strategy is used to instruct migrations via vreplication, gh-ost or pt-osc with optional parameters. -migration_context allows the user to specify a custom request context for online DDL migrations.",
 			},
 			{
 				name:   "CopySchemaShard",
@@ -692,6 +602,9 @@ var commands = []commandGroup{
 				help: "Operates on online DDL (migrations). Examples:" +
 					" \nvtctl OnlineDDL test_keyspace show 82fa54ac_e83e_11ea_96b7_f875a4d24e90" +
 					" \nvtctl OnlineDDL test_keyspace show all" +
+					" \nvtctl OnlineDDL  --order descending test_keyspace show all" +
+					" \nvtctl OnlineDDL  --limit 10 test_keyspace show all" +
+					" \nvtctl OnlineDDL  --skip 5 --limit 10 test_keyspace show all" +
 					" \nvtctl OnlineDDL test_keyspace show running" +
 					" \nvtctl OnlineDDL test_keyspace show complete" +
 					" \nvtctl OnlineDDL test_keyspace show failed" +
@@ -775,6 +688,12 @@ var commands = []commandGroup{
 				help:   "Outputs a JSON structure that contains information about the SrvKeyspace.",
 			},
 			{
+				name:   "UpdateThrottlerConfig",
+				method: commandUpdateThrottlerConfig,
+				params: "[--enable|--disable] [--threshold=<float64>] [--custom-query=<query>] [--check-as-check-self|--check-as-check-shard] <keyspace>",
+				help:   "Update the table throttler configuration for all cells and tablets of a given keyspace",
+			},
+			{
 				name:   "GetSrvVSchema",
 				method: commandGetSrvVSchema,
 				params: "<cell>",
@@ -801,20 +720,10 @@ var commands = []commandGroup{
 	{
 		"Workflow", []command{
 			{
-				name:   "VExec",
-				method: commandVExec,
-				params: "<ks.workflow> <query> --dry-run",
-				help:   "Runs query on all tablets in workflow. Example: VExec merchant.morders \"update _vt.vreplication set Status='Running'\"",
-			},
-		},
-	},
-	{
-		"Workflow", []command{
-			{
 				name:   "Workflow",
 				method: commandWorkflow,
-				params: "<ks.workflow> <action> --dry-run",
-				help:   "Start/Stop/Delete/Show/ListAll/Tags Workflow on all target tablets in workflow. Example: Workflow merchant.morders Start",
+				params: "[--dry-run] [--cells] [--tablet-types] <keyspace>[.<workflow>] start/stop/update/delete/show/listall/tags [<tags>]",
+				help:   "Start/Stop/Update/Delete/Show/ListAll/Tags Workflow on all target tablets in workflow. Example: Workflow merchant.morders Start",
 			},
 		},
 	},
@@ -984,7 +893,7 @@ func parseTabletType(param string, types []topodatapb.TabletType) (topodatapb.Ta
 	return tabletType, nil
 }
 
-func commandInitTablet(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandInitTablet(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	dbNameOverride := subFlags.String("db_name_override", "", "Overrides the name of the database that the vttablet uses")
 	allowUpdate := subFlags.Bool("allow_update", false, "Use this flag to force initialization if a tablet with the same name already exists. Use with caution.")
 	allowPrimaryOverride := subFlags.Bool("allow_master_override", false, "Use this flag to force initialization if a tablet is created as primary, and a primary for the keyspace/shard already exists. Use with caution.")
@@ -1040,7 +949,7 @@ func commandInitTablet(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 	return wr.TopoServer().InitTablet(ctx, tablet, *allowPrimaryOverride, *createShardAndKeyspace, *allowUpdate)
 }
 
-func commandGetTablet(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandGetTablet(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1060,7 +969,7 @@ func commandGetTablet(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag
 	return printJSON(wr.Logger(), tabletInfo.Tablet)
 }
 
-func commandUpdateTabletAddrs(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandUpdateTabletAddrs(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	hostname := subFlags.String("hostname", "", "The fully qualified host name of the server on which the tablet is running.")
 	mysqlHost := subFlags.String("mysql_host", "", "The mysql host for the mysql server")
 	mysqlPort := subFlags.Int("mysql-port", 0, "The mysql port for the mysql daemon")
@@ -1105,7 +1014,7 @@ func commandUpdateTabletAddrs(ctx context.Context, wr *wrangler.Wrangler, subFla
 	return err
 }
 
-func commandDeleteTablet(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandDeleteTablet(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	allowPrimary := subFlags.Bool("allow_primary", false, "Allows for the primary tablet of a shard to be deleted. Use with caution.")
 
 	if err := subFlags.Parse(args); err != nil {
@@ -1127,7 +1036,7 @@ func commandDeleteTablet(ctx context.Context, wr *wrangler.Wrangler, subFlags *f
 	return nil
 }
 
-func commandSetReadOnly(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandSetReadOnly(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1146,7 +1055,7 @@ func commandSetReadOnly(ctx context.Context, wr *wrangler.Wrangler, subFlags *fl
 	return err
 }
 
-func commandSetReadWrite(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandSetReadWrite(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1165,7 +1074,7 @@ func commandSetReadWrite(ctx context.Context, wr *wrangler.Wrangler, subFlags *f
 	return err
 }
 
-func commandStartReplication(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandStartReplication(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1184,7 +1093,7 @@ func commandStartReplication(ctx context.Context, wr *wrangler.Wrangler, subFlag
 	return err
 }
 
-func commandStopReplication(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandStopReplication(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1203,7 +1112,7 @@ func commandStopReplication(ctx context.Context, wr *wrangler.Wrangler, subFlags
 	return err
 }
 
-func commandChangeTabletType(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandChangeTabletType(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	dryRun := subFlags.Bool("dry-run", false, "Lists the proposed change without actually executing it")
 
 	if err := subFlags.Parse(args); err != nil {
@@ -1222,7 +1131,7 @@ func commandChangeTabletType(ctx context.Context, wr *wrangler.Wrangler, subFlag
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, *topo.RemoteOperationTimeout)
+	ctx, cancel := context.WithTimeout(ctx, topo.RemoteOperationTimeout)
 	defer cancel()
 
 	if *dryRun {
@@ -1241,7 +1150,7 @@ func commandChangeTabletType(ctx context.Context, wr *wrangler.Wrangler, subFlag
 	return wr.ChangeTabletType(ctx, tabletAlias, newType)
 }
 
-func commandPing(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandPing(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1258,7 +1167,7 @@ func commandPing(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.Flag
 	return err
 }
 
-func commandRefreshState(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandRefreshState(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1276,7 +1185,7 @@ func commandRefreshState(ctx context.Context, wr *wrangler.Wrangler, subFlags *f
 	return err
 }
 
-func commandRefreshStateByShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandRefreshStateByShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	cellsStr := subFlags.String("cells", "", "Specifies a comma-separated list of cells whose tablets are included. If empty, all cells are considered.")
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -1303,7 +1212,7 @@ func commandRefreshStateByShard(ctx context.Context, wr *wrangler.Wrangler, subF
 	return err
 }
 
-func commandRunHealthCheck(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandRunHealthCheck(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1321,44 +1230,7 @@ func commandRunHealthCheck(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 	return err
 }
 
-func commandIgnoreHealthError(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	return fmt.Errorf("this command is no longer relevant and has been deprecated")
-}
-
-func commandWaitForDrain(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	wr.Logger().Printf("*** This is a legacy sharding command that will soon be removed! Please use VReplication instead: https://vitess.io/docs/reference/vreplication/ ***\n")
-	var cells flagutil.StringListValue
-	subFlags.Var(&cells, "cells", "Specifies a comma-separated list of cells to look for tablets")
-	timeout := subFlags.Duration("timeout", 0*time.Second, "Timeout after which the command fails")
-	retryDelay := subFlags.Duration("retry_delay", 1*time.Second, "Time to wait between two checks")
-	initialWait := subFlags.Duration("initial_wait", 1*time.Minute, "Time to wait for all tablets to check in")
-
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-	if subFlags.NArg() != 2 {
-		return fmt.Errorf("the <keyspace/shard> and <tablet type> arguments are both required for the WaitForDrain command")
-	}
-	if *timeout != 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, *timeout)
-		defer cancel()
-	}
-
-	keyspace, shard, err := topoproto.ParseKeyspaceShard(subFlags.Arg(0))
-	if err != nil {
-		return err
-	}
-	servedType, err := topo.ParseServingTabletType(subFlags.Arg(1))
-	if err != nil {
-		return err
-	}
-
-	return wr.WaitForDrain(ctx, cells, keyspace, shard, servedType,
-		*retryDelay, *HealthCheckTopologyRefresh, *HealthcheckRetryDelay, *HealthCheckTimeout, *initialWait)
-}
-
-func commandSleep(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandSleep(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1381,7 +1253,7 @@ func commandSleep(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.Fla
 	return err
 }
 
-func commandExecuteFetchAsApp(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandExecuteFetchAsApp(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	maxRows := subFlags.Int("max_rows", 10000, "Specifies the maximum number of rows to allow in fetch")
 	usePool := subFlags.Bool("use_pool", false, "Use connection from pool")
 	json := subFlags.Bool("json", false, "Output JSON instead of human-readable table")
@@ -1410,7 +1282,7 @@ func commandExecuteFetchAsApp(ctx context.Context, wr *wrangler.Wrangler, subFla
 	return nil
 }
 
-func commandExecuteFetchAsDba(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandExecuteFetchAsDba(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	maxRows := subFlags.Int("max_rows", 10000, "Specifies the maximum number of rows to allow in fetch")
 	disableBinlogs := subFlags.Bool("disable_binlogs", false, "Disables writing to binlogs during the query")
 	reloadSchema := subFlags.Bool("reload_schema", false, "Indicates whether the tablet schema will be reloaded after executing the SQL command. The default value is <code>false</code>, which indicates that the tablet schema will not be reloaded.")
@@ -1440,7 +1312,9 @@ func commandExecuteFetchAsDba(ctx context.Context, wr *wrangler.Wrangler, subFla
 	return nil
 }
 
-func commandVReplicationExec(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandVReplicationExec(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
+	wr.Logger().Printf("\nWARNING: VReplicationExec is deprecated and will be removed in a future release. Please use 'Workflow -- <keyspace.workflow> <action>' instead.\n\n")
+
 	json := subFlags.Bool("json", false, "Output JSON instead of human-readable table")
 
 	if err := subFlags.Parse(args); err != nil {
@@ -1467,7 +1341,9 @@ func commandVReplicationExec(ctx context.Context, wr *wrangler.Wrangler, subFlag
 	return nil
 }
 
-func commandExecuteHook(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandExecuteHook(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
+	subFlags.SetInterspersed(false) // all flags should be treated as posargs to pass them to the actual hook
+
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1499,7 +1375,7 @@ func commandExecuteHook(ctx context.Context, wr *wrangler.Wrangler, subFlags *fl
 	return printJSON(wr.Logger(), hr)
 }
 
-func commandCreateShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandCreateShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	force := subFlags.Bool("force", false, "Proceeds with the command even if the shard already exists")
 	parent := subFlags.Bool("parent", false, "Creates the parent keyspace if it doesn't already exist")
 	if err := subFlags.Parse(args); err != nil {
@@ -1527,7 +1403,7 @@ func commandCreateShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *fl
 	return err
 }
 
-func commandGetShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandGetShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1547,7 +1423,7 @@ func commandGetShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.
 	return printJSON(wr.Logger(), shardInfo.Shard)
 }
 
-func commandValidateShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandValidateShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	pingTablets := subFlags.Bool("ping-tablets", true, "Indicates whether all tablets should be pinged during the validation process")
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -1563,7 +1439,7 @@ func commandValidateShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *
 	return wr.ValidateShard(ctx, keyspace, shard, *pingTablets)
 }
 
-func commandShardReplicationPositions(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandShardReplicationPositions(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1599,7 +1475,7 @@ func commandShardReplicationPositions(ctx context.Context, wr *wrangler.Wrangler
 	return nil
 }
 
-func commandListShardTablets(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandListShardTablets(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1627,7 +1503,7 @@ func commandListShardTablets(ctx context.Context, wr *wrangler.Wrangler, subFlag
 	return nil
 }
 
-func commandSetShardIsPrimaryServing(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandSetShardIsPrimaryServing(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1652,7 +1528,7 @@ func commandSetShardIsPrimaryServing(ctx context.Context, wr *wrangler.Wrangler,
 	return err
 }
 
-func commandUpdateSrvKeyspacePartition(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandUpdateSrvKeyspacePartition(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	cellsStr := subFlags.String("cells", "", "Specifies a comma-separated list of cells to update")
 	remove := subFlags.Bool("remove", false, "Removes shard from serving keyspace partition")
 
@@ -1683,11 +1559,11 @@ func commandUpdateSrvKeyspacePartition(ctx context.Context, wr *wrangler.Wrangle
 	return nil
 }
 
-func commandSetShardTabletControl(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandSetShardTabletControl(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	cellsStr := subFlags.String("cells", "", "Specifies a comma-separated list of cells to update")
-	deniedTablesStr := subFlags.String("denied_tables", "", "Specifies a comma-separated list of tables to add to the denylist (used for vertical split). Each is either an exact match, or a regular expression of the form '/regexp/'.")
+	deniedTablesStr := subFlags.String("denied_tables", "", "Specifies a comma-separated list of tables to add to the denylist (used for VReplication). Each is either an exact match, or a regular expression of the form '/regexp/'.")
 
-	remove := subFlags.Bool("remove", false, "Removes cells for vertical splits.")
+	remove := subFlags.Bool("remove", false, "Removes cells.")
 	disableQueryService := subFlags.Bool("disable_query_service", false, "Disables query service on the provided nodes. This flag requires 'denied_tables' and 'remove' to be unset, otherwise it's ignored.")
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -1724,7 +1600,7 @@ func commandSetShardTabletControl(ctx context.Context, wr *wrangler.Wrangler, su
 	return err
 }
 
-func commandSourceShardDelete(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandSourceShardDelete(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1736,16 +1612,16 @@ func commandSourceShardDelete(ctx context.Context, wr *wrangler.Wrangler, subFla
 	if err != nil {
 		return err
 	}
-	uid, err := strconv.Atoi(subFlags.Arg(1))
+	uid, err := strconv.ParseInt(subFlags.Arg(1), 10, 32)
 	if err != nil {
 		return err
 	}
-	return wr.SourceShardDelete(ctx, keyspace, shard, uint32(uid))
+	return wr.SourceShardDelete(ctx, keyspace, shard, int32(uid))
 }
 
-func commandSourceShardAdd(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandSourceShardAdd(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	keyRange := subFlags.String("key_range", "", "Identifies the key range to use for the SourceShard")
-	tablesStr := subFlags.String("tables", "", "Specifies a comma-separated list of tables to replicate (used for vertical split). Each is either an exact match, or a regular expression of the form /regexp/")
+	tablesStr := subFlags.String("tables", "", "Specifies a comma-separated list of tables to replicate. Each is either an exact match, or a regular expression of the form /regexp/")
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1756,7 +1632,7 @@ func commandSourceShardAdd(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 	if err != nil {
 		return err
 	}
-	uid, err := strconv.Atoi(subFlags.Arg(1))
+	uid, err := strconv.ParseInt(subFlags.Arg(1), 10, 32)
 	if err != nil {
 		return err
 	}
@@ -1774,10 +1650,10 @@ func commandSourceShardAdd(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 			return err
 		}
 	}
-	return wr.SourceShardAdd(ctx, keyspace, shard, uint32(uid), skeyspace, sshard, kr, tables)
+	return wr.SourceShardAdd(ctx, keyspace, shard, int32(uid), skeyspace, sshard, kr, tables)
 }
 
-func commandShardReplicationAdd(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandShardReplicationAdd(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1802,7 +1678,7 @@ func commandShardReplicationAdd(ctx context.Context, wr *wrangler.Wrangler, subF
 	return err
 }
 
-func commandShardReplicationRemove(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandShardReplicationRemove(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1827,7 +1703,7 @@ func commandShardReplicationRemove(ctx context.Context, wr *wrangler.Wrangler, s
 	return err
 }
 
-func commandShardReplicationFix(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandShardReplicationFix(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1844,7 +1720,7 @@ func commandShardReplicationFix(ctx context.Context, wr *wrangler.Wrangler, subF
 	return err
 }
 
-func commandWaitForFilteredReplication(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandWaitForFilteredReplication(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	maxDelay := subFlags.Duration("max_delay", wrangler.DefaultWaitForFilteredReplicationMaxDelay,
 		"Specifies the maximum delay, in seconds, the filtered replication of the"+
 			" given destination shard should lag behind the source shard. When"+
@@ -1863,7 +1739,7 @@ func commandWaitForFilteredReplication(ctx context.Context, wr *wrangler.Wrangle
 	return wr.WaitForFilteredReplication(ctx, keyspace, shard, *maxDelay)
 }
 
-func commandRemoveShardCell(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandRemoveShardCell(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	force := subFlags.Bool("force", false, "Proceeds even if the cell's topology server cannot be reached. The assumption is that you turned down the entire cell, and just need to update the global topo data.")
 	recursive := subFlags.Bool("recursive", false, "Also delete all tablets in that cell belonging to the specified shard.")
 	if err := subFlags.Parse(args); err != nil {
@@ -1890,7 +1766,7 @@ func commandRemoveShardCell(ctx context.Context, wr *wrangler.Wrangler, subFlags
 	return err
 }
 
-func commandDeleteShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandDeleteShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	recursive := subFlags.Bool("recursive", false, "Also delete all tablets belonging to the shard.")
 	evenIfServing := subFlags.Bool("even_if_serving", false, "Remove the shard even if it is serving. Use with caution.")
 	if err := subFlags.Parse(args); err != nil {
@@ -1918,9 +1794,7 @@ func commandDeleteShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *fl
 	return nil
 }
 
-func commandCreateKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	shardingColumnName := subFlags.String("sharding_column_name", "", "Specifies the column to use for sharding operations")
-	shardingColumnType := subFlags.String("sharding_column_type", "", "Specifies the type of the column to use for sharding operations")
+func commandCreateKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	force := subFlags.Bool("force", false, "Proceeds even if the keyspace already exists")
 	allowEmptyVSchema := subFlags.Bool("allow_empty_vschema", false, "If set this will allow a new keyspace to have no vschema")
 
@@ -1930,6 +1804,7 @@ func commandCreateKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 	baseKeyspace := subFlags.String("base_keyspace", "", "Specifies the base keyspace for a snapshot keyspace")
 	timestampStr := subFlags.String("snapshot_time", "", "Specifies the snapshot time for this keyspace")
 	durabilityPolicy := subFlags.String("durability-policy", "none", "Type of durability to enforce for this keyspace. Default is none. Possible values include 'semi_sync' and others as dictated by registered plugins.")
+	sidecarDBName := subFlags.String("sidecar-db-name", sidecardb.DefaultName, "(Experimental) Name of the Vitess sidecar database that tablets in this keyspace will use for internal metadata.")
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -1938,10 +1813,6 @@ func commandCreateKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 	}
 
 	keyspace := subFlags.Arg(0)
-	kit, err := key.ParseKeyspaceIDType(*shardingColumnType)
-	if err != nil {
-		return err
-	}
 	ktype := topodatapb.KeyspaceType_NORMAL
 	if *keyspaceType != "" {
 		kt, err := topoproto.ParseKeyspaceType(*keyspaceType)
@@ -1977,12 +1848,11 @@ func commandCreateKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 		snapshotTime = logutil.TimeToProto(timeTime)
 	}
 	ki := &topodatapb.Keyspace{
-		ShardingColumnName: *shardingColumnName,
-		ShardingColumnType: kit,
-		KeyspaceType:       ktype,
-		BaseKeyspace:       *baseKeyspace,
-		SnapshotTime:       snapshotTime,
-		DurabilityPolicy:   *durabilityPolicy,
+		KeyspaceType:     ktype,
+		BaseKeyspace:     *baseKeyspace,
+		SnapshotTime:     snapshotTime,
+		DurabilityPolicy: *durabilityPolicy,
+		SidecarDbName:    *sidecarDBName,
 	}
 	if len(servedFrom) > 0 {
 		for name, value := range servedFrom {
@@ -1996,7 +1866,7 @@ func commandCreateKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 			})
 		}
 	}
-	err = wr.TopoServer().CreateKeyspace(ctx, keyspace, ki)
+	err := wr.TopoServer().CreateKeyspace(ctx, keyspace, ki)
 	if *force && topo.IsErrType(err, topo.NodeExists) {
 		wr.Logger().Infof("keyspace %v already exists (ignoring error with --force)", keyspace)
 		err = nil
@@ -2039,7 +1909,7 @@ func commandCreateKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 	return wr.TopoServer().RebuildSrvVSchema(ctx, []string{} /* cells */)
 }
 
-func commandDeleteKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandDeleteKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	recursive := subFlags.Bool("recursive", false, "Also recursively delete all shards in the keyspace.")
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -2055,7 +1925,7 @@ func commandDeleteKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 	return err
 }
 
-func commandRemoveKeyspaceCell(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandRemoveKeyspaceCell(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	force := subFlags.Bool("force", false, "Proceeds even if the cell's topology server cannot be reached. The assumption is that you turned down the entire cell, and just need to update the global topo data.")
 	recursive := subFlags.Bool("recursive", false, "Also delete all tablets in that cell belonging to the specified keyspace.")
 	if err := subFlags.Parse(args); err != nil {
@@ -2077,7 +1947,7 @@ func commandRemoveKeyspaceCell(ctx context.Context, wr *wrangler.Wrangler, subFl
 	return err
 }
 
-func commandGetKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandGetKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -2097,7 +1967,7 @@ func commandGetKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *fl
 	return printJSON(wr.Logger(), keyspaceInfo.Keyspace.Keyspace)
 }
 
-func commandGetKeyspaces(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandGetKeyspaces(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	resp, err := wr.VtctldServer().GetKeyspaces(ctx, &vtctldatapb.GetKeyspacesRequest{})
 	if err != nil {
 		return err
@@ -2112,71 +1982,7 @@ func commandGetKeyspaces(ctx context.Context, wr *wrangler.Wrangler, subFlags *f
 	return nil
 }
 
-func commandSetKeyspaceShardingInfo(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	wr.Logger().Printf("*** This is a legacy sharding command that will soon be removed! Please use VReplication instead: https://vitess.io/docs/reference/vreplication/ ***\n")
-	force := subFlags.Bool("force", false, "Updates fields even if they are already set. Use caution before calling this command.")
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-	if subFlags.NArg() > 3 || subFlags.NArg() < 1 {
-		return fmt.Errorf("the <keyspace name> argument is required for the SetKeyspaceShardingInfo command. The <column name> and <column type> arguments are both optional")
-	}
-
-	keyspace := subFlags.Arg(0)
-	columnName := ""
-	if subFlags.NArg() >= 2 {
-		columnName = subFlags.Arg(1)
-	}
-	kit := topodatapb.KeyspaceIdType_UNSET
-	if subFlags.NArg() >= 3 {
-		var err error
-		kit, err = key.ParseKeyspaceIDType(subFlags.Arg(2))
-		if err != nil {
-			return err
-		}
-	}
-
-	keyspaceIDTypeSet := (kit != topodatapb.KeyspaceIdType_UNSET)
-	columnNameSet := (columnName != "")
-	if (keyspaceIDTypeSet && !columnNameSet) || (!keyspaceIDTypeSet && columnNameSet) {
-		return fmt.Errorf("both <column name> and <column type> must be set, or both must be unset")
-	}
-
-	return wr.SetKeyspaceShardingInfo(ctx, keyspace, columnName, kit, *force)
-}
-
-func commandSetKeyspaceServedFrom(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	wr.Logger().Printf("*** This is a legacy sharding command that will soon be removed! Please use VReplication instead: https://vitess.io/docs/reference/vreplication/ ***\n")
-	source := subFlags.String("source", "", "Specifies the source keyspace name")
-	remove := subFlags.Bool("remove", false, "Indicates whether to add (default) or remove the served from record")
-	cellsStr := subFlags.String("cells", "", "Specifies a comma-separated list of cells to affect")
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-	if subFlags.NArg() != 2 {
-		return fmt.Errorf("the <keyspace name> and <tablet type> arguments are required for the SetKeyspaceServedFrom command")
-	}
-	keyspace := subFlags.Arg(0)
-	servedType, err := parseTabletType(subFlags.Arg(1), []topodatapb.TabletType{topodatapb.TabletType_PRIMARY, topodatapb.TabletType_REPLICA, topodatapb.TabletType_RDONLY})
-	if err != nil {
-		return err
-	}
-	var cells []string
-	if *cellsStr != "" {
-		cells = strings.Split(*cellsStr, ",")
-	}
-
-	_, err = wr.VtctldServer().SetKeyspaceServedFrom(ctx, &vtctldatapb.SetKeyspaceServedFromRequest{
-		Keyspace:       keyspace,
-		TabletType:     servedType,
-		Cells:          cells,
-		Remove:         *remove,
-		SourceKeyspace: *source,
-	})
-	return err
-}
-
-func commandRebuildKeyspaceGraph(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandRebuildKeyspaceGraph(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	cells := subFlags.String("cells", "", "Specifies a comma-separated list of cells to update")
 	allowPartial := subFlags.Bool("allow_partial", false, "Specifies whether a SNAPSHOT keyspace is allowed to serve with an incomplete set of shards. Ignored for all other types of keyspaces")
 	if err := subFlags.Parse(args); err != nil {
@@ -2208,7 +2014,7 @@ func commandRebuildKeyspaceGraph(ctx context.Context, wr *wrangler.Wrangler, sub
 	return nil
 }
 
-func commandValidateKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandValidateKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	pingTablets := subFlags.Bool("ping-tablets", false, "Specifies whether all tablets will be pinged during the validation process")
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -2221,88 +2027,12 @@ func commandValidateKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlag
 	return wr.ValidateKeyspace(ctx, keyspace, *pingTablets)
 }
 
-func useV1(args []string) bool {
-	for _, arg := range args {
-		if arg == "-v1" || arg == "--v1" {
-			return true
-		}
-	}
-	return false
+func commandReshard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
+	return commandVRWorkflow(ctx, wr, subFlags, args, wrangler.ReshardWorkflow)
 }
 
-func commandReshard(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	if !useV1(args) {
-		log.Infof("*** Using Reshard v2 flow ***")
-		return commandVRWorkflow(ctx, wr, subFlags, args, wrangler.ReshardWorkflow)
-	}
-	wr.Logger().Printf("*** The Reshard v1 flow is deprecated, consider using v2 commands instead, see https://vitess.io/docs/reference/vreplication/v2/ ***\n")
-
-	cells := subFlags.String("cells", "", "Cell(s) or CellAlias(es) (comma-separated) to replicate from.")
-	tabletTypes := subFlags.String("tablet_types", "", "Source tablet types to replicate from.")
-	skipSchemaCopy := subFlags.Bool("skip_schema_copy", false, "Skip copying of schema to targets")
-
-	autoStart := subFlags.Bool("auto_start", true, "If false, streams will start in the Stopped state and will need to be explicitly started")
-	stopAfterCopy := subFlags.Bool("stop_after_copy", false, "Streams will be stopped once the copy phase is completed")
-	_ = subFlags.Bool("v1", true, "")
-
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-	if subFlags.NArg() != 3 {
-		return fmt.Errorf("three arguments are required: <keyspace.workflow>, source_shards, target_shards")
-	}
-	keyspace, workflow, err := splitKeyspaceWorkflow(subFlags.Arg(0))
-	if err != nil {
-		return err
-	}
-	source := strings.Split(subFlags.Arg(1), ",")
-	target := strings.Split(subFlags.Arg(2), ",")
-	return wr.Reshard(ctx, keyspace, workflow, source, target, *skipSchemaCopy, *cells,
-		*tabletTypes, *autoStart, *stopAfterCopy)
-}
-
-func commandMoveTables(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	if !useV1(args) {
-		log.Infof("*** Using MoveTables v2 flow ***")
-		return commandVRWorkflow(ctx, wr, subFlags, args, wrangler.MoveTablesWorkflow)
-	}
-	wr.Logger().Printf("*** The MoveTables v1 flow is deprecated, consider using v2 commands instead, see https://vitess.io/docs/reference/vreplication/v2/ ***\n")
-
-	workflow := subFlags.String("workflow", "", "Workflow name. Can be any descriptive string. Will be used to later migrate traffic via SwitchReads/SwitchWrites.")
-	cells := subFlags.String("cells", "", "Cell(s) or CellAlias(es) (comma-separated) to replicate from.")
-	tabletTypes := subFlags.String("tablet_types", "", "Source tablet types to replicate from (e.g. PRIMARY, REPLICA, RDONLY). Defaults to --vreplication_tablet_type parameter value for the tablet, which has the default value of in_order:REPLICA,PRIMARY.")
-	allTables := subFlags.Bool("all", false, "Move all tables from the source keyspace")
-	excludes := subFlags.String("exclude", "", "Tables to exclude (comma-separated) if --all is specified")
-
-	autoStart := subFlags.Bool("auto_start", true, "If false, streams will start in the Stopped state and will need to be explicitly started")
-	stopAfterCopy := subFlags.Bool("stop_after_copy", false, "Streams will be stopped once the copy phase is completed")
-	dropForeignKeys := subFlags.Bool("drop_foreign_keys", false, "If true, tables in the target keyspace will be created without foreign keys.")
-	_ = subFlags.Bool("v1", true, "")
-
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-	if *workflow == "" {
-		return fmt.Errorf("a workflow name must be specified")
-	}
-	if !*allTables && len(*excludes) > 0 {
-		return fmt.Errorf("you can only specify tables to exclude if all tables are to be moved (with --all)")
-	}
-	if *allTables {
-		if subFlags.NArg() != 2 {
-			return fmt.Errorf("two arguments are required: source_keyspace, target_keyspace")
-		}
-	} else {
-		if subFlags.NArg() != 3 {
-			return fmt.Errorf("three arguments are required: source_keyspace, target_keyspace, tableSpecs")
-		}
-	}
-
-	source := subFlags.Arg(0)
-	target := subFlags.Arg(1)
-	tableSpecs := subFlags.Arg(2)
-	return wr.MoveTables(ctx, *workflow, source, target, tableSpecs, *cells, *tabletTypes, *allTables,
-		*excludes, *autoStart, *stopAfterCopy, "", *dropForeignKeys, "")
+func commandMoveTables(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
+	return commandVRWorkflow(ctx, wr, subFlags, args, wrangler.MoveTablesWorkflow)
 }
 
 // VReplicationWorkflowAction defines subcommands passed to vtctl for movetables or reshard
@@ -2319,7 +2049,7 @@ const (
 	vReplicationWorkflowActionGetState       = "getstate"
 )
 
-func commandMigrate(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandMigrate(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	return commandVRWorkflow(ctx, wr, subFlags, args, wrangler.MigrateWorkflow)
 }
 
@@ -2334,7 +2064,7 @@ func getSourceKeyspace(clusterKeyspace string) (clusterName string, sourceKeyspa
 
 // commandVRWorkflow is the common entry point for MoveTables/Reshard/Migrate workflows
 // FIXME: this function needs a refactor. Also validations for params should to be done per workflow type
-func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string,
+func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string,
 	workflowType wrangler.VReplicationWorkflowType) error {
 
 	const defaultWaitTime = time.Duration(30 * time.Second)
@@ -2344,14 +2074,18 @@ func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 
 	cells := subFlags.String("cells", "", "Cell(s) or CellAlias(es) (comma-separated) to replicate from.")
 	tabletTypes := subFlags.String("tablet_types", "in_order:REPLICA,PRIMARY", "Source tablet types to replicate from (e.g. PRIMARY, REPLICA, RDONLY). Defaults to --vreplication_tablet_type parameter value for the tablet, which has the default value of in_order:REPLICA,PRIMARY. Note: SwitchTraffic overrides this default and uses in_order:RDONLY,REPLICA,PRIMARY to switch all traffic by default.")
-	dryRun := subFlags.Bool("dry_run", false, "Does a dry run of SwitchReads and only reports the actions to be taken. --dry_run is only supported for SwitchTraffic, ReverseTraffic and Complete.")
+	dryRun := subFlags.Bool("dry_run", false, "Does a dry run of SwitchTraffic and only reports the actions to be taken. --dry_run is only supported for SwitchTraffic, ReverseTraffic and Complete.")
 	timeout := subFlags.Duration("timeout", defaultWaitTime, "Specifies the maximum time to wait, in seconds, for vreplication to catch up on primary migrations. The migration will be cancelled on a timeout. --timeout is only supported for SwitchTraffic and ReverseTraffic.")
 	reverseReplication := subFlags.Bool("reverse_replication", true, "Also reverse the replication (default true). --reverse_replication is only supported for SwitchTraffic.")
 	keepData := subFlags.Bool("keep_data", false, "Do not drop tables or shards (if true, only vreplication artifacts are cleaned up).  --keep_data is only supported for Complete and Cancel.")
 	keepRoutingRules := subFlags.Bool("keep_routing_rules", false, "Do not remove the routing rules for the source keyspace.  --keep_routing_rules is only supported for Complete and Cancel.")
 	autoStart := subFlags.Bool("auto_start", true, "If false, streams will start in the Stopped state and will need to be explicitly started")
 	stopAfterCopy := subFlags.Bool("stop_after_copy", false, "Streams will be stopped once the copy phase is completed")
+	dropForeignKeys := subFlags.Bool("drop_foreign_keys", false, "If true, tables in the target keyspace will be created without foreign keys.")
 	maxReplicationLagAllowed := subFlags.Duration("max_replication_lag_allowed", defaultMaxReplicationLagAllowed, "Allow traffic to be switched only if vreplication lag is below this (in seconds)")
+
+	onDDL := "IGNORE"
+	subFlags.StringVar(&onDDL, "on-ddl", onDDL, "What to do when DDL is encountered in the VReplication stream. Possible values are IGNORE, STOP, EXEC, and EXEC_IGNORE.")
 
 	// MoveTables and Migrate params
 	tables := subFlags.String("tables", "", "MoveTables only. A table spec or a list of tables. Either table_specs or --all needs to be specified.")
@@ -2366,13 +2100,15 @@ func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 	// MoveTables-only params
 	renameTables := subFlags.Bool("rename_tables", false, "MoveTables only. Rename tables instead of dropping them. --rename_tables is only supported for Complete.")
 
-	// Reshard params
-	sourceShards := subFlags.String("source_shards", "", "Reshard only. Source shards")
-	targetShards := subFlags.String("target_shards", "", "Reshard only. Target shards")
-	skipSchemaCopy := subFlags.Bool("skip_schema_copy", false, "Reshard only. Skip copying of schema to target shards")
+	// MoveTables and Reshard params
+	sourceShards := subFlags.String("source_shards", "", "Source shards")
+	*sourceShards = strings.TrimSpace(*sourceShards)
+	deferNonPKeys := subFlags.Bool("defer-secondary-keys", false, "Defer secondary index creation for a table until after it has been copied.")
 
-	_ = subFlags.Bool("v1", false, "Enables usage of v1 command structure. (default false). Must be added to run the command with --workflow")
-	_ = subFlags.Bool("v2", true, "")
+	// Reshard params
+	targetShards := subFlags.String("target_shards", "", "Reshard only. Target shards")
+	*targetShards = strings.TrimSpace(*targetShards)
+	skipSchemaCopy := subFlags.Bool("skip_schema_copy", false, "Reshard only. Skip copying of schema to target shards")
 
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -2381,6 +2117,12 @@ func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 	if subFlags.NArg() != 2 {
 		return fmt.Errorf("two arguments are needed: action, keyspace.workflow")
 	}
+
+	onDDL = strings.ToUpper(onDDL)
+	if _, ok := binlogdatapb.OnDDLAction_value[onDDL]; !ok {
+		return fmt.Errorf("invalid value for on-ddl: %v", onDDL)
+	}
+
 	action := subFlags.Arg(0)
 	ksWorkflow := subFlags.Arg(1)
 	target, workflowName, err := splitKeyspaceWorkflow(ksWorkflow)
@@ -2407,22 +2149,35 @@ func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 		if err != nil {
 			return err
 		}
-		s += fmt.Sprintf("Following vreplication streams are running for workflow %s.%s:\n\n", target, workflowName)
-		for ksShard := range res.ShardStatuses {
+		s += fmt.Sprintf("The following vreplication streams exist for workflow %s.%s:\n\n", target, workflowName)
+
+		// Sort the results for consistent and intuitive output.
+		ksShardKeys := make([]string, 0, len(res.ShardStatuses))
+		for ksShardKey := range res.ShardStatuses {
+			ksShardKeys = append(ksShardKeys, ksShardKey)
+		}
+		sort.Strings(ksShardKeys)
+		for _, ksShard := range ksShardKeys {
 			statuses := res.ShardStatuses[ksShard].PrimaryReplicationStatuses
 			for _, st := range statuses {
-				now := time.Now().Nanosecond()
 				msg := ""
-				updateLag := int64(now) - st.TimeUpdated
-				if updateLag > 0*1e9 {
-					msg += " Vstream may not be running."
+				if st.State == "Error" {
+					msg += fmt.Sprintf(": %s.", st.Message)
+				} else if st.Pos == "" {
+					msg += ". VStream has not started."
+				} else {
+					now := time.Now().Nanosecond()
+					updateLag := int64(now) - st.TimeUpdated
+					if updateLag > 0*1e9 {
+						msg += ". VStream may not be running"
+					}
+					txLag := int64(now) - st.TransactionTimestamp
+					msg += fmt.Sprintf(". VStream Lag: %ds.", txLag/1e9)
+					if st.TransactionTimestamp > 0 { // if no events occur after copy phase, TransactionTimeStamp can be 0
+						msg += fmt.Sprintf(" Tx time: %s.", time.Unix(st.TransactionTimestamp, 0).Format(time.ANSIC))
+					}
 				}
-				txLag := int64(now) - st.TransactionTimestamp
-				msg += fmt.Sprintf(" VStream Lag: %ds.", txLag/1e9)
-				if st.TransactionTimestamp > 0 { // if no events occur after copy phase, TransactionTimeStamp can be 0
-					msg += fmt.Sprintf(" Tx time: %s.", time.Unix(st.TransactionTimestamp, 0).Format(time.ANSIC))
-				}
-				s += fmt.Sprintf("id=%d on %s: Status: %s.%s\n", st.ID, ksShard, st.State, msg)
+				s += fmt.Sprintf("id=%d on %s: Status: %s%s\n", st.ID, ksShard, st.State, msg)
 			}
 		}
 		wr.Logger().Printf("\n%s\n", s)
@@ -2439,7 +2194,7 @@ func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 		return err
 	}
 
-	//TODO: check if invalid parameters were passed in that do not apply to this action
+	// TODO: check if invalid parameters were passed in that do not apply to this action
 	originalAction := action
 	action = strings.ToLower(action) // allow users to input action in a case-insensitive manner
 	if workflowType == wrangler.MigrateWorkflow {
@@ -2487,6 +2242,10 @@ func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 			vrwp.Timeout = *timeout
 			vrwp.ExternalCluster = externalClusterName
 			vrwp.SourceTimeZone = *sourceTimeZone
+			vrwp.DropForeignKeys = *dropForeignKeys
+			if *sourceShards != "" {
+				vrwp.SourceShards = strings.Split(*sourceShards, ",")
+			}
 		case wrangler.ReshardWorkflow:
 			if *sourceShards == "" || *targetShards == "" {
 				return fmt.Errorf("source and target shards are not specified")
@@ -2498,11 +2257,13 @@ func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 		default:
 			return fmt.Errorf("unknown workflow type passed: %v", workflowType)
 		}
+		vrwp.OnDDL = onDDL
+		vrwp.DeferSecondaryKeys = *deferNonPKeys
 		vrwp.Cells = *cells
 		vrwp.TabletTypes = *tabletTypes
 	case vReplicationWorkflowActionSwitchTraffic, vReplicationWorkflowActionReverseTraffic:
 		vrwp.Cells = *cells
-		if userPassedFlag(subFlags, "tablet_types") {
+		if subFlags.Changed("tablet_types") {
 			vrwp.TabletTypes = *tabletTypes
 		} else {
 			// When no tablet types are specified we are supposed to switch all traffic so
@@ -2514,6 +2275,7 @@ func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 		vrwp.MaxAllowedTransactionLagSeconds = int64(math.Ceil(maxReplicationLagAllowed.Seconds()))
 	case vReplicationWorkflowActionCancel:
 		vrwp.KeepData = *keepData
+		vrwp.KeepRoutingRules = *keepRoutingRules
 	case vReplicationWorkflowActionComplete:
 		switch workflowType {
 		case wrangler.MoveTablesWorkflow:
@@ -2541,9 +2303,7 @@ func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 		if err != nil {
 			return err
 		}
-		if copyProgress == nil {
-			wr.Logger().Printf("\nCopy Completed.\n")
-		} else {
+		if copyProgress != nil {
 			wr.Logger().Printf("\nCopy Progress (approx):\n")
 			var tables []string
 			for table := range *copyProgress {
@@ -2568,7 +2328,6 @@ func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 			wr.Logger().Printf("\n%s\n", s)
 		}
 		return printDetails()
-
 	}
 
 	if *dryRun {
@@ -2612,7 +2371,6 @@ func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 			for {
 				select {
 				case <-ctx.Done():
-					errCh <- fmt.Errorf("workflow did not start within %s", (*timeout).String())
 					return
 				case <-ticker.C:
 					totalStreams, startedStreams, workflowErrors, err := wf.GetStreamCount()
@@ -2641,9 +2399,13 @@ func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 					return nil
 				}
 				wr.Logger().Printf("%d%% ... ", 100*progress.started/progress.total)
+			case <-timedCtx.Done():
+				wr.Logger().Printf("\nThe workflow did not start within %s. The workflow may simply be slow to start or there may be an issue.\n",
+					(*timeout).String())
+				wr.Logger().Printf("Check the status using the 'Workflow %s show' client command for details.\n", ksWorkflow)
+				return fmt.Errorf("timed out waiting for workflow to start")
 			case err := <-errCh:
 				wr.Logger().Error(err)
-				cancelTimedCtx()
 				return err
 			case wfErrs := <-wfErrCh:
 				wr.Logger().Printf("Found problems with the streams created for this workflow:\n")
@@ -2683,10 +2445,8 @@ func commandVRWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 	return nil
 }
 
-func commandCreateLookupVindex(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandCreateLookupVindex(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	cells := subFlags.String("cells", "", "Source cells to replicate from.")
-	//TODO: keep --cell around for backward compatibility and remove it in a future version
-	cell := subFlags.String("cell", "", "Cell to replicate from.")
 	tabletTypes := subFlags.String("tablet_types", "", "Source tablet types to replicate from.")
 	continueAfterCopyWithOwner := subFlags.Bool("continue_after_copy_with_owner", false, "Vindex will continue materialization after copy when an owner is provided")
 	if err := subFlags.Parse(args); err != nil {
@@ -2694,9 +2454,6 @@ func commandCreateLookupVindex(ctx context.Context, wr *wrangler.Wrangler, subFl
 	}
 	if subFlags.NArg() != 2 {
 		return fmt.Errorf("two arguments are required: keyspace and json_spec")
-	}
-	if *cells == "" && *cell != "" {
-		*cells = *cell
 	}
 	keyspace := subFlags.Arg(0)
 	specs := &vschemapb.Keyspace{}
@@ -2706,7 +2463,7 @@ func commandCreateLookupVindex(ctx context.Context, wr *wrangler.Wrangler, subFl
 	return wr.CreateLookupVindex(ctx, keyspace, specs, *cells, *tabletTypes, *continueAfterCopyWithOwner)
 }
 
-func commandExternalizeVindex(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandExternalizeVindex(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -2716,7 +2473,7 @@ func commandExternalizeVindex(ctx context.Context, wr *wrangler.Wrangler, subFla
 	return wr.ExternalizeVindex(ctx, subFlags.Arg(0))
 }
 
-func commandMaterialize(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandMaterialize(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	cells := subFlags.String("cells", "", "Source cells to replicate from.")
 	tabletTypes := subFlags.String("tablet_types", "", "Source tablet types to replicate from.")
 	if err := subFlags.Parse(args); err != nil {
@@ -2734,49 +2491,20 @@ func commandMaterialize(ctx context.Context, wr *wrangler.Wrangler, subFlags *fl
 	return wr.Materialize(ctx, ms)
 }
 
-func commandSplitClone(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	wr.Logger().Printf("*** This is a legacy sharding command that will soon be removed! Please use VReplication instead: https://vitess.io/docs/reference/vreplication/ ***\n")
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-	if subFlags.NArg() != 3 {
-		return fmt.Errorf("three arguments are required: keyspace, from_shards, to_shards")
-	}
-	keyspace := subFlags.Arg(0)
-	from := strings.Split(subFlags.Arg(1), ",")
-	to := strings.Split(subFlags.Arg(2), ",")
-	return wr.SplitClone(ctx, keyspace, from, to)
-}
-
-func commandVerticalSplitClone(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	wr.Logger().Printf("*** This is a legacy sharding command that will soon be removed! Please use VReplication instead: https://vitess.io/docs/reference/vreplication/ ***\n")
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-	if subFlags.NArg() != 3 {
-		return fmt.Errorf("three arguments are required: from_keyspace, to_keyspace, tables")
-	}
-	fromKeyspace := subFlags.Arg(0)
-	toKeyspace := subFlags.Arg(1)
-	tables := strings.Split(subFlags.Arg(2), ",")
-	return wr.VerticalSplitClone(ctx, fromKeyspace, toKeyspace, tables)
-}
-
-func useVDiffV2(args []string) bool {
+func useVDiffV1(args []string) bool {
 	for _, arg := range args {
-		if arg == "-v2" || arg == "--v2" {
+		if arg == "-v1" || arg == "--v1" {
 			return true
 		}
 	}
 	return false
 }
 
-func commandVDiff(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	if useVDiffV2(args) {
-		log.Infof("*** Using (experimental) VDiff2 ***")
+func commandVDiff(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
+	if !useVDiffV1(args) {
 		return commandVDiff2(ctx, wr, subFlags, args)
 	}
-	_ = subFlags.Bool("v2", false, "Use VDiff2")
+	_ = subFlags.Bool("v1", false, "Use legacy VDiff v1")
 
 	sourceCell := subFlags.String("source_cell", "", "The source cell to compare from; default is any available cell")
 	targetCell := subFlags.String("target_cell", "", "The target cell to compare with; default is any available cell")
@@ -2785,7 +2513,7 @@ func commandVDiff(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.Fla
 	maxRows := subFlags.Int64("limit", math.MaxInt64, "Max rows to stop comparing after")
 	debugQuery := subFlags.Bool("debug_query", false, "Adds a mysql query to the report that can be used for further debugging")
 	onlyPks := subFlags.Bool("only_pks", false, "When reporting missing rows, only show primary keys in the report.")
-	format := subFlags.String("format", "", "Format of report") //"json" or ""
+	format := subFlags.String("format", "", "Format of report") // "json" or ""
 	tables := subFlags.String("tables", "", "Only run vdiff for these tables in the workflow")
 	maxExtraRowsToCompare := subFlags.Int("max_extra_rows_to_compare", 1000, "If there are collation differences between the source and target, you can have rows that are identical but simply returned in a different order from MySQL. We will do a second pass to compare the rows for any actual differences in this case and this flag allows you to control the resources used for this operation.")
 	if err := subFlags.Parse(args); err != nil {
@@ -2829,222 +2557,7 @@ func splitKeyspaceWorkflow(in string) (keyspace, workflow string, err error) {
 	return splits[0], splits[1], nil
 }
 
-func commandMigrateServedTypes(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	wr.Logger().Printf("*** This is a legacy sharding command that will soon be removed! Please use VReplication instead: https://vitess.io/docs/reference/vreplication/ ***\n")
-	cellsStr := subFlags.String("cells", "", "Specifies a comma-separated list of cells to update")
-	reverse := subFlags.Bool("reverse", false, "Moves the served tablet type backward instead of forward.")
-	skipReFreshState := subFlags.Bool("skip-refresh-state", false, "Skips refreshing the state of the source tablets after the migration, meaning that the refresh will need to be done manually, REPLICA and RDONLY only)")
-	filteredReplicationWaitTime := subFlags.Duration("filtered_replication_wait_time", 30*time.Second, "Specifies the maximum time to wait, in seconds, for filtered replication to catch up on primary migrations. The migration will be cancelled on a timeout.")
-	reverseReplication := subFlags.Bool("reverse_replication", false, "For primary migration, enabling this flag reverses replication which allows you to rollback")
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-	if subFlags.NArg() != 2 {
-		return fmt.Errorf("the <source keyspace/shard> and <served tablet type> arguments are both required for the MigrateServedTypes command")
-	}
-
-	keyspace, shard, err := topoproto.ParseKeyspaceShard(subFlags.Arg(0))
-	if err != nil {
-		return err
-	}
-	servedType, err := topo.ParseServingTabletType(subFlags.Arg(1))
-	if err != nil {
-		return err
-	}
-	if servedType == topodatapb.TabletType_PRIMARY && *skipReFreshState {
-		return fmt.Errorf("the skip-refresh-state flag can only be specified for non-primary migrations")
-	}
-	var cells []string
-	if *cellsStr != "" {
-		cells = strings.Split(*cellsStr, ",")
-	}
-	return wr.MigrateServedTypes(ctx, keyspace, shard, cells, servedType, *reverse, *skipReFreshState, *filteredReplicationWaitTime, *reverseReplication)
-}
-
-func commandMigrateServedFrom(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	wr.Logger().Printf("*** This is a legacy sharding command that will soon be removed! Please use VReplication instead: https://vitess.io/docs/reference/vreplication/ ***\n")
-	reverse := subFlags.Bool("reverse", false, "Moves the served tablet type backward instead of forward.")
-	cellsStr := subFlags.String("cells", "", "Specifies a comma-separated list of cells to update")
-	filteredReplicationWaitTime := subFlags.Duration("filtered_replication_wait_time", 30*time.Second, "Specifies the maximum time to wait, in seconds, for filtered replication to catch up on primary migrations. The migration will be cancelled on a timeout.")
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-	if subFlags.NArg() != 2 {
-		return fmt.Errorf("the <destination keyspace/shard> and <served tablet type> arguments are both required for the MigrateServedFrom command")
-	}
-
-	keyspace, shard, err := topoproto.ParseKeyspaceShard(subFlags.Arg(0))
-	if err != nil {
-		return err
-	}
-	servedType, err := parseTabletType(subFlags.Arg(1), []topodatapb.TabletType{topodatapb.TabletType_PRIMARY, topodatapb.TabletType_REPLICA, topodatapb.TabletType_RDONLY})
-	if err != nil {
-		return err
-	}
-	var cells []string
-	if *cellsStr != "" {
-		cells = strings.Split(*cellsStr, ",")
-	}
-	return wr.MigrateServedFrom(ctx, keyspace, shard, servedType, cells, *reverse, *filteredReplicationWaitTime)
-}
-
-func commandDropSources(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	wr.Logger().Printf("*** DropSources is deprecated. Consider using v2 commands instead, see https://vitess.io/docs/reference/vreplication/v2/ ***\n")
-	dryRun := subFlags.Bool("dry_run", false, "Does a dry run of commandDropSources and only reports the actions to be taken")
-	renameTables := subFlags.Bool("rename_tables", false, "Rename tables instead of dropping them")
-	keepData := subFlags.Bool("keep_data", false, "Do not drop tables or shards (if true, only vreplication artifacts are cleaned up)")
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-	if subFlags.NArg() != 1 {
-		return fmt.Errorf("<keyspace.workflow> is required")
-	}
-	keyspace, workflowName, err := splitKeyspaceWorkflow(subFlags.Arg(0))
-	if err != nil {
-		return err
-	}
-
-	removalType := workflow.DropTable
-	if *renameTables {
-		removalType = workflow.RenameTable
-	}
-
-	_, _, _ = dryRun, keyspace, workflowName
-	dryRunResults, err := wr.DropSources(ctx, keyspace, workflowName, removalType, *keepData, false, false, *dryRun)
-	if err != nil {
-		return err
-	}
-	if *dryRun {
-		wr.Logger().Printf("Dry Run results for commandDropSources run at %s\nParameters: %s\n\n", time.Now().Format(time.RFC822), strings.Join(args, " "))
-		wr.Logger().Printf("%s\n", strings.Join(*dryRunResults, "\n"))
-	}
-	return nil
-}
-
-func commandSwitchReads(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	wr.Logger().Printf("*** SwitchReads is deprecated. Consider using v2 commands instead, see https://vitess.io/docs/reference/vreplication/v2/ ***\n")
-
-	reverse := subFlags.Bool("reverse", false, "Moves the served tablet type backward instead of forward.")
-	cellsStr := subFlags.String("cells", "", "Specifies a comma-separated list of cells to update")
-	tabletTypes := subFlags.String("tablet_types", "rdonly,replica", "Tablet types to switch one or both or rdonly/replica")
-	deprecatedTabletType := subFlags.String("tablet_type", "", "(DEPRECATED) one of rdonly/replica")
-	dryRun := subFlags.Bool("dry_run", false, "Does a dry run of SwitchReads and only reports the actions to be taken")
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-
-	if !(*deprecatedTabletType == "" || *deprecatedTabletType == "replica" || *deprecatedTabletType == "rdonly") {
-		return fmt.Errorf("invalid value specified for --tablet_type: %s", *deprecatedTabletType)
-	}
-
-	if *deprecatedTabletType != "" {
-		*tabletTypes = *deprecatedTabletType
-	}
-
-	tabletTypesArr := strings.Split(*tabletTypes, ",")
-	var servedTypes []topodatapb.TabletType
-	for _, tabletType := range tabletTypesArr {
-		servedType, err := parseTabletType(tabletType, []topodatapb.TabletType{topodatapb.TabletType_REPLICA, topodatapb.TabletType_RDONLY})
-		if err != nil {
-			return err
-		}
-		servedTypes = append(servedTypes, servedType)
-	}
-	var cells []string
-	if *cellsStr != "" {
-		cells = strings.Split(*cellsStr, ",")
-	}
-	direction := workflow.DirectionForward
-	if *reverse {
-		direction = workflow.DirectionBackward
-	}
-	if subFlags.NArg() != 1 {
-		return fmt.Errorf("<keyspace.workflow> is required")
-	}
-	keyspace, workflowName, err := splitKeyspaceWorkflow(subFlags.Arg(0))
-	if err != nil {
-		return err
-	}
-	dryRunResults, err := wr.SwitchReads(ctx, keyspace, workflowName, servedTypes, cells, direction, *dryRun)
-	if err != nil {
-		return err
-	}
-	if *dryRun {
-		wr.Logger().Printf("Dry Run results for SwitchReads run at %s\nParameters: %s\n\n", time.Now().Format(time.RFC822), strings.Join(args, " "))
-		wr.Logger().Printf("%s\n", strings.Join(*dryRunResults, "\n"))
-	}
-	return nil
-}
-
-func commandSwitchWrites(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	wr.Logger().Printf("*** SwitchWrites is deprecated. Consider using v2 commands instead, see https://vitess.io/docs/reference/vreplication/v2/ ***\n")
-
-	timeout := subFlags.Duration("timeout", 30*time.Second, "Specifies the maximum time to wait, in seconds, for vreplication to catch up on primary migrations. The migration will be cancelled on a timeout.")
-	filteredReplicationWaitTime := subFlags.Duration("filtered_replication_wait_time", 30*time.Second, "DEPRECATED Specifies the maximum time to wait, in seconds, for vreplication to catch up on primary migrations. The migration will be cancelled on a timeout.")
-	reverseReplication := subFlags.Bool("reverse_replication", true, "Also reverse the replication")
-	cancel := subFlags.Bool("cancel", false, "Cancel the failed migration and serve from source")
-	reverse := subFlags.Bool("reverse", false, "Reverse a previous SwitchWrites serve from source")
-	dryRun := subFlags.Bool("dry_run", false, "Does a dry run of SwitchWrites and only reports the actions to be taken")
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-
-	if subFlags.NArg() != 1 {
-		return fmt.Errorf("<keyspace.workflow> is required")
-	}
-	keyspace, workflow, err := splitKeyspaceWorkflow(subFlags.Arg(0))
-	if err != nil {
-		return err
-	}
-	if filteredReplicationWaitTime != timeout {
-		timeout = filteredReplicationWaitTime
-	}
-
-	journalID, dryRunResults, err := wr.SwitchWrites(ctx, keyspace, workflow, *timeout, *cancel, *reverse, *reverseReplication, *dryRun)
-	if err != nil {
-		return err
-	}
-	if *dryRun {
-		wr.Logger().Printf("Dry Run results for SwitchWrites run at %s\nParameters: %s\n\n", time.Now().Format(time.RFC822), strings.Join(args, " "))
-		wr.Logger().Printf("%s\n", strings.Join(*dryRunResults, "\n"))
-	} else {
-		wr.Logger().Infof("Migration Journal ID: %v", journalID)
-	}
-
-	return nil
-}
-
-func commandCancelResharding(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-	if subFlags.NArg() != 1 {
-		return fmt.Errorf("<keyspace/shard> required for CancelResharding command")
-	}
-
-	keyspace, shard, err := topoproto.ParseKeyspaceShard(subFlags.Arg(0))
-	if err != nil {
-		return err
-	}
-	return wr.CancelResharding(ctx, keyspace, shard)
-}
-
-func commandShowResharding(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-	if subFlags.NArg() != 1 {
-		return fmt.Errorf("<keyspace/shard> required for ShowResharding command")
-	}
-
-	keyspace, shard, err := topoproto.ParseKeyspaceShard(subFlags.Arg(0))
-	if err != nil {
-		return err
-	}
-	return wr.ShowResharding(ctx, keyspace, shard)
-}
-
-func commandFindAllShardsInKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandFindAllShardsInKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3070,7 +2583,7 @@ func commandFindAllShardsInKeyspace(ctx context.Context, wr *wrangler.Wrangler, 
 	return printJSON(wr.Logger(), legacyShardMap)
 }
 
-func commandValidate(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandValidate(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	pingTablets := subFlags.Bool("ping-tablets", false, "Indicates whether all tablets should be pinged during the validation process")
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -3082,7 +2595,7 @@ func commandValidate(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.
 	return wr.Validate(ctx, *pingTablets)
 }
 
-func commandListAllTablets(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandListAllTablets(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	keyspaceFilter := subFlags.String("keyspace", "", "Keyspace to filter on")
 	tabletTypeStr := subFlags.String("tablet_type", "", "Tablet type to filter on")
 	var err error
@@ -3119,7 +2632,7 @@ func commandListAllTablets(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 	return nil
 }
 
-func commandListTablets(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandListTablets(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3152,12 +2665,14 @@ func commandListTablets(ctx context.Context, wr *wrangler.Wrangler, subFlags *fl
 	return nil
 }
 
-func commandGetSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandGetSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	tables := subFlags.String("tables", "", "Specifies a comma-separated list of tables for which we should gather information. Each is either an exact match, or a regular expression of the form /regexp/")
 	excludeTables := subFlags.String("exclude_tables", "", "Specifies a comma-separated list of tables to exclude. Each is either an exact match, or a regular expression of the form /regexp/")
 	includeViews := subFlags.Bool("include-views", false, "Includes views in the output")
+	// skipFields := subFlags.Bool("skip-fields", false, "Skip fields introspection")
 	tableNamesOnly := subFlags.Bool("table_names_only", false, "Only displays table names that match")
 	tableSizesOnly := subFlags.Bool("table_sizes_only", false, "Only displays size information for tables. Ignored if --table_names_only is passed.")
+	tableSchemaOnly := subFlags.Bool("table_schema_only", false, "Only displays table schema. Skip columns and fields.")
 
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -3179,12 +2694,13 @@ func commandGetSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag
 	}
 
 	resp, err := wr.VtctldServer().GetSchema(ctx, &vtctldatapb.GetSchemaRequest{
-		TabletAlias:    tabletAlias,
-		Tables:         tableArray,
-		ExcludeTables:  excludeTableArray,
-		IncludeViews:   *includeViews,
-		TableNamesOnly: *tableNamesOnly,
-		TableSizesOnly: *tableSizesOnly,
+		TabletAlias:     tabletAlias,
+		Tables:          tableArray,
+		ExcludeTables:   excludeTableArray,
+		IncludeViews:    *includeViews,
+		TableNamesOnly:  *tableNamesOnly,
+		TableSizesOnly:  *tableSizesOnly,
+		TableSchemaOnly: *tableSchemaOnly,
 	})
 	if err != nil {
 		return err
@@ -3200,7 +2716,7 @@ func commandGetSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag
 	return printJSON(wr.Logger(), resp.Schema)
 }
 
-func commandReloadSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandReloadSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3217,7 +2733,7 @@ func commandReloadSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *f
 	return err
 }
 
-func commandReloadSchemaShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandReloadSchemaShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	concurrency := subFlags.Int("concurrency", 10, "How many tablets to reload in parallel")
 	includePrimary := subFlags.Bool("include_primary", true, "Include the primary tablet")
 
@@ -3246,7 +2762,7 @@ func commandReloadSchemaShard(ctx context.Context, wr *wrangler.Wrangler, subFla
 	return err
 }
 
-func commandReloadSchemaKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandReloadSchemaKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	concurrency := subFlags.Int("concurrency", 10, "How many tablets to reload in parallel")
 	includePrimary := subFlags.Bool("include_primary", true, "Include the primary tablet(s)")
 
@@ -3270,7 +2786,7 @@ func commandReloadSchemaKeyspace(ctx context.Context, wr *wrangler.Wrangler, sub
 	return err
 }
 
-func commandValidateSchemaShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandValidateSchemaShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	excludeTables := subFlags.String("exclude_tables", "", "Specifies a comma-separated list of tables to exclude. Each is either an exact match, or a regular expression of the form /regexp/")
 	includeViews := subFlags.Bool("include-views", false, "Includes views in the validation")
 	includeVSchema := subFlags.Bool("include-vschema", false, "Validate schemas against the vschema")
@@ -3292,7 +2808,7 @@ func commandValidateSchemaShard(ctx context.Context, wr *wrangler.Wrangler, subF
 	return wr.ValidateSchemaShard(ctx, keyspace, shard, excludeTableArray, *includeViews, *includeVSchema)
 }
 
-func commandValidateSchemaKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandValidateSchemaKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	excludeTables := subFlags.String("exclude_tables", "", "Specifies a comma-separated list of tables to exclude. Each is either an exact match, or a regular expression of the form /regexp/")
 	includeViews := subFlags.Bool("include-views", false, "Includes views in the validation")
 	skipNoPrimary := subFlags.Bool("skip-no-primary", true, "Skip shards that don't have primary when performing validation")
@@ -3334,7 +2850,7 @@ func commandValidateSchemaKeyspace(ctx context.Context, wr *wrangler.Wrangler, s
 	return nil
 }
 
-func commandApplySchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandApplySchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	allowLongUnavailability := subFlags.Bool("allow_long_unavailability", false, "Allow large schema changes which incur a longer unavailability of the database.")
 	sql := subFlags.String("sql", "", "A list of semicolon-delimited SQL commands")
 	sqlFile := subFlags.String("sql-file", "", "Identifies the file that contains the SQL commands")
@@ -3343,7 +2859,7 @@ func commandApplySchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *fl
 	migrationContext := subFlags.String("migration_context", "", "For Online DDL, optionally supply a custom unique string used as context for the migration(s) in this command. By default a unique context is auto-generated by Vitess")
 	requestContext := subFlags.String("request_context", "", "synonym for --migration_context")
 	waitReplicasTimeout := subFlags.Duration("wait_replicas_timeout", wrangler.DefaultWaitReplicasTimeout, "The amount of time to wait for replicas to receive the schema change via replication.")
-	skipPreflight := subFlags.Bool("skip_preflight", false, "Skip pre-apply schema checks, and directly forward schema change query to shards")
+	skipPreflight := subFlags.Bool("skip_preflight", false, "Deprecated. Always assumed to be 'true'")
 
 	callerID := subFlags.String("caller_id", "", "This is the effective caller ID used for the operation and should map to an ACL name which grants this identity the necessary permissions to perform the operation (this is only necessary when strict table ACLs are used)")
 	if err := subFlags.Parse(args); err != nil {
@@ -3352,11 +2868,8 @@ func commandApplySchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *fl
 	if subFlags.NArg() != 1 {
 		return fmt.Errorf("the <keyspace> argument is required for the commandApplySchema command")
 	}
-
-	// v14 deprecates `--skip-topo` flag. This check will be removed in v15
-	if settings, _ := schema.ParseDDLStrategy(*ddlStrategy); settings != nil && settings.IsSkipTopoFlag() {
-		deprecationMessage := `--skip-topo flag is deprecated and will be removed in v15`
-		log.Warningf(deprecationMessage)
+	if *skipPreflight {
+		log.Warningf("--skip_preflight flag is deprecated. Always assumed to be 'true'")
 	}
 
 	keyspace := subFlags.Arg(0)
@@ -3389,7 +2902,7 @@ func commandApplySchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *fl
 		AllowLongUnavailability: *allowLongUnavailability,
 		DdlStrategy:             *ddlStrategy,
 		Sql:                     parts,
-		SkipPreflight:           *skipPreflight,
+		SkipPreflight:           true,
 		UuidList:                textutil.SplitDelimitedList(*uuidList),
 		MigrationContext:        *migrationContext,
 		WaitReplicasTimeout:     protoutil.DurationToProto(*waitReplicasTimeout),
@@ -3408,8 +2921,11 @@ func commandApplySchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *fl
 	return nil
 }
 
-func commandOnlineDDL(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandOnlineDDL(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	json := subFlags.Bool("json", false, "Output JSON instead of human-readable table")
+	orderBy := subFlags.String("order", "ascending", "Sort the results by `id` property of the Schema migration (default is ascending. Allowed values are `ascending` or `descending`.")
+	limit := subFlags.Int64("limit", 0, "Limit number of rows returned in output")
+	skip := subFlags.Int64("skip", 0, "Skip specified number of rows returned in output")
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3425,8 +2941,9 @@ func commandOnlineDDL(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag
 	if subFlags.NArg() >= 3 {
 		arg = subFlags.Args()[2]
 	}
-	query := ""
-	uuid := ""
+
+	applySchemaQuery := ""
+	executeFetchQuery := ""
 	var bindErr error
 	switch command {
 	case "show":
@@ -3446,38 +2963,47 @@ func commandOnlineDDL(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag
 			condition, bindErr = sqlparser.ParseAndBind("migration_status=%a", sqltypes.StringBindVariable(arg))
 		default:
 			if schema.IsOnlineDDLUUID(arg) {
-				uuid = arg
 				condition, bindErr = sqlparser.ParseAndBind("migration_uuid=%a", sqltypes.StringBindVariable(arg))
 			} else {
 				condition, bindErr = sqlparser.ParseAndBind("migration_context=%a", sqltypes.StringBindVariable(arg))
 			}
 		}
-		query = fmt.Sprintf(`select
+		order := " order by `id` "
+		switch *orderBy {
+		case "desc", "descending":
+			order = order + "DESC"
+		default:
+			order = order + "ASC"
+		}
+
+		skipLimit := ""
+		if *limit > 0 {
+			skipLimit = fmt.Sprintf("LIMIT %v,%v", *skip, *limit)
+		}
+
+		executeFetchQuery = fmt.Sprintf(`select
 				*
-				from _vt.schema_migrations where %s`, condition)
+				from _vt.schema_migrations where %s %s %s`, condition, order, skipLimit)
 	case "retry":
 		if arg == "" {
 			return fmt.Errorf("UUID required")
 		}
-		uuid = arg
-		query, bindErr = sqlparser.ParseAndBind(`update _vt.schema_migrations set migration_status='retry' where migration_uuid=%a`, sqltypes.StringBindVariable(arg))
+		applySchemaQuery, bindErr = sqlparser.ParseAndBind(`alter vitess_migration %a retry`, sqltypes.StringBindVariable(arg))
 	case "complete":
 		if arg == "" {
 			return fmt.Errorf("UUID required")
 		}
-		uuid = arg
-		query, bindErr = sqlparser.ParseAndBind(`update _vt.schema_migrations set migration_status='complete' where migration_uuid=%a`, sqltypes.StringBindVariable(arg))
+		applySchemaQuery, bindErr = sqlparser.ParseAndBind(`alter vitess_migration %a complete`, sqltypes.StringBindVariable(arg))
 	case "cancel":
 		if arg == "" {
 			return fmt.Errorf("UUID required")
 		}
-		uuid = arg
-		query, bindErr = sqlparser.ParseAndBind(`update _vt.schema_migrations set migration_status='cancel' where migration_uuid=%a`, sqltypes.StringBindVariable(arg))
+		applySchemaQuery, bindErr = sqlparser.ParseAndBind(`alter vitess_migration %a cancel`, sqltypes.StringBindVariable(arg))
 	case "cancel-all":
 		if arg != "" {
 			return fmt.Errorf("UUID not allowed in %s", command)
 		}
-		query = `update _vt.schema_migrations set migration_status='cancel-all'`
+		applySchemaQuery = `alter vitess_migration cancel all`
 	default:
 		return fmt.Errorf("Unknown OnlineDDL command: %s", command)
 	}
@@ -3485,18 +3011,53 @@ func commandOnlineDDL(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag
 		return fmt.Errorf("Error generating OnlineDDL query: %+v", bindErr)
 	}
 
-	qr, err := wr.VExecResult(ctx, uuid, keyspace, query, false)
-	if err != nil {
-		return err
+	if applySchemaQuery != "" {
+		log.Info("Calling ApplySchema on VtctldServer")
+
+		resp, err := wr.VtctldServer().ApplySchema(ctx, &vtctldatapb.ApplySchemaRequest{
+			Keyspace:            keyspace,
+			Sql:                 []string{applySchemaQuery},
+			SkipPreflight:       true,
+			WaitReplicasTimeout: protoutil.DurationToProto(wrangler.DefaultWaitReplicasTimeout),
+		})
+		if err != nil {
+			return err
+		}
+		loggerWriter{wr.Logger()}.Printf("resp: %v\n", resp)
+	} else {
+		// This is a SELECT. We run this on all PRIMARY tablets of this keyspace, and return the combined result
+		resp, err := wr.VtctldServer().GetTablets(ctx, &vtctldatapb.GetTabletsRequest{
+			Cells:      nil,
+			Strict:     false,
+			Keyspace:   keyspace,
+			TabletType: topodatapb.TabletType_PRIMARY,
+		})
+		if err != nil {
+			return err
+		}
+
+		tabletResults := map[string]*sqltypes.Result{}
+		for _, tablet := range resp.Tablets {
+			tabletAlias := topoproto.TabletAliasString(tablet.Alias)
+
+			qrproto, err := wr.ExecuteFetchAsDba(ctx, tablet.Alias, executeFetchQuery, 10000, false, false)
+			if err != nil {
+				return err
+			}
+			tabletResults[tabletAlias] = sqltypes.Proto3ToResult(qrproto)
+		}
+		// combine results. This loses sorting if there's more then 1 tablet
+		combinedResults := queryResultForTabletResults(tabletResults)
+		if *json {
+			printJSON(wr.Logger(), combinedResults)
+		} else {
+			printQueryResult(loggerWriter{wr.Logger()}, combinedResults)
+		}
 	}
-	if *json {
-		return printJSON(wr.Logger(), qr)
-	}
-	printQueryResult(loggerWriter{wr.Logger()}, qr)
 	return nil
 }
 
-func commandCopySchemaShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandCopySchemaShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	tables := subFlags.String("tables", "", "Specifies a comma-separated list of tables to copy. Each is either an exact match, or a regular expression of the form /regexp/")
 	excludeTables := subFlags.String("exclude_tables", "", "Specifies a comma-separated list of tables to exclude. Each is either an exact match, or a regular expression of the form /regexp/")
 	includeViews := subFlags.Bool("include-views", true, "Includes views in the output")
@@ -3534,7 +3095,7 @@ func commandCopySchemaShard(ctx context.Context, wr *wrangler.Wrangler, subFlags
 	return err
 }
 
-func commandValidateVersionShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandValidateVersionShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3549,7 +3110,7 @@ func commandValidateVersionShard(ctx context.Context, wr *wrangler.Wrangler, sub
 	return wr.ValidateVersionShard(ctx, keyspace, shard)
 }
 
-func commandValidateVersionKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandValidateVersionKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3575,7 +3136,7 @@ func commandValidateVersionKeyspace(ctx context.Context, wr *wrangler.Wrangler, 
 	return nil
 }
 
-func commandGetPermissions(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandGetPermissions(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3600,7 +3161,7 @@ func commandGetPermissions(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 	return nil
 }
 
-func commandValidatePermissionsShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandValidatePermissionsShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3615,7 +3176,7 @@ func commandValidatePermissionsShard(ctx context.Context, wr *wrangler.Wrangler,
 	return wr.ValidatePermissionsShard(ctx, keyspace, shard)
 }
 
-func commandValidatePermissionsKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandValidatePermissionsKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3627,7 +3188,7 @@ func commandValidatePermissionsKeyspace(ctx context.Context, wr *wrangler.Wrangl
 	return wr.ValidatePermissionsKeyspace(ctx, keyspace)
 }
 
-func commandGetVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandGetVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3648,7 +3209,7 @@ func commandGetVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *fla
 	return nil
 }
 
-func commandGetRoutingRules(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandGetRoutingRules(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3667,9 +3228,9 @@ func commandGetRoutingRules(ctx context.Context, wr *wrangler.Wrangler, subFlags
 	return nil
 }
 
-func commandRebuildVSchemaGraph(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	var cells flagutil.StringListValue
-	subFlags.Var(&cells, "cells", "Specifies a comma-separated list of cells to look for tablets")
+func commandRebuildVSchemaGraph(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
+	var cells []string
+	subFlags.StringSliceVar(&cells, "cells", cells, "Specifies a comma-separated list of cells to look for tablets")
 
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -3684,15 +3245,15 @@ func commandRebuildVSchemaGraph(ctx context.Context, wr *wrangler.Wrangler, subF
 	return err
 }
 
-func commandApplyVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandApplyVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	vschema := subFlags.String("vschema", "", "Identifies the VTGate routing schema")
 	vschemaFile := subFlags.String("vschema_file", "", "Identifies the VTGate routing schema file")
 	sql := subFlags.String("sql", "", "A vschema ddl SQL statement (e.g. `add vindex`, `alter table t add vindex hash(id)`, etc)")
 	sqlFile := subFlags.String("sql_file", "", "A vschema ddl SQL statement (e.g. `add vindex`, `alter table t add vindex hash(id)`, etc)")
 	dryRun := subFlags.Bool("dry-run", false, "If set, do not save the altered vschema, simply echo to console.")
 	skipRebuild := subFlags.Bool("skip_rebuild", false, "If set, do not rebuild the SrvSchema objects.")
-	var cells flagutil.StringListValue
-	subFlags.Var(&cells, "cells", "If specified, limits the rebuild to the cells, after upload. Ignored if --skip_rebuild is set.")
+	var cells []string
+	subFlags.StringSliceVar(&cells, "cells", cells, "If specified, limits the rebuild to the cells, after upload. Ignored if --skip_rebuild is set.")
 
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -3775,6 +3336,27 @@ func commandApplyVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *f
 		wr.Logger().Printf("New VSchema object:\n%s\nIf this is not what you expected, check the input data (as JSON parsing will skip unexpected fields).\n", b)
 	}
 
+	// Validate the VSchema.
+	ksVs, err := vindexes.BuildKeyspace(vs)
+	if err != nil {
+		return err
+	}
+
+	// Log unknown Vindex params as warnings.
+	var vdxNames []string
+	for name := range ksVs.Vindexes {
+		vdxNames = append(vdxNames, name)
+	}
+	sort.Strings(vdxNames)
+	for _, name := range vdxNames {
+		vdx := ksVs.Vindexes[name]
+		if val, ok := vdx.(vindexes.ParamValidating); ok {
+			for _, param := range val.UnknownParams() {
+				wr.Logger().Warningf("Unknown param in vindex %s: %s", name, param)
+			}
+		}
+	}
+
 	if *dryRun {
 		wr.Logger().Printf("Dry run: Skipping update of VSchema\n")
 		return nil
@@ -3798,13 +3380,13 @@ func commandApplyVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *f
 	return wr.TopoServer().RebuildSrvVSchema(ctx, cells)
 }
 
-func commandApplyRoutingRules(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandApplyRoutingRules(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	routingRules := subFlags.String("rules", "", "Specify rules as a string")
 	routingRulesFile := subFlags.String("rules_file", "", "Specify rules in a file")
 	skipRebuild := subFlags.Bool("skip_rebuild", false, "If set, do no rebuild the SrvSchema objects.")
 	dryRun := subFlags.Bool("dry-run", false, "Do not upload the routing rules, but print what actions would be taken")
-	var cells flagutil.StringListValue
-	subFlags.Var(&cells, "cells", "If specified, limits the rebuild to the cells, after upload. Ignored if skipRebuild is set.")
+	var cells []string
+	subFlags.StringSliceVar(&cells, "cells", cells, "If specified, limits the rebuild to the cells, after upload. Ignored if skipRebuild is set.")
 
 	if err := subFlags.Parse(args); err != nil {
 		return err
@@ -3874,7 +3456,7 @@ func commandApplyRoutingRules(ctx context.Context, wr *wrangler.Wrangler, subFla
 	return nil
 }
 
-func commandGetSrvKeyspaceNames(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandGetSrvKeyspaceNames(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3903,7 +3485,7 @@ func commandGetSrvKeyspaceNames(ctx context.Context, wr *wrangler.Wrangler, subF
 	return nil
 }
 
-func commandGetSrvKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandGetSrvKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3929,7 +3511,44 @@ func commandGetSrvKeyspace(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 	return printJSON(wr.Logger(), cellKs)
 }
 
-func commandGetSrvVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandUpdateThrottlerConfig(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) (err error) {
+	enable := subFlags.Bool("enable", false, "Enable the throttler")
+	disable := subFlags.Bool("disable", false, "Disable the throttler")
+	threshold := subFlags.Float64("threshold", 0, "threshold for the either default check (replication lag seconds) or custom check")
+	customQuery := subFlags.String("custom-query", "", "custom throttler check query")
+	checkAsCheckSelf := subFlags.Bool("check-as-check-self", false, "/throttler/check requests behave as is /throttler/check-self was called")
+	checkAsCheckShard := subFlags.Bool("check-as-check-shard", false, "use standard behavior for /throttler/check requests")
+
+	if err := subFlags.Parse(args); err != nil {
+		return err
+	}
+	customQuerySet := subFlags.Changed("custom-query")
+	if subFlags.NArg() != 1 {
+		return fmt.Errorf("the <keyspace> arguments are required for the SetThrottlerConfig command")
+	}
+	if *enable && *disable {
+		return fmt.Errorf("--enable and --disable are mutually exclusive")
+	}
+	if *checkAsCheckSelf && *checkAsCheckShard {
+		return fmt.Errorf("--check-as-check-self and --check-as-check-shard are mutually exclusive")
+	}
+
+	keyspace := subFlags.Arg(0)
+
+	_, err = wr.VtctldServer().UpdateThrottlerConfig(ctx, &vtctldatapb.UpdateThrottlerConfigRequest{
+		Keyspace:          keyspace,
+		Enable:            *enable,
+		Disable:           *disable,
+		CustomQuery:       *customQuery,
+		CustomQuerySet:    customQuerySet,
+		Threshold:         *threshold,
+		CheckAsCheckSelf:  *checkAsCheckSelf,
+		CheckAsCheckShard: *checkAsCheckShard,
+	})
+	return err
+}
+
+func commandGetSrvVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3944,7 +3563,7 @@ func commandGetSrvVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *
 	return printJSON(wr.Logger(), srvVSchema)
 }
 
-func commandDeleteSrvVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandDeleteSrvVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3958,7 +3577,7 @@ func commandDeleteSrvVSchema(ctx context.Context, wr *wrangler.Wrangler, subFlag
 	return err
 }
 
-func commandGetShardReplication(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandGetShardReplication(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3978,7 +3597,7 @@ func commandGetShardReplication(ctx context.Context, wr *wrangler.Wrangler, subF
 	return printJSON(wr.Logger(), shardReplication.ShardReplication)
 }
 
-func commandHelp(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandHelp(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
@@ -3995,59 +3614,20 @@ func commandHelp(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.Flag
 	return nil
 }
 
-func commandVExec(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	deprecationMessage := `VExec command will be deprecated in version v12. For Online DDL control, use "vtctl OnlineDDL" commands or SQL syntax`
-	log.Warningf(deprecationMessage)
-
-	json := subFlags.Bool("json", false, "Output JSON instead of human-readable table")
-	dryRun := subFlags.Bool("dry_run", false, "Does a dry run of VExec and only reports the final query and list of tablets on which it will be applied")
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-	if subFlags.NArg() != 2 {
-		return fmt.Errorf("usage: VExec --dry-run keyspace.workflow \"<query>\"")
-	}
-	keyspace, workflow, err := splitKeyspaceWorkflow(subFlags.Arg(0))
-	if err != nil {
-		return err
-	}
-	_, err = wr.TopoServer().GetKeyspace(ctx, keyspace)
-	if err != nil {
-		wr.Logger().Errorf("keyspace %s not found", keyspace)
-	}
-	query := subFlags.Arg(1)
-
-	qr, err := wr.VExecResult(ctx, workflow, keyspace, query, *dryRun)
-	if err != nil {
-		return err
-	}
-	if *dryRun {
-		return nil
-	}
-	if qr == nil {
-		wr.Logger().Printf("no result returned\n")
-	}
-	if *json {
-		return printJSON(wr.Logger(), qr)
-	}
-	printQueryResult(loggerWriter{wr.Logger()}, qr)
-	return nil
-}
-
-func commandWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	dryRun := subFlags.Bool("dry_run", false, "Does a dry run of Workflow and only reports the final query and list of tablets on which the operation will be applied")
+func commandWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
+	usage := "usage: Workflow [--dry-run] [--cells] [--tablet-types] <keyspace>[.<workflow>] start/stop/update/delete/show/listall/tags [<tags>]"
+	dryRun := subFlags.Bool("dry-run", false, "Does a dry run of the Workflow action and reports the query and list of tablets on which the operation will be applied")
+	cells := subFlags.StringSlice("cells", []string{}, "New Cell(s) or CellAlias(es) (comma-separated) to replicate from. (Update only)")
+	tabletTypes := subFlags.StringSlice("tablet-types", []string{}, "New source tablet types to replicate from (e.g. PRIMARY, REPLICA, RDONLY). (Update only)")
+	onDDL := subFlags.String("on-ddl", "", "New instruction on what to do when DDL is encountered in the VReplication stream. Possible values are IGNORE, STOP, EXEC, and EXEC_IGNORE. (Update only)")
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
 	if subFlags.NArg() < 2 {
-		return fmt.Errorf("usage: Workflow --dry-run keyspace[.workflow] start/stop/delete/show/listall/tags [<tags>]")
+		return fmt.Errorf(usage)
 	}
 	keyspace := subFlags.Arg(0)
 	action := strings.ToLower(subFlags.Arg(1))
-	// Note: List is deprecated and replaced by show.
-	if action == "list" {
-		action = "show"
-	}
 	var workflow string
 	var err error
 	if action != "listall" {
@@ -4076,13 +3656,57 @@ func commandWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.
 		}
 	} else {
 		if subFlags.NArg() != 2 {
-			return fmt.Errorf("usage: Workflow --dry-run keyspace[.workflow] start/stop/delete/show/listall")
+			return fmt.Errorf(usage)
 		}
-		results, err = wr.WorkflowAction(ctx, workflow, keyspace, action, *dryRun)
+		var rpcReq any = nil
+		if action == "update" {
+			changes := false
+			// We need to implicitly distinguish between an empty value (which is valid)
+			// and no value having been provided. We will use NULL for this purpose.
+			if subFlags.Lookup("cells").Changed { // Validate the provided value(s)
+				changes = true
+				for i, cell := range *cells { // Which only means trimming whitespace
+					(*cells)[i] = strings.TrimSpace(cell)
+				}
+			} else {
+				cells = &textutil.SimulatedNullStringSlice
+			}
+			if subFlags.Lookup("tablet-types").Changed { // Validate the provided value(s)
+				changes = true
+				for i, tabletType := range *tabletTypes {
+					(*tabletTypes)[i] = strings.ToUpper(strings.TrimSpace(tabletType))
+					if _, err = topoproto.ParseTabletType((*tabletTypes)[i]); err != nil {
+						return err
+					}
+				}
+			} else {
+				tabletTypes = &textutil.SimulatedNullStringSlice
+			}
+			onddl := int32(textutil.SimulatedNullInt) // To signify no value has been provided
+			if subFlags.Lookup("on-ddl").Changed {    // Validate the provided value
+				changes = true
+				ival, valid := binlogdatapb.OnDDLAction_value[strings.ToUpper(*onDDL)]
+				if !valid {
+					return fmt.Errorf("invalid on-ddl action: %s", *onDDL)
+				}
+				onddl = ival
+			}
+			if !changes {
+				return fmt.Errorf(errWorkflowUpdateWithoutChanges)
+			}
+			rpcReq = &tabletmanagerdatapb.UpdateVRWorkflowRequest{
+				Workflow:    workflow,
+				Cells:       *cells,
+				TabletTypes: *tabletTypes,
+				OnDdl:       binlogdatapb.OnDDLAction(onddl),
+			}
+		}
+		results, err = wr.WorkflowAction(ctx, workflow, keyspace, action, *dryRun, rpcReq) // Only update currently uses the new RPC path
 		if err != nil {
 			return err
 		}
-		if action == "show" || action == "listall" {
+		if action == "show" || action == "listall" || (action == "update" && *dryRun) {
+			// No final results left to print.
 			return nil
 		}
 	}
@@ -4097,7 +3721,7 @@ func commandWorkflow(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.
 	return nil
 }
 
-func commandMount(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandMount(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	clusterType := subFlags.String("type", "vitess", "Specify cluster type: mysql or vitess, only vitess clustered right now")
 	unmount := subFlags.Bool("unmount", false, "Unmount cluster")
 	show := subFlags.Bool("show", false, "Display contents of cluster")
@@ -4153,7 +3777,7 @@ func commandMount(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.Fla
 	}
 }
 
-func commandGenerateShardRanges(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandGenerateShardRanges(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	numShards := subFlags.Int("num_shards", 2, "Number of shards to generate shard ranges for.")
 
 	if err := subFlags.Parse(args); err != nil {
@@ -4168,7 +3792,7 @@ func commandGenerateShardRanges(ctx context.Context, wr *wrangler.Wrangler, subF
 	return printJSON(wr.Logger(), shardRanges)
 }
 
-func commandPanic(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandPanic(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	panic(fmt.Errorf("this command panics on purpose"))
 }
 
@@ -4180,6 +3804,22 @@ func printJSON(logger logutil.Logger, val any) error {
 	}
 	logger.Printf("%s\n", data)
 	return nil
+}
+
+// loggerWriter turns a Logger into a Writer by decorating it with a Write()
+// method that sends everything to Logger.Printf().
+type loggerWriter struct {
+	logutil.Logger
+}
+
+func (lw loggerWriter) Write(p []byte) (int, error) {
+	lw.Logger.Printf("%s", p)
+	return len(p), nil
+}
+
+// printQueryResult will pretty-print a QueryResult to the logger.
+func printQueryResult(writer io.Writer, qr *sqltypes.Result) {
+	cli.WriteQueryResultTable(writer, qr)
 }
 
 // MarshalJSON marshals "obj" to a JSON string. It uses the "jsonpb" marshaler
@@ -4194,7 +3834,8 @@ func printJSON(logger logutil.Logger, val any) error {
 // mixed protobuf and non-protobuf).
 //
 // TODO(mberlin): Switch "EnumAsInts" to "false" once the frontend is
-//                updated and mixed types will use jsonpb as well.
+//
+//	updated and mixed types will use jsonpb as well.
 func MarshalJSON(obj any) (data []byte, err error) {
 	switch obj := obj.(type) {
 	case proto.Message:
@@ -4246,36 +3887,58 @@ func RunCommand(ctx context.Context, wr *wrangler.Wrangler, args []string) error
 	for _, group := range commands {
 		for _, cmd := range group.commands {
 			if strings.ToLower(cmd.name) == actionLowerCase {
-				subFlags := flag.NewFlagSet(action, flag.ContinueOnError)
+				subFlags := pflag.NewFlagSet(action, pflag.ContinueOnError)
 				subFlags.SetOutput(logutil.NewLoggerWriter(wr.Logger()))
-				_flag.SetUsage(subFlags, _flag.UsageOptions{
-					Preface: func(w io.Writer) {
-						if cmd.deprecated {
-							msg := &strings.Builder{}
-							msg.WriteString("WARNING: ")
-							msg.WriteString(action)
-							msg.WriteString(" is deprecated and will be removed in a future release.")
-							if cmd.deprecatedBy != "" {
-								msg.WriteString(" Use ")
-								msg.WriteString(cmd.deprecatedBy)
-								msg.WriteString(" instead.")
-							}
-
-							wr.Logger().Printf("%s\n", msg.String())
+				subFlags.Usage = func() {
+					if cmd.deprecated {
+						msg := &strings.Builder{}
+						msg.WriteString("WARNING: ")
+						msg.WriteString(action)
+						msg.WriteString(" is deprecated and will be removed in a future release.")
+						if cmd.deprecatedBy != "" {
+							msg.WriteString(" Use ")
+							msg.WriteString(cmd.deprecatedBy)
+							msg.WriteString(" instead.")
 						}
 
-						wr.Logger().Printf("Usage: %s %s\n\n", action, cmd.params)
-						wr.Logger().Printf("%s\n\n", cmd.help)
-					},
-				})
+						wr.Logger().Printf("%s\n", msg.String())
+					}
 
-				return cmd.method(ctx, wr, subFlags, args[1:])
+					wr.Logger().Printf("Usage: %s %s\n\n", action, cmd.params)
+					wr.Logger().Printf("%s\n\n", cmd.help)
+
+					wr.Logger().Printf("%s\n", subFlags.FlagUsages())
+				}
+
+				if len(args) > 1 && args[1] == "--" && !cmd.disableFlagInterspersal {
+					PrintDoubleDashDeprecationNotice(wr)
+					args = args[1:]
+				}
+
+				switch err := cmd.method(ctx, wr, subFlags, args[1:]); err {
+				case pflag.ErrHelp:
+					// Don't actually error if the user requested --help on a
+					// subcommand.
+					return nil
+				default:
+					return err
+				}
 			}
 		}
 	}
 
-	wr.Logger().Printf("Unknown command: %v\n", action)
 	return ErrUnknownCommand
+}
+
+func PrintDoubleDashDeprecationNotice(wr *wrangler.Wrangler) {
+	msg := (`DEPRECATION NOTICE: in v14, users needed to add a double-dash ("--") separator to split up top-level and sub-command arguments/flags.
+Beginning in v16, this will no longer work properly. Please remove any double-dashes that preceed sub-command **flags** only.
+	
+Note that this does not mean you do not need a separator to split up position arguments.
+For example, to pass a flag to a hook via ExecuteHook, "vtctl ExecuteHook myhook.sh -- --hook-flag 5" is the correct formation.
+For v1 Reshard commands, you will also need a separator if your shard names begin with a hyphen, i.e. "Reshard ks.workflow -- -80,80-" needs a double-dash, but "Reshard ks.workflow 40-80,80-c0" does not.`)
+
+	wr.Logger().Warningf(msg)
 }
 
 // PrintAllCommands will print the list of commands to the logger
@@ -4306,14 +3969,25 @@ func PrintAllCommands(logger logutil.Logger) {
 	}
 }
 
-// userPassedFlag returns true if the flag name given was provided
-// as a command-line argument by the user.
-func userPassedFlag(flags *flag.FlagSet, name string) bool {
-	passed := false
-	flags.Visit(func(f *flag.Flag) {
-		if f.Name == name {
-			passed = true
+// queryResultForTabletResults aggregates given results into a combined result set
+func queryResultForTabletResults(results map[string]*sqltypes.Result) *sqltypes.Result {
+	var qr = &sqltypes.Result{}
+	defaultFields := []*querypb.Field{{
+		Name: "Tablet",
+		Type: sqltypes.VarBinary,
+	}}
+	var row2 []sqltypes.Value
+	for tabletAlias, result := range results {
+		if qr.Fields == nil {
+			qr.Fields = append(qr.Fields, defaultFields...)
+			qr.Fields = append(qr.Fields, result.Fields...)
 		}
-	})
-	return passed
+		for _, row := range result.Rows {
+			row2 = nil
+			row2 = append(row2, sqltypes.NewVarBinary(tabletAlias))
+			row2 = append(row2, row...)
+			qr.Rows = append(qr.Rows, row2)
+		}
+	}
+	return qr
 }

@@ -33,12 +33,19 @@ type MysqlDaemon interface {
 	// methods related to mysql running or not
 	Start(ctx context.Context, cnf *Mycnf, mysqldArgs ...string) error
 	Shutdown(ctx context.Context, cnf *Mycnf, waitForMysqld bool) error
-	RunMysqlUpgrade() error
+	RunMysqlUpgrade(ctx context.Context) error
+	ApplyBinlogFile(ctx context.Context, binlogFile string, restorePos mysql.Position) error
 	ReinitConfig(ctx context.Context, cnf *Mycnf) error
 	Wait(ctx context.Context, cnf *Mycnf) error
 
 	// GetMysqlPort returns the current port mysql is listening on.
 	GetMysqlPort() (int32, error)
+
+	// GetServerID returns the servers ID.
+	GetServerID(ctx context.Context) (uint32, error)
+
+	// GetServerUUID returns the servers UUID
+	GetServerUUID(ctx context.Context) (string, error)
 
 	// replication related methods
 	StartReplication(hookExtraEnv map[string]string) error
@@ -48,18 +55,30 @@ type MysqlDaemon interface {
 	StopIOThread(ctx context.Context) error
 	ReplicationStatus() (mysql.ReplicationStatus, error)
 	PrimaryStatus(ctx context.Context) (mysql.PrimaryStatus, error)
+	GetGTIDPurged(ctx context.Context) (mysql.Position, error)
 	SetSemiSyncEnabled(source, replica bool) error
 	SemiSyncEnabled() (source, replica bool)
+	SemiSyncExtensionLoaded() (bool, error)
+	SemiSyncStatus() (source, replica bool)
+	SemiSyncClients() (count uint32)
+	SemiSyncSettings() (timeout uint64, numReplicas uint32)
 	SemiSyncReplicationStatus() (bool, error)
+	ResetReplicationParameters(ctx context.Context) error
+	GetBinlogInformation(ctx context.Context) (binlogFormat string, logEnabled bool, logReplicaUpdate bool, binlogRowImage string, err error)
+	GetGTIDMode(ctx context.Context) (gtidMode string, err error)
+	FlushBinaryLogs(ctx context.Context) (err error)
+	GetBinaryLogs(ctx context.Context) (binaryLogs []string, err error)
+	GetPreviousGTIDs(ctx context.Context, binlog string) (previousGtids string, err error)
 
 	// reparenting related methods
 	ResetReplication(ctx context.Context) error
 	PrimaryPosition() (mysql.Position, error)
 	IsReadOnly() (bool, error)
+	IsSuperReadOnly() (bool, error)
 	SetReadOnly(on bool) error
-	SetSuperReadOnly(on bool) error
+	SetSuperReadOnly(on bool) (ResetSuperReadOnlyFunc, error)
 	SetReplicationPosition(ctx context.Context, pos mysql.Position) error
-	SetReplicationSource(ctx context.Context, host string, port int, stopReplicationBefore bool, startReplicationAfter bool) error
+	SetReplicationSource(ctx context.Context, host string, port int32, stopReplicationBefore bool, startReplicationAfter bool) error
 	WaitForReparentJournal(ctx context.Context, timeCreatedNS int64) error
 
 	WaitSourcePos(context.Context, mysql.Position) error
@@ -69,7 +88,7 @@ type MysqlDaemon interface {
 	Promote(map[string]string) (mysql.Position, error)
 
 	// Schema related methods
-	GetSchema(ctx context.Context, dbName string, tables, excludeTables []string, includeViews bool) (*tabletmanagerdatapb.SchemaDefinition, error)
+	GetSchema(ctx context.Context, dbName string, request *tabletmanagerdatapb.GetSchemaRequest) (*tabletmanagerdatapb.SchemaDefinition, error)
 	GetColumns(ctx context.Context, dbName, table string) ([]*querypb.Field, []string, error)
 	GetPrimaryKeyColumns(ctx context.Context, dbName, table string) ([]string, error)
 	GetPrimaryKeyEquivalentColumns(ctx context.Context, dbName, table string) ([]string, error)
@@ -84,19 +103,16 @@ type MysqlDaemon interface {
 	GetAllPrivsConnection(ctx context.Context) (*dbconnpool.DBConnection, error)
 
 	// GetVersionString returns the database version as a string
-	GetVersionString() string
+	GetVersionString(ctx context.Context) string
+
+	// GetVersionComment returns the version comment
+	GetVersionComment(ctx context.Context) string
 
 	// ExecuteSuperQueryList executes a list of queries, no result
 	ExecuteSuperQueryList(ctx context.Context, queryList []string) error
 
 	// FetchSuperQuery executes one query, returns the result
 	FetchSuperQuery(ctx context.Context, query string) (*sqltypes.Result, error)
-
-	// EnableBinlogPlayback enables playback of binlog events
-	EnableBinlogPlayback() error
-
-	// DisableBinlogPlayback disable playback of binlog events
-	DisableBinlogPlayback() error
 
 	// Close will close this instance of Mysqld. It will wait for all dba
 	// queries to be finished.

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -169,17 +170,17 @@ func TestDestinationKeyspace(t *testing.T) {
 		vschema:       vschemaWith1KS,
 		targetString:  "ks2",
 		qualifier:     "",
-		expectedError: "Unknown database 'ks2' in vschema",
+		expectedError: "VT05003: unknown database 'ks2' in vschema",
 	}, {
 		vschema:       vschemaWith1KS,
 		targetString:  "ks2:-80",
 		qualifier:     "",
-		expectedError: "Unknown database 'ks2' in vschema",
+		expectedError: "VT05003: unknown database 'ks2' in vschema",
 	}, {
 		vschema:       vschemaWith1KS,
 		targetString:  "",
 		qualifier:     "ks2",
-		expectedError: "Unknown database 'ks2' in vschema",
+		expectedError: "VT05003: unknown database 'ks2' in vschema",
 	}, {
 		vschema:       vschemaWith2KS,
 		targetString:  "",
@@ -188,7 +189,7 @@ func TestDestinationKeyspace(t *testing.T) {
 
 	for i, tc := range tests {
 		t.Run(strconv.Itoa(i)+tc.targetString, func(t *testing.T) {
-			impl, _ := newVCursorImpl(context.Background(), NewSafeSession(&vtgatepb.Session{TargetString: tc.targetString}), sqlparser.MarginComments{}, nil, nil, &fakeVSchemaOperator{vschema: tc.vschema}, tc.vschema, nil, nil, false, querypb.ExecuteOptions_Gen4)
+			impl, _ := newVCursorImpl(NewSafeSession(&vtgatepb.Session{TargetString: tc.targetString}), sqlparser.MarginComments{}, nil, nil, &fakeVSchemaOperator{vschema: tc.vschema}, tc.vschema, nil, nil, false, querypb.ExecuteOptions_Gen4)
 			impl.vschema = tc.vschema
 			dest, keyspace, tabletType, err := impl.TargetDestination(tc.qualifier)
 			if tc.expectedError == "" {
@@ -237,7 +238,7 @@ func TestSetTarget(t *testing.T) {
 	}, {
 		vschema:       vschemaWith2KS,
 		targetString:  "ks3",
-		expectedError: "unknown database 'ks3'",
+		expectedError: "VT05003: unknown database 'ks3' in vschema",
 	}, {
 		vschema:       vschemaWith2KS,
 		targetString:  "ks2@replica",
@@ -246,7 +247,7 @@ func TestSetTarget(t *testing.T) {
 
 	for i, tc := range tests {
 		t.Run(fmt.Sprintf("%d#%s", i, tc.targetString), func(t *testing.T) {
-			vc, _ := newVCursorImpl(context.Background(), NewSafeSession(&vtgatepb.Session{InTransaction: true}), sqlparser.MarginComments{}, nil, nil, &fakeVSchemaOperator{vschema: tc.vschema}, tc.vschema, nil, nil, false, querypb.ExecuteOptions_Gen4)
+			vc, _ := newVCursorImpl(NewSafeSession(&vtgatepb.Session{InTransaction: true}), sqlparser.MarginComments{}, nil, nil, &fakeVSchemaOperator{vschema: tc.vschema}, tc.vschema, nil, nil, false, querypb.ExecuteOptions_Gen4)
 			vc.vschema = tc.vschema
 			err := vc.SetTarget(tc.targetString)
 			if tc.expectedError == "" {
@@ -259,7 +260,7 @@ func TestSetTarget(t *testing.T) {
 	}
 }
 
-func TestPlanPrefixKey(t *testing.T) {
+func TestKeyForPlan(t *testing.T) {
 	type testCase struct {
 		vschema               *vindexes.VSchema
 		targetString          string
@@ -269,29 +270,32 @@ func TestPlanPrefixKey(t *testing.T) {
 	tests := []testCase{{
 		vschema:               vschemaWith1KS,
 		targetString:          "",
-		expectedPlanPrefixKey: "ks1@primary",
+		expectedPlanPrefixKey: "ks1@primary+Collate:utf8mb4_0900_ai_ci+Query:SELECT 1",
 	}, {
 		vschema:               vschemaWith1KS,
 		targetString:          "ks1@replica",
-		expectedPlanPrefixKey: "ks1@replica",
+		expectedPlanPrefixKey: "ks1@replica+Collate:utf8mb4_0900_ai_ci+Query:SELECT 1",
 	}, {
 		vschema:               vschemaWith1KS,
 		targetString:          "ks1:-80",
-		expectedPlanPrefixKey: "ks1@primaryDestinationShard(-80)",
+		expectedPlanPrefixKey: "ks1@primary+Collate:utf8mb4_0900_ai_ci+DestinationShard(-80)+Query:SELECT 1",
 	}, {
 		vschema:               vschemaWith1KS,
 		targetString:          "ks1[deadbeef]",
-		expectedPlanPrefixKey: "ks1@primaryKsIDsResolved(80-)",
+		expectedPlanPrefixKey: "ks1@primary+Collate:utf8mb4_0900_ai_ci+KsIDsResolved:80-+Query:SELECT 1",
 	}}
 
 	for i, tc := range tests {
 		t.Run(fmt.Sprintf("%d#%s", i, tc.targetString), func(t *testing.T) {
 			ss := NewSafeSession(&vtgatepb.Session{InTransaction: false})
 			ss.SetTargetString(tc.targetString)
-			vc, err := newVCursorImpl(context.Background(), ss, sqlparser.MarginComments{}, nil, nil, &fakeVSchemaOperator{vschema: tc.vschema}, tc.vschema, srvtopo.NewResolver(&fakeTopoServer{}, nil, ""), nil, false, querypb.ExecuteOptions_Gen4)
+			vc, err := newVCursorImpl(ss, sqlparser.MarginComments{}, nil, nil, &fakeVSchemaOperator{vschema: tc.vschema}, tc.vschema, srvtopo.NewResolver(&fakeTopoServer{}, nil, ""), nil, false, querypb.ExecuteOptions_Gen4)
 			require.NoError(t, err)
 			vc.vschema = tc.vschema
-			require.Equal(t, tc.expectedPlanPrefixKey, vc.planPrefixKey())
+
+			var buf strings.Builder
+			vc.keyForPlan(context.Background(), "SELECT 1", &buf)
+			require.Equal(t, tc.expectedPlanPrefixKey, buf.String())
 		})
 	}
 }
@@ -307,7 +311,7 @@ func TestFirstSortedKeyspace(t *testing.T) {
 			ks3Schema.Keyspace.Name: ks3Schema,
 		}}
 
-	vc, err := newVCursorImpl(context.Background(), NewSafeSession(nil), sqlparser.MarginComments{}, nil, nil, &fakeVSchemaOperator{vschema: vschemaWith2KS}, vschemaWith2KS, srvtopo.NewResolver(&fakeTopoServer{}, nil, ""), nil, false, querypb.ExecuteOptions_Gen4)
+	vc, err := newVCursorImpl(NewSafeSession(nil), sqlparser.MarginComments{}, nil, nil, &fakeVSchemaOperator{vschema: vschemaWith2KS}, vschemaWith2KS, srvtopo.NewResolver(&fakeTopoServer{}, nil, ""), nil, false, querypb.ExecuteOptions_Gen4)
 	require.NoError(t, err)
 	ks, err := vc.FirstSortedKeyspace()
 	require.NoError(t, err)

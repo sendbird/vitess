@@ -12,17 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# NOTE: This file is also symlinked as "Dockerfile" in the root of our
-#       repository because the automated build feature on Docker Hub does not
-#       allow to specify a different build context. It always assumes that the
-#       build context is the same directory as the Dockerfile is in.
-#       "make build" below must be called in our repository's root and
-#       therefore we need to have the symlinked "Dockerfile" in there as well.
-# TODO(mberlin): Remove the symlink and this note once
-# https://github.com/docker/hub-feedback/issues/292 is fixed.
-
-ARG bootstrap_version=9
-ARG image="vitess/bootstrap:${bootstrap_version}-mysql57"
+ARG bootstrap_version=19
+ARG image="vitess/bootstrap:${bootstrap_version}-mysql80"
 
 FROM "${image}"
 
@@ -32,13 +23,19 @@ ARG CGO_ENABLED=0
 # Allows docker builds to set the BUILD_NUMBER
 ARG BUILD_NUMBER
 
+# Allows docker builds to set the BUILD_GIT_BRANCH
+ARG BUILD_GIT_BRANCH
+
+# Allows docker builds to set the BUILD_GIT_REV
+ARG BUILD_GIT_REV
+
+# Allows docker builds to set the BUILD_TIME
+ARG BUILD_TIME
+
 # Re-copy sources from working tree
-USER root
-COPY . /vt/src/vitess.io/vitess
+COPY --chown=vitess:vitess . /vt/src/vitess.io/vitess
+
+USER vitess
 
 # Build Vitess
 RUN make build
-
-# Fix permissions
-RUN chown -R vitess:vitess /vt
-USER vitess

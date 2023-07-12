@@ -32,29 +32,13 @@ type colldefaults struct {
 type Environment struct {
 	version     collver
 	byName      map[string]Collation
-	byID        map[ID]Collation
 	byCharset   map[string]*colldefaults
 	unsupported map[string]ID
 }
 
-// LookupByName returns the collation with the given name. The collation
-// is initialized if it's the first time being accessed.
+// LookupByName returns the collation with the given name.
 func (env *Environment) LookupByName(name string) Collation {
-	if coll, ok := env.byName[name]; ok {
-		coll.Init()
-		return coll
-	}
-	return nil
-}
-
-// LookupByID returns the collation with the given numerical identifier. The collation
-// is initialized if it's the first time being accessed.
-func (env *Environment) LookupByID(id ID) Collation {
-	if coll, ok := env.byID[id]; ok {
-		coll.Init()
-		return coll
-	}
-	return nil
+	return env.byName[name]
 }
 
 // LookupID returns the collation ID for the given name, and whether
@@ -72,10 +56,7 @@ func (env *Environment) LookupID(name string) (ID, bool) {
 // DefaultCollationForCharset returns the default collation for a charset
 func (env *Environment) DefaultCollationForCharset(charset string) Collation {
 	if defaults, ok := env.byCharset[charset]; ok {
-		if defaults.Default != nil {
-			defaults.Default.Init()
-			return defaults.Default
-		}
+		return defaults.Default
 	}
 	return nil
 }
@@ -83,21 +64,15 @@ func (env *Environment) DefaultCollationForCharset(charset string) Collation {
 // BinaryCollationForCharset returns the default binary collation for a charset
 func (env *Environment) BinaryCollationForCharset(charset string) Collation {
 	if defaults, ok := env.byCharset[charset]; ok {
-		if defaults.Binary != nil {
-			defaults.Binary.Init()
-			return defaults.Binary
-		}
+		return defaults.Binary
 	}
 	return nil
 }
 
-// AllCollations returns a slice with all known collations in Vitess. This is an expensive call because
-// it will initialize the internal state of all the collations before returning them.
-// Used for testing/debugging.
+// AllCollations returns a slice with all known collations in Vitess.
 func (env *Environment) AllCollations() (all []Collation) {
-	all = make([]Collation, 0, len(env.byID))
-	for _, col := range env.byID {
-		col.Init()
+	all = make([]Collation, 0, len(env.byName))
+	for _, col := range env.byName {
 		all = append(all, col)
 	}
 	return
@@ -125,13 +100,17 @@ func fetchCacheEnvironment(version collver) *Environment {
 // The version string must be in the format that is sent by the server as the version packet
 // when opening a new MySQL connection
 func NewEnvironment(serverVersion string) *Environment {
-	var version collver = collverMySQL56
+	// 5.7 is the oldest version we support today, so use that as
+	// the default.
+	// NOTE: this should be changed when we EOL MySQL 5.7 support
+	var version collver = collverMySQL57
+	serverVersion = strings.TrimSpace(strings.ToLower(serverVersion))
 	switch {
 	case strings.HasSuffix(serverVersion, "-ripple"):
 		// the ripple binlog server can mask the actual version of mysqld;
 		// assume we have the highest
 		version = collverMySQL80
-	case strings.Contains(serverVersion, "MariaDB"):
+	case strings.Contains(serverVersion, "mariadb"):
 		switch {
 		case strings.Contains(serverVersion, "10.0."):
 			version = collverMariaDB100
@@ -156,7 +135,6 @@ func makeEnv(version collver) *Environment {
 	env := &Environment{
 		version:     version,
 		byName:      make(map[string]Collation),
-		byID:        make(map[ID]Collation),
 		byCharset:   make(map[string]*colldefaults),
 		unsupported: make(map[string]ID),
 	}
@@ -172,8 +150,11 @@ func makeEnv(version collver) *Environment {
 			continue
 		}
 
-		collation, ok := globalAllCollations[collid]
-		if !ok {
+		var collation Collation
+		if int(collid) < len(collationsById) {
+			collation = collationsById[collid]
+		}
+		if collation == nil {
 			for _, name := range ournames {
 				env.unsupported[name] = collid
 			}
@@ -183,7 +164,6 @@ func makeEnv(version collver) *Environment {
 		for _, name := range ournames {
 			env.byName[name] = collation
 		}
-		env.byID[collid] = collation
 
 		csname := collation.Charset().Name()
 		if _, ok := env.byCharset[csname]; !ok {
@@ -214,10 +194,15 @@ func makeEnv(version collver) *Environment {
 // A few interesting character set values.
 // See http://dev.mysql.com/doc/internals/en/character-set.html#packet-Protocol::CharacterSet
 const (
-	CollationUtf8ID    = 33
-	CollationUtf8mb4ID = 255
-	CollationBinaryID  = 63
+	CollationUtf8ID        = 33
+	CollationUtf8mb4ID     = 255
+	CollationBinaryID      = 63
+	CollationUtf8mb4BinID  = 46
+	CollationLatin1Swedish = 8
 )
+
+// Binary is the default Binary collation
+var Binary = ID(CollationBinaryID).Get()
 
 // CharsetAlias returns the internal charset name for the given charset.
 // For now, this only maps `utf8` to `utf8mb3`; in future versions of MySQL,
@@ -228,6 +213,33 @@ func (env *Environment) CharsetAlias(charset string) (alias string, ok bool) {
 	return
 }
 
+// CollationAlias returns the internal collaction name for the given charset.
+// For now, this maps all `utf8` to `utf8mb3` collation names; in future versions of MySQL,
+// this mapping will change, so it's important to use this helper so that
+// Vitess code has a consistent mapping for the active collations environment.
+func (env *Environment) CollationAlias(collation string) (string, bool) {
+	col := env.LookupByName(collation)
+	if col == nil {
+		return collation, false
+	}
+	allCols, ok := globalVersionInfo[col.ID()]
+	if !ok {
+		return collation, false
+	}
+	if len(allCols.alias) == 1 {
+		return collation, false
+	}
+	for _, alias := range allCols.alias {
+		for source, dest := range env.version.charsetAliases() {
+			if strings.HasPrefix(collation, fmt.Sprintf("%s_", source)) &&
+				strings.HasPrefix(alias.name, fmt.Sprintf("%s_", dest)) {
+				return alias.name, true
+			}
+		}
+	}
+	return collation, false
+}
+
 // DefaultConnectionCharset is the default charset that Vitess will use when negotiating a
 // charset in a MySQL connection handshake. Note that in this context, a 'charset' is equivalent
 // to a Collation ID, with the exception that it can only fit in 1 byte.
@@ -236,7 +248,7 @@ func (env *Environment) CharsetAlias(charset string) (alias string, ok bool) {
 func (env *Environment) DefaultConnectionCharset() uint8 {
 	switch env.version {
 	case collverMySQL80:
-		return CollationUtf8mb4ID
+		return uint8(CollationUtf8mb4ID)
 	default:
 		return 45
 	}

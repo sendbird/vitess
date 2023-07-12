@@ -38,15 +38,15 @@ func TestNormalizeAllFields(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.Close()
 
-	insertQuery := string(`insert into t1 values (1, "chars", "variable chars", x'73757265', 0x676F, 0.33, 9.99, 1, "1976-06-08", "small", "b", "{\"key\":\"value\"}", point(1,5))`)
-	normalizedInsertQuery := string(`insert into t1 values (:vtg1, :vtg2, :vtg3, :vtg4, :vtg5, :vtg6, :vtg7, :vtg8, :vtg9, :vtg10, :vtg11, :vtg12, point(:vtg13, :vtg14))`)
+	insertQuery := `insert into t1 values (1, "chars", "variable chars", x'73757265', 0x676F, 0.33, 9.99, 1, "1976-06-08", "small", "b", "{\"key\":\"value\"}", point(1,5), b'011', 0b0101)`
+	normalizedInsertQuery := `insert into t1 values (:vtg1 /* INT64 */, :vtg2 /* VARCHAR */, :vtg3 /* VARCHAR */, :vtg4 /* HEXVAL */, :vtg5 /* HEXNUM */, :vtg6 /* DECIMAL */, :vtg7 /* DECIMAL */, :vtg8 /* INT64 */, :vtg9 /* VARCHAR */, :vtg10 /* VARCHAR */, :vtg11 /* VARCHAR */, :vtg12 /* VARCHAR */, point(:vtg13 /* INT64 */, :vtg14 /* INT64 */), :vtg15 /* HEXNUM */, :vtg16 /* HEXNUM */)`
 	selectQuery := "select * from t1"
 	utils.Exec(t, conn, insertQuery)
 	qr := utils.Exec(t, conn, selectQuery)
 	assert.Equal(t, 1, len(qr.Rows), "wrong number of table rows, expected 1 but had %d. Results: %v", len(qr.Rows), qr.Rows)
 
 	// Now need to figure out the best way to check the normalized query in the planner cache...
-	results, err := getPlanCache(fmt.Sprintf("%s:%d", clusterInstance.Hostname, clusterInstance.VtgateProcess.Port))
+	results, err := getPlanCache(fmt.Sprintf("%s:%d", vtParams.Host, clusterInstance.VtgateProcess.Port))
 	require.Nil(t, err)
 	found := false
 	for _, record := range results {
@@ -56,7 +56,7 @@ func TestNormalizeAllFields(t *testing.T) {
 			break
 		}
 	}
-	assert.True(t, found, "correctly normalized record not found in planner cache")
+	assert.Truef(t, found, "correctly normalized record not found in planner cache %v", results)
 }
 
 func getPlanCache(vtgateHostPort string) ([]map[string]any, error) {

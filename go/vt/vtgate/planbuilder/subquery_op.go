@@ -19,12 +19,12 @@ package planbuilder
 import (
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/engine/opcode"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/operators"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
-
-	"vitess.io/vitess/go/vt/vtgate/planbuilder/physical"
 )
 
-func transformSubQueryPlan(ctx *plancontext.PlanningContext, op *physical.SubQueryOp) (logicalPlan, error) {
+func transformSubQueryPlan(ctx *plancontext.PlanningContext, op *operators.SubQueryOp) (logicalPlan, error) {
 	innerPlan, err := transformToLogicalPlan(ctx, op.Inner, false)
 	if err != nil {
 		return nil, err
@@ -42,7 +42,7 @@ func transformSubQueryPlan(ctx *plancontext.PlanningContext, op *physical.SubQue
 	if merged != nil {
 		return merged, nil
 	}
-	plan := newPulloutSubquery(engine.PulloutOpcode(op.Extracted.OpCode), argName, hasValuesArg, innerPlan)
+	plan := newPulloutSubquery(opcode.PulloutOpcode(op.Extracted.OpCode), argName, hasValuesArg, innerPlan)
 	if err != nil {
 		return nil, err
 	}
@@ -50,7 +50,7 @@ func transformSubQueryPlan(ctx *plancontext.PlanningContext, op *physical.SubQue
 	return plan, err
 }
 
-func transformCorrelatedSubQueryPlan(ctx *plancontext.PlanningContext, op *physical.CorrelatedSubQueryOp) (logicalPlan, error) {
+func transformCorrelatedSubQueryPlan(ctx *plancontext.PlanningContext, op *operators.CorrelatedSubQueryOp) (logicalPlan, error) {
 	outer, err := transformToLogicalPlan(ctx, op.Outer, false)
 	if err != nil {
 		return nil, err
@@ -62,7 +62,7 @@ func transformCorrelatedSubQueryPlan(ctx *plancontext.PlanningContext, op *physi
 	return newSemiJoin(outer, inner, op.Vars, op.LHSColumns), nil
 }
 
-func mergeSubQueryOpPlan(ctx *plancontext.PlanningContext, inner, outer logicalPlan, n *physical.SubQueryOp) logicalPlan {
+func mergeSubQueryOpPlan(ctx *plancontext.PlanningContext, inner, outer logicalPlan, n *operators.SubQueryOp) logicalPlan {
 	iroute, ok := inner.(*routeGen4)
 	if !ok {
 		return nil
@@ -75,7 +75,7 @@ func mergeSubQueryOpPlan(ctx *plancontext.PlanningContext, inner, outer logicalP
 	if canMergeSubqueryPlans(ctx, iroute, oroute) {
 		// n.extracted is an expression that lives in oroute.Select.
 		// Instead of looking for it in the AST, we have a copy in the subquery tree that we can update
-		n.Extracted.NeedsRewrite = true
+		n.Extracted.Merged = true
 		replaceSubQuery(ctx, oroute.Select)
 		return mergeSystemTableInformation(oroute, iroute)
 	}

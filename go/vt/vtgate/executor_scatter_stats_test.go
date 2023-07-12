@@ -18,9 +18,8 @@ package vtgate
 
 import (
 	"context"
-	"testing"
-
 	"net/http/httptest"
+	"testing"
 
 	"github.com/stretchr/testify/require"
 
@@ -31,7 +30,7 @@ func TestScatterStatsWithNoScatterQuery(t *testing.T) {
 	executor, _, _, _ := createExecutorEnv()
 	session := NewSafeSession(&vtgatepb.Session{TargetString: "@primary"})
 
-	_, err := executor.Execute(context.Background(), "TestExecutorResultsExceeded", session, "select * from main1", nil)
+	_, err := executor.Execute(context.Background(), nil, "TestExecutorResultsExceeded", session, "select * from main1", nil)
 	require.NoError(t, err)
 
 	result, err := executor.gatherScatterStats()
@@ -43,7 +42,7 @@ func TestScatterStatsWithSingleScatterQuery(t *testing.T) {
 	executor, _, _, _ := createExecutorEnv()
 	session := NewSafeSession(&vtgatepb.Session{TargetString: "@primary"})
 
-	_, err := executor.Execute(context.Background(), "TestExecutorResultsExceeded", session, "select * from user", nil)
+	_, err := executor.Execute(context.Background(), nil, "TestExecutorResultsExceeded", session, "select * from user", nil)
 	require.NoError(t, err)
 
 	result, err := executor.gatherScatterStats()
@@ -55,17 +54,17 @@ func TestScatterStatsHttpWriting(t *testing.T) {
 	executor, _, _, _ := createExecutorEnv()
 	session := NewSafeSession(&vtgatepb.Session{TargetString: "@primary"})
 
-	_, err := executor.Execute(context.Background(), "TestExecutorResultsExceeded", session, "select * from user", nil)
+	_, err := executor.Execute(context.Background(), nil, "TestExecutorResultsExceeded", session, "select * from user", nil)
 	require.NoError(t, err)
 
-	_, err = executor.Execute(context.Background(), "TestExecutorResultsExceeded", session, "select * from user where Id = 15", nil)
+	_, err = executor.Execute(context.Background(), nil, "TestExecutorResultsExceeded", session, "select * from user where Id = 15", nil)
 	require.NoError(t, err)
 
-	_, err = executor.Execute(context.Background(), "TestExecutorResultsExceeded", session, "select * from user where Id > 15", nil)
+	_, err = executor.Execute(context.Background(), nil, "TestExecutorResultsExceeded", session, "select * from user where Id > 15", nil)
 	require.NoError(t, err)
 
 	query4 := "select * from user as u1 join  user as u2 on u1.Id = u2.Id"
-	_, err = executor.Execute(context.Background(), "TestExecutorResultsExceeded", session, query4, nil)
+	_, err = executor.Execute(context.Background(), nil, "TestExecutorResultsExceeded", session, query4, nil)
 	require.NoError(t, err)
 
 	executor.plans.Wait()
@@ -75,6 +74,6 @@ func TestScatterStatsHttpWriting(t *testing.T) {
 
 	// Here we are checking that the template was executed correctly.
 	// If it wasn't, instead of html, we'll get an error message
-	require.Contains(t, recorder.Body.String(), query4)
+	require.Contains(t, recorder.Body.String(), "select * from `user` as u1 join `user` as u2 on u1.Id = u2.Id")
 	require.NoError(t, err)
 }

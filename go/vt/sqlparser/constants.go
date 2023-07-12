@@ -16,6 +16,8 @@ limitations under the License.
 
 package sqlparser
 
+import "vitess.io/vitess/go/mysql/datetime"
+
 // String constants to be used in ast.
 const (
 	// Select.Distinct
@@ -47,8 +49,6 @@ const (
 	GlobalStr         = "global"
 	VitessMetadataStr = "vitess_metadata"
 	VariableStr       = "variable"
-	LocalStr          = "local"
-	ImplicitStr       = ""
 
 	// DDL strings.
 	CreateStr           = "create"
@@ -66,6 +66,12 @@ const (
 	DropColVindexStr    = "on table drop vindex"
 	AddSequenceStr      = "add sequence"
 	AddAutoIncStr       = "add auto_increment"
+
+	// ALTER TABLE ALGORITHM string.
+	DefaultStr = "default"
+	CopyStr    = "copy"
+	InplaceStr = "inplace"
+	InstantStr = "instant"
 
 	// Partition and subpartition type strings
 	HashTypeStr  = "hash"
@@ -230,18 +236,20 @@ const (
 	AscScr  = "asc"
 	DescScr = "desc"
 
-	// SetExpr.Expr, for SET TRANSACTION ... or START TRANSACTION
-	// TransactionStr is the Name for a SET TRANSACTION statement
-	TransactionStr = "transaction"
+	// SetExpr.Expr transaction variables
+	TransactionIsolationStr = "transaction_isolation"
+	TransactionReadOnlyStr  = "transaction_read_only"
 
 	// Transaction isolation levels
-	ReadUncommittedStr = "read uncommitted"
-	ReadCommittedStr   = "read committed"
-	RepeatableReadStr  = "repeatable read"
+	ReadUncommittedStr = "read-uncommitted"
+	ReadCommittedStr   = "read-committed"
+	RepeatableReadStr  = "repeatable-read"
 	SerializableStr    = "serializable"
 
-	TxReadOnly  = "read only"
-	TxReadWrite = "read write"
+	// Transaction access mode
+	WithConsistentSnapshotStr = "with consistent snapshot"
+	ReadWriteStr              = "read write"
+	ReadOnlyStr               = "read only"
 
 	// Explain formats
 	EmptyStr       = ""
@@ -250,6 +258,10 @@ const (
 	VitessStr      = "vitess"
 	TraditionalStr = "traditional"
 	AnalyzeStr     = "analyze"
+	VTExplainStr   = "vtexplain"
+	QueriesStr     = "queries"
+	AllVExplainStr = "all"
+	PlanStr        = "plan"
 
 	// Lock Types
 	ReadStr             = "read"
@@ -281,7 +293,7 @@ const (
 	ProcedureStr               = " procedure status"
 	StatusGlobalStr            = " global status"
 	StatusSessionStr           = " status"
-	TableStr                   = " tables"
+	TablesStr                  = " tables"
 	TableStatusStr             = " table status"
 	TriggerStr                 = " triggers"
 	VariableGlobalStr          = " global variables"
@@ -373,47 +385,88 @@ const (
 	ReleaseAllLocksStr = "release_all_locks"
 	ReleaseLockStr     = "release_lock"
 
+	// PerformanceSchemaType strings
+	FormatBytesStr       = "format_bytes"
+	FormatPicoTimeStr    = "format_pico_time"
+	PsCurrentThreadIDStr = "ps_current_thread_id"
+	PsThreadIDStr        = "ps_thread_id"
+
+	// GTIDType strings
+	GTIDSubsetStr                   = "gtid_subset"
+	GTIDSubtractStr                 = "gtid_subtract"
+	WaitForExecutedGTIDSetStr       = "wait_for_executed_gtid_set"
+	WaitUntilSQLThreadAfterGTIDSStr = "wait_until_sql_thread_after_gtids"
+
 	// LockOptionType strings
 	NoneTypeStr      = "none"
 	SharedTypeStr    = "shared"
 	DefaultTypeStr   = "default"
 	ExclusiveTypeStr = "exclusive"
 
-	// IntervalTypes strings
-	DayStr               = "day"
-	WeekStr              = "week"
-	MonthStr             = "month"
-	YearStr              = "year"
-	DayHourStr           = "day_hour"
-	DayMicrosecondStr    = "day_microsecond"
-	DayMinuteStr         = "day_minute"
-	DaySecondStr         = "day_second"
-	HourStr              = "hour"
-	HourMicrosecondStr   = "hour_microsecond"
-	HourMinuteStr        = "hour_minute"
-	HourSecondStr        = "hour_second"
-	MicrosecondStr       = "microsecond"
-	MinuteStr            = "minute"
-	MinuteMicrosecondStr = "minute_microsecond"
-	MinuteSecondStr      = "minute_second"
-	QuarterStr           = "quarter"
-	SecondStr            = "second"
-	SecondMicrosecondStr = "second_microsecond"
-	YearMonthStr         = "year_month"
-)
+	// GeomeFromWktType strings
+	GeometryFromTextStr           = "st_geometryfromtext"
+	GeometryCollectionFromTextStr = "st_geometrycollectionfromtext"
+	PointFromTextStr              = "st_pointfromtext"
+	MultiPointFromTextStr         = "st_multipointfromtext"
+	LineStringFromTextStr         = "st_linestringfromtext"
+	MultiLinestringFromTextStr    = "st_multilinestringfromtext"
+	PolygonFromTextStr            = "st_polygonfromtext"
+	MultiPolygonFromTextStr       = "st_multipolygonfromtext"
 
-// Constants for Enum type - AccessMode
-const (
-	ReadOnly AccessMode = iota
-	ReadWrite
-)
+	// GeomeFromWktType strings
+	GeometryFromWKBStr           = "st_geometryfromwkb"
+	GeometryCollectionFromWKBStr = "st_geometrycollectionfromwkb"
+	PointFromWKBStr              = "st_pointfromwkb"
+	MultiPointFromWKBStr         = "st_multipointfromwkb"
+	LineStringFromWKBStr         = "st_linestringfromwkb"
+	MultiLinestringFromWKBStr    = "st_multilinestringfromwkb"
+	PolygonFromWKBStr            = "st_polygonfromwkb"
+	MultiPolygonFromWKBStr       = "st_multipolygonfromwkb"
 
-//Constants for Enum type - IsolationLevel
-const (
-	ReadUncommitted IsolationLevel = iota
-	ReadCommitted
-	RepeatableRead
-	Serializable
+	// GeomFormatExpr strings
+	TextFormatStr   = "st_astext"
+	BinaryFormatStr = "st_asbinary"
+
+	// GeomPropertyType strings
+	IsSimpleStr     = "st_issimple"
+	IsEmptyStr      = "st_isempty"
+	EnvelopeStr     = "st_envelope"
+	DimensionStr    = "st_dimension"
+	GeometryTypeStr = "st_geometrytype"
+
+	// PointPropertyType strings
+	XCordinateStr = "st_x"
+	YCordinateStr = "st_y"
+	LatitudeStr   = "st_latitude"
+	LongitudeStr  = "st_longitude"
+
+	// LinestringPropertyType strings
+	EndPointStr   = "st_endpoint"
+	IsClosedStr   = "st_isclosed"
+	LengthStr     = "st_length"
+	NumPointsStr  = "st_numpoints"
+	PointNStr     = "st_pointn"
+	StartPointStr = "st_startpoint"
+
+	// PolygonPropertyType strings
+	AreaStr             = "st_area"
+	CentroidStr         = "st_centroid"
+	ExteriorRingStr     = "st_exteriorring"
+	InteriorRingNStr    = "st_interiorringN"
+	NumInteriorRingsStr = "st_numinteriorrings"
+
+	// GeomCollPropType strings
+	NumGeometriesStr = "st_numgeometries"
+	GeometryNStr     = "st_geometryn"
+
+	// GeomFromGeoHash strings
+	LatitudeFromHashStr  = "st_latfromgeohash"
+	LongitudeFromHashStr = "st_longfromgeohash"
+	PointFromHashStr     = "st_pointfromgeohash"
+
+	// KillType strings
+	ConnectionStr = "connection"
+	QueryStr      = "query"
 )
 
 // Constants for Enum Type - Insert.Action
@@ -440,14 +493,17 @@ const (
 	RevertDDLAction
 )
 
-// Constants for Enum Type - Scope
+// Constants for scope of variables
+// See https://dev.mysql.com/doc/refman/8.0/en/set-variable.html
 const (
-	ImplicitScope Scope = iota
-	SessionScope
-	GlobalScope
-	VitessMetadataScope
-	VariableScope
-	LocalScope
+	NoScope             Scope = iota
+	SessionScope              // [SESSION | @@SESSION.| @@LOCAL. | @@] This is the default if no scope is given
+	GlobalScope               // {GLOBAL | @@GLOBAL.} system_var_name
+	VitessMetadataScope       // @@vitess_metadata.system_var_name
+	PersistSysScope           // {PERSIST_ONLY | @@PERSIST_ONLY.} system_var_name
+	PersistOnlySysScope       // {PERSIST_ONLY | @@PERSIST_ONLY.} system_var_name
+	VariableScope             // @var_name   This is used for user defined variables.
+	NextTxScope               // This is used for transaction related variables like transaction_isolation, transaction_read_write and set transaction statement.
 )
 
 // Constants for Enum Type - Lock
@@ -551,6 +607,22 @@ const (
 	IsUsedLock
 	ReleaseAllLocks
 	ReleaseLock
+)
+
+// Constants for Enum Type - PerformanceSchemaType
+const (
+	FormatBytesType PerformanceSchemaType = iota
+	FormatPicoTimeType
+	PsCurrentThreadIDType
+	PsThreadIDType
+)
+
+// Constants for Enum Type - GTIDType
+const (
+	GTIDSubsetType GTIDType = iota
+	GTIDSubtractType
+	WaitForExecutedGTIDSetType
+	WaitUntilSQLThreadAfterGTIDSType
 )
 
 // Constants for Enum Type - WhereType
@@ -692,8 +764,16 @@ const (
 	TreeType
 	JSONType
 	VitessType
+	VTExplainType
 	TraditionalType
 	AnalyzeType
+)
+
+// Constant for Enum Type - VExplainType
+const (
+	QueriesVExplainType VExplainType = iota
+	PlanVExplainType
+	AllVExplainType
 )
 
 // Constant for Enum Type - SelectIntoType
@@ -701,12 +781,6 @@ const (
 	IntoOutfile SelectIntoType = iota
 	IntoOutfileS3
 	IntoDumpfile
-)
-
-// Constant for Enum Type - DeallocateStmtType
-const (
-	DeallocateType DeallocateStmtType = iota
-	DropType
 )
 
 // Constant for Enum Type - JtOnResponseType
@@ -795,7 +869,10 @@ const (
 // AlterMigrationType constants
 const (
 	RetryMigrationType AlterMigrationType = iota
+	LaunchMigrationType
+	LaunchAllMigrationType
 	CompleteMigrationType
+	CompleteAllMigrationType
 	CancelMigrationType
 	CancelAllMigrationType
 	CleanupMigrationType
@@ -819,26 +896,133 @@ const (
 	DefaultFormat
 )
 
-// IntervalTypes constants
+// Transaction access mode
 const (
-	IntervalYear IntervalTypes = iota
-	IntervalQuarter
-	IntervalMonth
-	IntervalWeek
-	IntervalDay
-	IntervalHour
-	IntervalMinute
-	IntervalSecond
-	IntervalMicrosecond
-	IntervalYearMonth
-	IntervalDayHour
-	IntervalDayMinute
-	IntervalDaySecond
-	IntervalHourMinute
-	IntervalHourSecond
-	IntervalMinuteSecond
-	IntervalDayMicrosecond
-	IntervalHourMicrosecond
-	IntervalMinuteMicrosecond
-	IntervalSecondMicrosecond
+	WithConsistentSnapshot TxAccessMode = iota
+	ReadWrite
+	ReadOnly
+)
+
+// Enum Types of WKT functions
+const (
+	GeometryFromText GeomFromWktType = iota
+	GeometryCollectionFromText
+	PointFromText
+	LineStringFromText
+	PolygonFromText
+	MultiPointFromText
+	MultiPolygonFromText
+	MultiLinestringFromText
+)
+
+// Enum Types of WKT functions
+const (
+	GeometryFromWKB GeomFromWkbType = iota
+	GeometryCollectionFromWKB
+	PointFromWKB
+	LineStringFromWKB
+	PolygonFromWKB
+	MultiPointFromWKB
+	MultiPolygonFromWKB
+	MultiLinestringFromWKB
+)
+
+// Enum Types of spatial format functions
+const (
+	TextFormat GeomFormatType = iota
+	BinaryFormat
+)
+
+// Enum Types of spatial property functions
+const (
+	IsSimple GeomPropertyType = iota
+	IsEmpty
+	Dimension
+	GeometryType
+	Envelope
+)
+
+// Enum Types of point property functions
+const (
+	XCordinate PointPropertyType = iota
+	YCordinate
+	Latitude
+	Longitude
+)
+
+// Enum Types of linestring property functions
+const (
+	EndPoint LinestrPropType = iota
+	IsClosed
+	Length
+	NumPoints
+	PointN
+	StartPoint
+)
+
+// Enum Types of linestring property functions
+const (
+	Area PolygonPropType = iota
+	Centroid
+	ExteriorRing
+	InteriorRingN
+	NumInteriorRings
+)
+
+// Enum Types of geom collection property functions
+const (
+	GeometryN GeomCollPropType = iota
+	NumGeometries
+)
+
+// Enum Types of geom from geohash functions
+const (
+	LatitudeFromHash GeomFromHashType = iota
+	LongitudeFromHash
+	PointFromHash
+)
+
+// IntervalType constants
+const (
+	IntervalNone        = datetime.IntervalNone
+	IntervalMicrosecond = datetime.IntervalMicrosecond
+	IntervalSecond      = datetime.IntervalSecond
+	IntervalMinute      = datetime.IntervalMinute
+	IntervalHour        = datetime.IntervalHour
+	IntervalDay         = datetime.IntervalDay
+	IntervalWeek        = datetime.IntervalWeek
+	IntervalMonth       = datetime.IntervalMonth
+	IntervalQuarter     = datetime.IntervalQuarter
+	IntervalYear        = datetime.IntervalYear
+
+	IntervalSecondMicrosecond = datetime.IntervalSecondMicrosecond
+	IntervalMinuteMicrosecond = datetime.IntervalMinuteMicrosecond
+	IntervalMinuteSecond      = datetime.IntervalMinuteSecond
+	IntervalHourMicrosecond   = datetime.IntervalHourMicrosecond
+	IntervalHourSecond        = datetime.IntervalHourSecond
+	IntervalHourMinute        = datetime.IntervalHourMinute
+	IntervalDayMicrosecond    = datetime.IntervalDayMicrosecond
+	IntervalDaySecond         = datetime.IntervalDaySecond
+	IntervalDayMinute         = datetime.IntervalDayMinute
+	IntervalDayHour           = datetime.IntervalDayHour
+	IntervalYearMonth         = datetime.IntervalYearMonth
+)
+
+type IntervalExprSyntax int8
+
+const (
+	IntervalDateExprDateAdd IntervalExprSyntax = iota
+	IntervalDateExprDateSub
+	IntervalDateExprAdddate
+	IntervalDateExprSubdate
+	IntervalDateExprBinaryAdd
+	IntervalDateExprBinaryAddLeft
+	IntervalDateExprBinarySub
+	IntervalDateExprTimestampadd
+)
+
+// Constant for Enum Type - KillType
+const (
+	ConnectionType KillType = iota
+	QueryType
 )

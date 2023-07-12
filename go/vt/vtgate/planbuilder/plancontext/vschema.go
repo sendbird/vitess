@@ -1,9 +1,13 @@
 package plancontext
 
 import (
+	"context"
 	"strings"
 
+	"vitess.io/vitess/go/vt/log"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
+	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
+	"vitess.io/vitess/go/vt/vtgate/engine"
 
 	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/vt/key"
@@ -21,6 +25,7 @@ type PlannerVersion = querypb.ExecuteOptions_PlannerVersion
 // info about tables.
 type VSchema interface {
 	FindTable(tablename sqlparser.TableName) (*vindexes.Table, string, topodatapb.TabletType, key.Destination, error)
+	FindView(name sqlparser.TableName) sqlparser.SelectStatement
 	FindTableOrVindex(tablename sqlparser.TableName) (*vindexes.Table, vindexes.Vindex, string, topodatapb.TabletType, key.Destination, error)
 	DefaultKeyspace() (*vindexes.Keyspace, error)
 	TargetString() string
@@ -58,12 +63,38 @@ type VSchema interface {
 
 	// GetSrvVschema returns the latest cached vschema.SrvVSchema
 	GetSrvVschema() *vschemapb.SrvVSchema
+
+	// FindRoutedShard looks up shard routing rules for a shard
+	FindRoutedShard(keyspace, shard string) (string, error)
+
+	// IsShardRoutingEnabled returns true if partial shard routing is enabled
+	IsShardRoutingEnabled() bool
+
+	// IsViewsEnabled returns true if Vitess manages the views.
+	IsViewsEnabled() bool
+
+	// GetUDV returns user defined value from the variable passed.
+	GetUDV(name string) *querypb.BindVariable
+
+	// PlanPrepareStatement plans the prepared statement.
+	PlanPrepareStatement(ctx context.Context, query string) (*engine.Plan, sqlparser.Statement, error)
+
+	// ClearPrepareData clears the prepared data from the session.
+	ClearPrepareData(stmtName string)
+
+	// GetPrepareData returns the prepared data for the statement from the session.
+	GetPrepareData(stmtName string) *vtgatepb.PrepareData
+
+	// StorePrepareData stores the prepared data in the session.
+	StorePrepareData(name string, v *vtgatepb.PrepareData)
 }
 
 // PlannerNameToVersion returns the numerical representation of the planner
 func PlannerNameToVersion(s string) (PlannerVersion, bool) {
+	deprecationMessage := "The V3 planner is deprecated and will be removed in future release of Vitess"
 	switch strings.ToLower(s) {
 	case "v3":
+		log.Warning(deprecationMessage)
 		return querypb.ExecuteOptions_V3, true
 	case "gen4":
 		return querypb.ExecuteOptions_Gen4, true
@@ -74,7 +105,11 @@ func PlannerNameToVersion(s string) (PlannerVersion, bool) {
 	case "gen4fallback":
 		return querypb.ExecuteOptions_Gen4WithFallback, true
 	case "gen4comparev3":
+		log.Warning(deprecationMessage)
 		return querypb.ExecuteOptions_Gen4CompareV3, true
+	case "v3insert":
+		log.Warning(deprecationMessage)
+		return querypb.ExecuteOptions_V3Insert, true
 	}
 	return 0, false
 }

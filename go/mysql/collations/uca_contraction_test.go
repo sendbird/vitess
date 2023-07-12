@@ -26,7 +26,9 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"vitess.io/vitess/go/mysql/collations/internal/charset"
+	"github.com/stretchr/testify/assert"
+
+	"vitess.io/vitess/go/mysql/collations/charset"
 	"vitess.io/vitess/go/mysql/collations/internal/uca"
 )
 
@@ -47,10 +49,10 @@ func findContractedCollations(t testing.TB, unique bool) (result []CollationWith
 	for _, collation := range testall() {
 		var contract uca.Contractor
 		if uca, ok := collation.(*Collation_utf8mb4_uca_0900); ok {
-			contract = uca.contract
+			contract = uca.uca.Contractor()
 		}
 		if uca, ok := collation.(*Collation_uca_legacy); ok {
-			contract = uca.contract
+			contract = uca.uca.Contractor()
 		}
 		if contract == nil {
 			continue
@@ -96,15 +98,10 @@ func findContractedCollations(t testing.TB, unique bool) (result []CollationWith
 }
 
 func testMatch(t *testing.T, name string, cnt uca.Contraction, result []uint16, remainder []byte, skip int) {
-	if !reflect.DeepEqual(cnt.Weights, result) {
-		t.Errorf("%s didn't match: expected %#v, got %#v", name, cnt.Weights, result)
-	}
-	if len(remainder) != 0 {
-		t.Errorf("%s bad remainder: %#v", name, remainder)
-	}
-	if skip != len(cnt.Path) {
-		t.Errorf("%s bad skipped length %d for %#v", name, skip, cnt.Path)
-	}
+	assert.True(t, reflect.DeepEqual(cnt.Weights, result), "%s didn't match: expected %#v, got %#v", name, cnt.Weights, result)
+	assert.Equal(t, 0, len(remainder), "%s bad remainder: %#v", name, remainder)
+	assert.Equal(t, len(cnt.Path), skip, "%s bad skipped length %d for %#v", name, skip, cnt.Path)
+
 }
 
 func TestUCAContractions(t *testing.T) {

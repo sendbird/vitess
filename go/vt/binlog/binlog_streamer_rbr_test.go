@@ -17,12 +17,12 @@ limitations under the License.
 package binlog
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
-	"context"
-
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/binlog"
 	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
@@ -42,7 +42,7 @@ func TestStreamerParseRBREvents(t *testing.T) {
 	// We only use the Columns.
 	se := schema.NewEngineForTests()
 	se.SetTableForTests(&schema.Table{
-		Name: sqlparser.NewTableIdent("vt_a"),
+		Name: sqlparser.NewIdentifierCS("vt_a"),
 		Fields: []*querypb.Field{{
 			Name: "id",
 			Type: querypb.Type_INT64,
@@ -59,8 +59,8 @@ func TestStreamerParseRBREvents(t *testing.T) {
 		Database: "vt_test_keyspace",
 		Name:     "vt_a",
 		Types: []byte{
-			mysql.TypeLong,
-			mysql.TypeVarchar,
+			binlog.TypeLong,
+			binlog.TypeVarchar,
 		},
 		CanBeNull: mysql.NewServerBitmap(2),
 		Metadata: []uint16{
@@ -175,6 +175,7 @@ func TestStreamerParseRBREvents(t *testing.T) {
 	}
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
 	want := []fullBinlogTransaction{
 		{
@@ -263,7 +264,7 @@ func TestStreamerParseRBREvents(t *testing.T) {
 	bls := NewStreamer(dbcfgs, se, nil, mysql.Position{}, 0, sendTransaction)
 
 	go sendTestEvents(events, input)
-	_, err := bls.parseEvents(context.Background(), events)
+	_, err := bls.parseEvents(context.Background(), events, errs)
 	if err != ErrServerEOF {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -287,7 +288,7 @@ func TestStreamerParseRBRNameEscapes(t *testing.T) {
 	// Create a schema.Engine for this test using keyword names.
 	se := schema.NewEngineForTests()
 	se.SetTableForTests(&schema.Table{
-		Name: sqlparser.NewTableIdent("insert"),
+		Name: sqlparser.NewIdentifierCS("insert"),
 		Fields: []*querypb.Field{{
 			Name: "update",
 			Type: querypb.Type_INT64,
@@ -304,8 +305,8 @@ func TestStreamerParseRBRNameEscapes(t *testing.T) {
 		Database: "vt_test_keyspace",
 		Name:     "insert",
 		Types: []byte{
-			mysql.TypeLong,
-			mysql.TypeVarchar,
+			binlog.TypeLong,
+			binlog.TypeVarchar,
 		},
 		CanBeNull: mysql.NewServerBitmap(2),
 		Metadata: []uint16{
@@ -420,6 +421,7 @@ func TestStreamerParseRBRNameEscapes(t *testing.T) {
 	}
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
 	want := []fullBinlogTransaction{
 		{
@@ -508,7 +510,7 @@ func TestStreamerParseRBRNameEscapes(t *testing.T) {
 	bls := NewStreamer(dbcfgs, se, nil, mysql.Position{}, 0, sendTransaction)
 
 	go sendTestEvents(events, input)
-	_, err := bls.parseEvents(context.Background(), events)
+	_, err := bls.parseEvents(context.Background(), events, errs)
 	if err != ErrServerEOF {
 		t.Errorf("unexpected error: %v", err)
 	}

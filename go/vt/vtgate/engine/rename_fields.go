@@ -17,9 +17,10 @@ limitations under the License.
 package engine
 
 import (
+	"context"
+
 	"vitess.io/vitess/go/sqltypes"
 	querypb "vitess.io/vitess/go/vt/proto/query"
-	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
 )
 
@@ -36,7 +37,7 @@ type RenameFields struct {
 // NewRenameField creates a new rename field
 func NewRenameField(cols []string, indices []int, input Primitive) (*RenameFields, error) {
 	if len(cols) != len(indices) {
-		return nil, vterrors.New(vtrpc.Code_INTERNAL, "Unequal length of columns and indices in RenameField primitive")
+		return nil, vterrors.VT13001("number of columns does not match number of indices in RenameField primitive")
 	}
 	return &RenameFields{
 		Cols:    cols,
@@ -61,8 +62,8 @@ func (r *RenameFields) GetTableName() string {
 }
 
 // TryExecute implements the Primitive interface
-func (r *RenameFields) TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
-	qr, err := vcursor.ExecutePrimitive(r.Input, bindVars, wantfields)
+func (r *RenameFields) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
+	qr, err := vcursor.ExecutePrimitive(ctx, r.Input, bindVars, wantfields)
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +84,7 @@ func (r *RenameFields) renameFields(qr *sqltypes.Result) {
 }
 
 // TryStreamExecute implements the Primitive interface
-func (r *RenameFields) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+func (r *RenameFields) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
 	if wantfields {
 		innerCallback := callback
 		callback = func(result *sqltypes.Result) error {
@@ -95,12 +96,12 @@ func (r *RenameFields) TryStreamExecute(vcursor VCursor, bindVars map[string]*qu
 			return innerCallback(result)
 		}
 	}
-	return vcursor.StreamExecutePrimitive(r.Input, bindVars, wantfields, callback)
+	return vcursor.StreamExecutePrimitive(ctx, r.Input, bindVars, wantfields, callback)
 }
 
 // GetFields implements the primitive interface
-func (r *RenameFields) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	qr, err := r.Input.GetFields(vcursor, bindVars)
+func (r *RenameFields) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	qr, err := r.Input.GetFields(ctx, vcursor, bindVars)
 	if err != nil {
 		return nil, err
 	}

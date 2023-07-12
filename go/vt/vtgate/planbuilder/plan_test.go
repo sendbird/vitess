@@ -17,51 +17,57 @@ limitations under the License.
 package planbuilder
 
 import (
-	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"testing"
 
-	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
-	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
-
-	"vitess.io/vitess/go/mysql/collations"
-	"vitess.io/vitess/go/vt/vtgate/semantics"
-
-	"github.com/google/go-cmp/cmp"
-
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
-	"vitess.io/vitess/go/vt/vterrors"
-
+	"github.com/nsf/jsondiff"
 	"github.com/stretchr/testify/require"
 
+	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/key"
-	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/topo/topoproto"
-	"vitess.io/vitess/go/vt/vtgate/engine"
-	"vitess.io/vitess/go/vt/vtgate/vindexes"
-
+	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
+	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/sidecardb"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vtgate/engine"
+	oprewriters "vitess.io/vitess/go/vt/vtgate/planbuilder/operators/rewrite"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
+	"vitess.io/vitess/go/vt/vtgate/semantics"
+	"vitess.io/vitess/go/vt/vtgate/vindexes"
 )
 
 // hashIndex is a functional, unique Vindex.
 type hashIndex struct{ name string }
 
-func (v *hashIndex) String() string   { return v.name }
-func (*hashIndex) Cost() int          { return 1 }
-func (*hashIndex) IsUnique() bool     { return true }
+func (v *hashIndex) String() string { return v.name }
+
+func (*hashIndex) Cost() int { return 1 }
+
+func (*hashIndex) IsUnique() bool { return true }
+
 func (*hashIndex) NeedsVCursor() bool { return false }
-func (*hashIndex) Verify(vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
+
+func (*hashIndex) Verify(context.Context, vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
 	return []bool{}, nil
 }
-func (*hashIndex) Map(cursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+
+func (*hashIndex) Map(ctx context.Context, vcursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	return nil, nil
 }
 
@@ -72,19 +78,31 @@ func newHashIndex(name string, _ map[string]string) (vindexes.Vindex, error) {
 // lookupIndex is a unique Vindex, and satisfies Lookup.
 type lookupIndex struct{ name string }
 
-func (v *lookupIndex) String() string   { return v.name }
-func (*lookupIndex) Cost() int          { return 2 }
-func (*lookupIndex) IsUnique() bool     { return true }
+func (v *lookupIndex) String() string { return v.name }
+
+func (*lookupIndex) Cost() int { return 2 }
+
+func (*lookupIndex) IsUnique() bool { return true }
+
 func (*lookupIndex) NeedsVCursor() bool { return false }
-func (*lookupIndex) Verify(vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
+
+func (*lookupIndex) Verify(context.Context, vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
 	return []bool{}, nil
 }
-func (*lookupIndex) Map(cursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+
+func (*lookupIndex) Map(ctx context.Context, vcursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	return nil, nil
 }
-func (*lookupIndex) Create(vindexes.VCursor, [][]sqltypes.Value, [][]byte, bool) error { return nil }
-func (*lookupIndex) Delete(vindexes.VCursor, [][]sqltypes.Value, []byte) error         { return nil }
-func (*lookupIndex) Update(vindexes.VCursor, []sqltypes.Value, []byte, []sqltypes.Value) error {
+
+func (*lookupIndex) Create(context.Context, vindexes.VCursor, [][]sqltypes.Value, [][]byte, bool) error {
+	return nil
+}
+
+func (*lookupIndex) Delete(context.Context, vindexes.VCursor, [][]sqltypes.Value, []byte) error {
+	return nil
+}
+
+func (*lookupIndex) Update(context.Context, vindexes.VCursor, []sqltypes.Value, []byte, []sqltypes.Value) error {
 	return nil
 }
 
@@ -97,20 +115,46 @@ var _ vindexes.Lookup = (*lookupIndex)(nil)
 // nameLkpIndex satisfies Lookup, NonUnique.
 type nameLkpIndex struct{ name string }
 
-func (v *nameLkpIndex) String() string   { return v.name }
-func (*nameLkpIndex) Cost() int          { return 3 }
-func (*nameLkpIndex) IsUnique() bool     { return false }
+func (v *nameLkpIndex) String() string { return v.name }
+
+func (*nameLkpIndex) Cost() int { return 3 }
+
+func (*nameLkpIndex) IsUnique() bool { return false }
+
 func (*nameLkpIndex) NeedsVCursor() bool { return false }
-func (*nameLkpIndex) Verify(vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
+
+func (*nameLkpIndex) AllowBatch() bool { return true }
+
+func (*nameLkpIndex) AutoCommitEnabled() bool { return false }
+
+func (*nameLkpIndex) GetCommitOrder() vtgatepb.CommitOrder { return vtgatepb.CommitOrder_NORMAL }
+
+func (*nameLkpIndex) Verify(context.Context, vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
 	return []bool{}, nil
 }
-func (*nameLkpIndex) Map(cursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+
+func (*nameLkpIndex) Map(ctx context.Context, vcursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	return nil, nil
 }
-func (*nameLkpIndex) Create(vindexes.VCursor, [][]sqltypes.Value, [][]byte, bool) error { return nil }
-func (*nameLkpIndex) Delete(vindexes.VCursor, [][]sqltypes.Value, []byte) error         { return nil }
-func (*nameLkpIndex) Update(vindexes.VCursor, []sqltypes.Value, []byte, []sqltypes.Value) error {
+
+func (*nameLkpIndex) Create(context.Context, vindexes.VCursor, [][]sqltypes.Value, [][]byte, bool) error {
 	return nil
+}
+
+func (*nameLkpIndex) Delete(context.Context, vindexes.VCursor, [][]sqltypes.Value, []byte) error {
+	return nil
+}
+
+func (*nameLkpIndex) Update(context.Context, vindexes.VCursor, []sqltypes.Value, []byte, []sqltypes.Value) error {
+	return nil
+}
+
+func (v *nameLkpIndex) Query() (string, []string) {
+	return "select name, keyspace_id from name_user_vdx where name in ::name", []string{"name"}
+}
+
+func (*nameLkpIndex) MapResult([]sqltypes.Value, []*sqltypes.Result) ([]key.Destination, error) {
+	return nil, nil
 }
 
 func newNameLkpIndex(name string, _ map[string]string) (vindexes.Vindex, error) {
@@ -118,24 +162,39 @@ func newNameLkpIndex(name string, _ map[string]string) (vindexes.Vindex, error) 
 }
 
 var _ vindexes.Vindex = (*nameLkpIndex)(nil)
+
 var _ vindexes.Lookup = (*nameLkpIndex)(nil)
+
+var _ vindexes.LookupPlanable = (*nameLkpIndex)(nil)
 
 // costlyIndex satisfies Lookup, NonUnique.
 type costlyIndex struct{ name string }
 
-func (v *costlyIndex) String() string   { return v.name }
-func (*costlyIndex) Cost() int          { return 10 }
-func (*costlyIndex) IsUnique() bool     { return false }
+func (v *costlyIndex) String() string { return v.name }
+
+func (*costlyIndex) Cost() int { return 10 }
+
+func (*costlyIndex) IsUnique() bool { return false }
+
 func (*costlyIndex) NeedsVCursor() bool { return false }
-func (*costlyIndex) Verify(vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
+
+func (*costlyIndex) Verify(context.Context, vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
 	return []bool{}, nil
 }
-func (*costlyIndex) Map(cursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+
+func (*costlyIndex) Map(ctx context.Context, vcursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	return nil, nil
 }
-func (*costlyIndex) Create(vindexes.VCursor, [][]sqltypes.Value, [][]byte, bool) error { return nil }
-func (*costlyIndex) Delete(vindexes.VCursor, [][]sqltypes.Value, []byte) error         { return nil }
-func (*costlyIndex) Update(vindexes.VCursor, []sqltypes.Value, []byte, []sqltypes.Value) error {
+
+func (*costlyIndex) Create(context.Context, vindexes.VCursor, [][]sqltypes.Value, [][]byte, bool) error {
+	return nil
+}
+
+func (*costlyIndex) Delete(context.Context, vindexes.VCursor, [][]sqltypes.Value, []byte) error {
+	return nil
+}
+
+func (*costlyIndex) Update(context.Context, vindexes.VCursor, []sqltypes.Value, []byte, []sqltypes.Value) error {
 	return nil
 }
 
@@ -144,6 +203,7 @@ func newCostlyIndex(name string, _ map[string]string) (vindexes.Vindex, error) {
 }
 
 var _ vindexes.Vindex = (*costlyIndex)(nil)
+
 var _ vindexes.Lookup = (*costlyIndex)(nil)
 
 // multiColIndex satisfies multi column vindex.
@@ -165,11 +225,11 @@ func (m *multiColIndex) IsUnique() bool { return true }
 
 func (m *multiColIndex) NeedsVCursor() bool { return false }
 
-func (m *multiColIndex) Map(vcursor vindexes.VCursor, rowsColValues [][]sqltypes.Value) ([]key.Destination, error) {
+func (m *multiColIndex) Map(ctx context.Context, vcursor vindexes.VCursor, rowsColValues [][]sqltypes.Value) ([]key.Destination, error) {
 	return nil, nil
 }
 
-func (m *multiColIndex) Verify(vcursor vindexes.VCursor, rowsColValues [][]sqltypes.Value, ksids [][]byte) ([]bool, error) {
+func (m *multiColIndex) Verify(ctx context.Context, vcursor vindexes.VCursor, rowsColValues [][]sqltypes.Value, ksids [][]byte) ([]bool, error) {
 	return []bool{}, nil
 }
 
@@ -185,29 +245,16 @@ func init() {
 	vindexes.Register("multiCol_test", newMultiColIndex)
 }
 
-const (
-	samePlanMarker  = "Gen4 plan same as above\n"
-	gen4ErrorPrefix = "Gen4 error: "
-)
-
 func makeTestOutput(t *testing.T) string {
-	testOutputTempDir, err := os.MkdirTemp("testdata", "plan_test")
-	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		if !t.Failed() {
-			_ = os.RemoveAll(testOutputTempDir)
-		} else {
-			t.Logf("Errors found in plantests. If the output is correct, run `cp %s/* testdata/` to update test expectations", testOutputTempDir)
-		}
-	})
+	testOutputTempDir := utils.MakeTestOutput(t, "testdata", "plan_test")
 
 	return testOutputTempDir
 }
 
 func TestPlan(t *testing.T) {
 	vschemaWrapper := &vschemaWrapper{
-		v:             loadSchema(t, "schema_test.json", true),
+		v:             loadSchema(t, "vschemas/schema.json", true),
+		tabletType:    topodatapb.TabletType_PRIMARY,
 		sysVarEnabled: true,
 	}
 	testOutputTempDir := makeTestOutput(t)
@@ -218,117 +265,168 @@ func TestPlan(t *testing.T) {
 	// the column is named as Id. This is to make sure that
 	// column names are case-preserved, but treated as
 	// case-insensitive even if they come from the vschema.
-	testFile(t, "aggr_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "dml_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "from_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "filter_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "postprocess_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "select_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "symtab_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "unsupported_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "vindex_func_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "wireup_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "memory_sort_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "use_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "set_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "union_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "transaction_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "lock_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "large_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "ddl_cases_no_default_keyspace.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "flush_cases_no_default_keyspace.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "show_cases_no_default_keyspace.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "stream_cases.txt", testOutputTempDir, vschemaWrapper)
-	testFile(t, "systemtables_cases.txt", testOutputTempDir, vschemaWrapper)
+	testFile(t, "aggr_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "dml_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "from_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "filter_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "postprocess_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "select_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "symtab_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "unsupported_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "vindex_func_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "wireup_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "memory_sort_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "use_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "set_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "union_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "large_union_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "transaction_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "lock_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "large_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "ddl_cases_no_default_keyspace.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "flush_cases_no_default_keyspace.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "show_cases_no_default_keyspace.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "stream_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "info_schema80_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "reference_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "vexplain_cases.json", testOutputTempDir, vschemaWrapper, false)
+	testFile(t, "misc_cases.json", testOutputTempDir, vschemaWrapper, false)
+}
+
+func TestSystemTables57(t *testing.T) {
+	// first we move everything to use 5.7 logic
+	servenv.SetMySQLServerVersionForTest("5.7")
+	defer servenv.SetMySQLServerVersionForTest("")
+	vschemaWrapper := &vschemaWrapper{v: loadSchema(t, "vschemas/schema.json", true)}
+	testOutputTempDir := makeTestOutput(t)
+	testFile(t, "info_schema57_cases.json", testOutputTempDir, vschemaWrapper, false)
 }
 
 func TestSysVarSetDisabled(t *testing.T) {
 	vschemaWrapper := &vschemaWrapper{
-		v:             loadSchema(t, "schema_test.json", true),
+		v:             loadSchema(t, "vschemas/schema.json", true),
 		sysVarEnabled: false,
 	}
 
-	testFile(t, "set_sysvar_disabled_cases.txt", makeTestOutput(t), vschemaWrapper)
+	testFile(t, "set_sysvar_disabled_cases.json", makeTestOutput(t), vschemaWrapper, false)
+}
+
+func TestViews(t *testing.T) {
+	vschemaWrapper := &vschemaWrapper{
+		v:           loadSchema(t, "vschemas/schema.json", true),
+		enableViews: true,
+	}
+
+	testFile(t, "view_cases.json", makeTestOutput(t), vschemaWrapper, false)
 }
 
 func TestOne(t *testing.T) {
+	reset := oprewriters.EnableDebugPrinting()
+	defer reset()
+
 	vschema := &vschemaWrapper{
-		v: loadSchema(t, "schema_test.json", true),
+		v: loadSchema(t, "vschemas/schema.json", true),
 	}
 
-	testFile(t, "onecase.txt", "", vschema)
+	testFile(t, "onecase.json", "", vschema, false)
+}
+
+func TestOneTPCC(t *testing.T) {
+	vschema := &vschemaWrapper{
+		v: loadSchema(t, "vschemas/tpcc_schema.json", true),
+	}
+
+	testFile(t, "onecase.json", "", vschema, false)
 }
 
 func TestOneWithMainAsDefault(t *testing.T) {
 	vschema := &vschemaWrapper{
-		v: loadSchema(t, "schema_test.json", true),
+		v: loadSchema(t, "vschemas/schema.json", true),
 		keyspace: &vindexes.Keyspace{
 			Name:    "main",
 			Sharded: false,
 		},
 	}
 
-	testFile(t, "onecase.txt", "", vschema)
+	testFile(t, "onecase.json", "", vschema, false)
 }
 
 func TestOneWithSecondUserAsDefault(t *testing.T) {
 	vschema := &vschemaWrapper{
-		v: loadSchema(t, "schema_test.json", true),
+		v: loadSchema(t, "vschemas/schema.json", true),
 		keyspace: &vindexes.Keyspace{
 			Name:    "second_user",
 			Sharded: true,
 		},
 	}
 
-	testFile(t, "onecase.txt", "", vschema)
+	testFile(t, "onecase.json", "", vschema, false)
 }
 
 func TestOneWithUserAsDefault(t *testing.T) {
 	vschema := &vschemaWrapper{
-		v: loadSchema(t, "schema_test.json", true),
+		v: loadSchema(t, "vschemas/schema.json", true),
 		keyspace: &vindexes.Keyspace{
 			Name:    "user",
 			Sharded: true,
 		},
 	}
 
-	testFile(t, "onecase.txt", "", vschema)
+	testFile(t, "onecase.json", "", vschema, false)
+}
+
+func TestOneWithTPCHVSchema(t *testing.T) {
+	vschema := &vschemaWrapper{
+		v:             loadSchema(t, "vschemas/tpch_schema.json", true),
+		sysVarEnabled: true,
+	}
+
+	testFile(t, "onecase.json", "", vschema, false)
+}
+
+func TestOneWith57Version(t *testing.T) {
+	// first we move everything to use 5.7 logic
+	servenv.SetMySQLServerVersionForTest("5.7")
+	defer servenv.SetMySQLServerVersionForTest("")
+	vschema := &vschemaWrapper{v: loadSchema(t, "vschemas/schema.json", true)}
+
+	testFile(t, "onecase.json", "", vschema, false)
 }
 
 func TestRubyOnRailsQueries(t *testing.T) {
 	vschemaWrapper := &vschemaWrapper{
-		v:             loadSchema(t, "rails_schema_test.json", true),
+		v:             loadSchema(t, "vschemas/rails_schema.json", true),
 		sysVarEnabled: true,
 	}
 
-	testFile(t, "rails_cases.txt", makeTestOutput(t), vschemaWrapper)
+	testFile(t, "rails_cases.json", makeTestOutput(t), vschemaWrapper, false)
 }
 
 func TestOLTP(t *testing.T) {
 	vschemaWrapper := &vschemaWrapper{
-		v:             loadSchema(t, "oltp_schema_test.json", true),
+		v:             loadSchema(t, "vschemas/oltp_schema.json", true),
 		sysVarEnabled: true,
 	}
 
-	testFile(t, "oltp_cases.txt", makeTestOutput(t), vschemaWrapper)
+	testFile(t, "oltp_cases.json", makeTestOutput(t), vschemaWrapper, false)
 }
 
 func TestTPCC(t *testing.T) {
 	vschemaWrapper := &vschemaWrapper{
-		v:             loadSchema(t, "tpcc_schema_test.json", true),
+		v:             loadSchema(t, "vschemas/tpcc_schema.json", true),
 		sysVarEnabled: true,
 	}
 
-	testFile(t, "tpcc_cases.txt", makeTestOutput(t), vschemaWrapper)
+	testFile(t, "tpcc_cases.json", makeTestOutput(t), vschemaWrapper, false)
 }
 
 func TestTPCH(t *testing.T) {
 	vschemaWrapper := &vschemaWrapper{
-		v:             loadSchema(t, "tpch_schema_test.json", true),
+		v:             loadSchema(t, "vschemas/tpch_schema.json", true),
 		sysVarEnabled: true,
 	}
 
-	testFile(t, "tpch_cases.txt", makeTestOutput(t), vschemaWrapper)
+	testFile(t, "tpch_cases.json", makeTestOutput(t), vschemaWrapper, false)
 }
 
 func BenchmarkOLTP(b *testing.B) {
@@ -345,14 +443,11 @@ func BenchmarkTPCH(b *testing.B) {
 
 func benchmarkWorkload(b *testing.B, name string) {
 	vschemaWrapper := &vschemaWrapper{
-		v:             loadSchema(b, name+"_schema_test.json", true),
+		v:             loadSchema(b, "vschemas/"+name+"_schema.json", true),
 		sysVarEnabled: true,
 	}
 
-	var testCases []testCase
-	for tc := range iterateExecFile(name + "_cases.txt") {
-		testCases = append(testCases, tc)
-	}
+	testCases := readJSONTests(name + "_cases.json")
 	b.ResetTimer()
 	for _, version := range plannerVersions {
 		b.Run(version.String(), func(b *testing.B) {
@@ -363,7 +458,7 @@ func benchmarkWorkload(b *testing.B, name string) {
 
 func TestBypassPlanningShardTargetFromFile(t *testing.T) {
 	vschema := &vschemaWrapper{
-		v: loadSchema(t, "schema_test.json", true),
+		v: loadSchema(t, "vschemas/schema.json", true),
 		keyspace: &vindexes.Keyspace{
 			Name:    "main",
 			Sharded: false,
@@ -371,13 +466,14 @@ func TestBypassPlanningShardTargetFromFile(t *testing.T) {
 		tabletType: topodatapb.TabletType_PRIMARY,
 		dest:       key.DestinationShard("-80")}
 
-	testFile(t, "bypass_shard_cases.txt", makeTestOutput(t), vschema)
+	testFile(t, "bypass_shard_cases.json", makeTestOutput(t), vschema, false)
 }
+
 func TestBypassPlanningKeyrangeTargetFromFile(t *testing.T) {
 	keyRange, _ := key.ParseShardingSpec("-")
 
 	vschema := &vschemaWrapper{
-		v: loadSchema(t, "schema_test.json", true),
+		v: loadSchema(t, "vschemas/schema.json", true),
 		keyspace: &vindexes.Keyspace{
 			Name:    "main",
 			Sharded: false,
@@ -386,33 +482,46 @@ func TestBypassPlanningKeyrangeTargetFromFile(t *testing.T) {
 		dest:       key.DestinationExactKeyRange{KeyRange: keyRange[0]},
 	}
 
-	testFile(t, "bypass_keyrange_cases.txt", makeTestOutput(t), vschema)
+	testFile(t, "bypass_keyrange_cases.json", makeTestOutput(t), vschema, false)
 }
 
 func TestWithDefaultKeyspaceFromFile(t *testing.T) {
 	// We are testing this separately so we can set a default keyspace
 	vschema := &vschemaWrapper{
-		v: loadSchema(t, "schema_test.json", true),
+		v: loadSchema(t, "vschemas/schema.json", true),
 		keyspace: &vindexes.Keyspace{
 			Name:    "main",
 			Sharded: false,
 		},
 		tabletType: topodatapb.TabletType_PRIMARY,
 	}
+	ts := memorytopo.NewServer("cell1")
+	ts.CreateKeyspace(context.Background(), "main", &topodatapb.Keyspace{})
+	ts.CreateKeyspace(context.Background(), "user", &topodatapb.Keyspace{})
+	// Create a cache to use for lookups of the sidecar database identifier
+	// in use by each keyspace.
+	_, created := sidecardb.NewIdentifierCache(func(ctx context.Context, keyspace string) (string, error) {
+		ki, err := ts.GetKeyspace(ctx, keyspace)
+		if err != nil {
+			return "", err
+		}
+		return ki.SidecarDbName, nil
+	})
+	require.True(t, created)
 
 	testOutputTempDir := makeTestOutput(t)
-	testFile(t, "alterVschema_cases.txt", testOutputTempDir, vschema)
-	testFile(t, "ddl_cases.txt", testOutputTempDir, vschema)
-	testFile(t, "migration_cases.txt", testOutputTempDir, vschema)
-	testFile(t, "flush_cases.txt", testOutputTempDir, vschema)
-	testFile(t, "show_cases.txt", testOutputTempDir, vschema)
-	testFile(t, "call_cases.txt", testOutputTempDir, vschema)
+	testFile(t, "alterVschema_cases.json", testOutputTempDir, vschema, false)
+	testFile(t, "ddl_cases.json", testOutputTempDir, vschema, false)
+	testFile(t, "migration_cases.json", testOutputTempDir, vschema, false)
+	testFile(t, "flush_cases.json", testOutputTempDir, vschema, false)
+	testFile(t, "show_cases.json", testOutputTempDir, vschema, false)
+	testFile(t, "call_cases.json", testOutputTempDir, vschema, false)
 }
 
 func TestWithDefaultKeyspaceFromFileSharded(t *testing.T) {
 	// We are testing this separately so we can set a default keyspace
 	vschema := &vschemaWrapper{
-		v: loadSchema(t, "schema_test.json", true),
+		v: loadSchema(t, "vschemas/schema.json", true),
 		keyspace: &vindexes.Keyspace{
 			Name:    "second_user",
 			Sharded: true,
@@ -421,13 +530,13 @@ func TestWithDefaultKeyspaceFromFileSharded(t *testing.T) {
 	}
 
 	testOutputTempDir := makeTestOutput(t)
-	testFile(t, "select_cases_with_default.txt", testOutputTempDir, vschema)
+	testFile(t, "select_cases_with_default.json", testOutputTempDir, vschema, false)
 }
 
 func TestWithUserDefaultKeyspaceFromFileSharded(t *testing.T) {
 	// We are testing this separately so we can set a default keyspace
 	vschema := &vschemaWrapper{
-		v: loadSchema(t, "schema_test.json", true),
+		v: loadSchema(t, "vschemas/schema.json", true),
 		keyspace: &vindexes.Keyspace{
 			Name:    "user",
 			Sharded: true,
@@ -436,24 +545,24 @@ func TestWithUserDefaultKeyspaceFromFileSharded(t *testing.T) {
 	}
 
 	testOutputTempDir := makeTestOutput(t)
-	testFile(t, "select_cases_with_user_as_default.txt", testOutputTempDir, vschema)
+	testFile(t, "select_cases_with_user_as_default.json", testOutputTempDir, vschema, false)
 }
 
 func TestWithSystemSchemaAsDefaultKeyspace(t *testing.T) {
 	// We are testing this separately so we can set a default keyspace
 	vschema := &vschemaWrapper{
-		v:          loadSchema(t, "schema_test.json", true),
+		v:          loadSchema(t, "vschemas/schema.json", true),
 		keyspace:   &vindexes.Keyspace{Name: "information_schema"},
 		tabletType: topodatapb.TabletType_PRIMARY,
 	}
 
-	testFile(t, "sysschema_default.txt", makeTestOutput(t), vschema)
+	testFile(t, "sysschema_default.json", makeTestOutput(t), vschema, false)
 }
 
 func TestOtherPlanningFromFile(t *testing.T) {
 	// We are testing this separately so we can set a default keyspace
 	vschema := &vschemaWrapper{
-		v: loadSchema(t, "schema_test.json", true),
+		v: loadSchema(t, "vschemas/schema.json", true),
 		keyspace: &vindexes.Keyspace{
 			Name:    "main",
 			Sharded: false,
@@ -462,8 +571,8 @@ func TestOtherPlanningFromFile(t *testing.T) {
 	}
 
 	testOutputTempDir := makeTestOutput(t)
-	testFile(t, "other_read_cases.txt", testOutputTempDir, vschema)
-	testFile(t, "other_admin_cases.txt", testOutputTempDir, vschema)
+	testFile(t, "other_read_cases.json", testOutputTempDir, vschema, false)
+	testFile(t, "other_admin_cases.json", testOutputTempDir, vschema, false)
 }
 
 func loadSchema(t testing.TB, filename string, setCollation bool) *vindexes.VSchema {
@@ -478,6 +587,15 @@ func loadSchema(t testing.TB, filename string, setCollation bool) *vindexes.VSch
 	for _, ks := range vschema.Keyspaces {
 		if ks.Error != nil {
 			t.Fatal(ks.Error)
+		}
+
+		// adding view in user keyspace
+		if ks.Keyspace.Name == "user" {
+			if err = vschema.AddView(ks.Keyspace.Name,
+				"user_details_view",
+				"select user.id, user_extra.col from user join user_extra on user.id = user_extra.user_id"); err != nil {
+				t.Fatal(err)
+			}
 		}
 
 		// setting a default value to all the text columns in the tables of this keyspace
@@ -505,6 +623,56 @@ type vschemaWrapper struct {
 	dest          key.Destination
 	sysVarEnabled bool
 	version       plancontext.PlannerVersion
+	enableViews   bool
+}
+
+func (vw *vschemaWrapper) GetPrepareData(stmtName string) *vtgatepb.PrepareData {
+	switch stmtName {
+	case "prep_one_param":
+		return &vtgatepb.PrepareData{
+			PrepareStatement: "select 1 from user where id = :v1",
+			ParamsCount:      1,
+		}
+	case "prep_in_param":
+		return &vtgatepb.PrepareData{
+			PrepareStatement: "select 1 from user where id in (:v1, :v2)",
+			ParamsCount:      2,
+		}
+	case "prep_no_param":
+		return &vtgatepb.PrepareData{
+			PrepareStatement: "select 1 from user",
+			ParamsCount:      0,
+		}
+	}
+	return nil
+}
+
+func (vw *vschemaWrapper) PlanPrepareStatement(ctx context.Context, query string) (*engine.Plan, sqlparser.Statement, error) {
+	plan, err := TestBuilder(query, vw, vw.currentDb())
+	if err != nil {
+		return nil, nil, err
+	}
+	stmt, _, err := sqlparser.Parse2(query)
+	if err != nil {
+		return nil, nil, err
+	}
+	return plan, stmt, nil
+}
+
+func (vw *vschemaWrapper) ClearPrepareData(lowered string) {
+}
+
+func (vw *vschemaWrapper) StorePrepareData(string, *vtgatepb.PrepareData) {}
+
+func (vw *vschemaWrapper) GetUDV(name string) *querypb.BindVariable {
+	if strings.EqualFold(name, "prep_stmt") {
+		return sqltypes.StringBindVariable("select * from user where id in (?, ?, ?)")
+	}
+	return nil
+}
+
+func (vw *vschemaWrapper) IsShardRoutingEnabled() bool {
+	return false
 }
 
 func (vw *vschemaWrapper) GetVSchema() *vindexes.VSchema {
@@ -526,7 +694,7 @@ func (vw *vschemaWrapper) GetSrvVschema() *vschemapb.SrvVSchema {
 }
 
 func (vw *vschemaWrapper) ConnCollation() collations.ID {
-	return collations.Unknown
+	return collations.CollationUtf8ID
 }
 
 func (vw *vschemaWrapper) PlannerWarning(_ string) {
@@ -538,7 +706,7 @@ func (vw *vschemaWrapper) ForeignKeyMode() string {
 
 func (vw *vschemaWrapper) AllKeyspace() ([]*vindexes.Keyspace, error) {
 	if vw.keyspace == nil {
-		return nil, errors.New("keyspace not available")
+		return nil, vterrors.VT13001("keyspace not available")
 	}
 	return []*vindexes.Keyspace{vw.keyspace}, nil
 }
@@ -546,7 +714,7 @@ func (vw *vschemaWrapper) AllKeyspace() ([]*vindexes.Keyspace, error) {
 // FindKeyspace implements the VSchema interface
 func (vw *vschemaWrapper) FindKeyspace(keyspace string) (*vindexes.Keyspace, error) {
 	if vw.keyspace == nil {
-		return nil, errors.New("keyspace not available")
+		return nil, vterrors.VT13001("keyspace not available")
 	}
 	if vw.keyspace.Name == keyspace {
 		return vw.keyspace, nil
@@ -587,11 +755,11 @@ func (vw *vschemaWrapper) TargetDestination(qualifier string) (key.Destination, 
 		keyspaceName = qualifier
 	}
 	if keyspaceName == "" {
-		return nil, nil, 0, vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, "keyspace not specified")
+		return nil, nil, 0, vterrors.VT03007()
 	}
 	keyspace := vw.v.Keyspaces[keyspaceName]
 	if keyspace == nil {
-		return nil, nil, 0, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.BadDb, "Unknown database '%s' in vschema", keyspaceName)
+		return nil, nil, 0, vterrors.VT05003(keyspaceName)
 	}
 	return vw.dest, keyspace.Keyspace, vw.tabletType, nil
 
@@ -617,7 +785,31 @@ func (vw *vschemaWrapper) FindTable(tab sqlparser.TableName) (*vindexes.Table, s
 	return table, destKeyspace, destTabletType, destTarget, nil
 }
 
+func (vw *vschemaWrapper) FindView(tab sqlparser.TableName) sqlparser.SelectStatement {
+	destKeyspace, _, _, err := topoproto.ParseDestination(tab.Qualifier.String(), topodatapb.TabletType_PRIMARY)
+	if err != nil {
+		return nil
+	}
+	return vw.v.FindView(destKeyspace, tab.Name.String())
+}
+
 func (vw *vschemaWrapper) FindTableOrVindex(tab sqlparser.TableName) (*vindexes.Table, vindexes.Vindex, string, topodatapb.TabletType, key.Destination, error) {
+	if tab.Qualifier.IsEmpty() && tab.Name.String() == "dual" {
+		ksName := vw.getActualKeyspace()
+		var ks *vindexes.Keyspace
+		if ksName == "" {
+			ks = vw.getfirstKeyspace()
+			ksName = ks.Name
+		} else {
+			ks = vw.v.Keyspaces[ksName].Keyspace
+		}
+		tbl := &vindexes.Table{
+			Name:     sqlparser.NewIdentifierCS("dual"),
+			Keyspace: ks,
+			Type:     vindexes.TypeReference,
+		}
+		return tbl, nil, ksName, topodatapb.TabletType_PRIMARY, nil, nil
+	}
 	destKeyspace, destTabletType, destTarget, err := topoproto.ParseDestination(tab.Qualifier.String(), topodatapb.TabletType_PRIMARY)
 	if err != nil {
 		return nil, nil, destKeyspace, destTabletType, destTarget, err
@@ -630,6 +822,17 @@ func (vw *vschemaWrapper) FindTableOrVindex(tab sqlparser.TableName) (*vindexes.
 		return nil, nil, destKeyspace, destTabletType, destTarget, err
 	}
 	return table, vindex, destKeyspace, destTabletType, destTarget, nil
+}
+
+func (vw *vschemaWrapper) getfirstKeyspace() (ks *vindexes.Keyspace) {
+	var f string
+	for name, schema := range vw.v.Keyspaces {
+		if f == "" || f > name {
+			f = name
+			ks = schema.Keyspace
+		}
+	}
+	return
 }
 
 func (vw *vschemaWrapper) getActualKeyspace() string {
@@ -681,35 +884,67 @@ func (vw *vschemaWrapper) currentDb() string {
 	return ksName
 }
 
-func escapeNewLines(in string) string {
-	return strings.ReplaceAll(in, "\n", "\\n")
+func (vw *vschemaWrapper) FindRoutedShard(keyspace, shard string) (string, error) {
+	return "", nil
 }
 
-func testFile(t *testing.T, filename, tempDir string, vschema *vschemaWrapper) {
+func (vw *vschemaWrapper) IsViewsEnabled() bool {
+	return vw.enableViews
+}
+
+type (
+	planTest struct {
+		Comment  string          `json:"comment,omitempty"`
+		Query    string          `json:"query,omitempty"`
+		Plan     json.RawMessage `json:"plan,omitempty"`
+		V3Plan   json.RawMessage `json:"v3-plan,omitempty"`
+		Gen4Plan json.RawMessage `json:"gen4-plan,omitempty"`
+	}
+)
+
+func testFile(t *testing.T, filename, tempDir string, vschema *vschemaWrapper, render bool) {
+	opts := jsondiff.DefaultConsoleOptions()
+
 	t.Run(filename, func(t *testing.T) {
-		expected := &strings.Builder{}
+		var expected []planTest
 		var outFirstPlanner string
-		for tcase := range iterateExecFile(filename) {
-			t.Run(fmt.Sprintf("%d V3: %s", tcase.lineno, tcase.comments), func(t *testing.T) {
+		for _, tcase := range readJSONTests(filename) {
+			if tcase.V3Plan == nil {
+				tcase.V3Plan = tcase.Plan
+				tcase.Gen4Plan = tcase.Plan
+			}
+			current := planTest{}
+			testName := tcase.Comment
+			if testName == "" {
+				testName = tcase.Query
+			}
+			if tcase.Query == "" {
+				continue
+			}
+			t.Run(fmt.Sprintf("V3: %s", testName), func(t *testing.T) {
 				vschema.version = V3
-				plan, err := TestBuilder(tcase.input, vschema, vschema.currentDb())
+				plan, err := TestBuilder(tcase.Query, vschema, vschema.currentDb())
+				if render && plan != nil {
+					viz, err := engine.GraphViz(plan.Instructions)
+					if err == nil {
+						_ = viz.Render()
+					}
+				}
 				out := getPlanOrErrorOutput(err, plan)
 
-				if out != tcase.output {
-					t.Errorf("V3 - %s:%d\nDiff:\n%s\n[%s] \n[%s]", filename, tcase.lineno, cmp.Diff(tcase.output, out), tcase.output, out)
+				compare, s := jsondiff.Compare(tcase.V3Plan, []byte(out), &opts)
+				if compare != jsondiff.FullMatch {
+					t.Errorf("V3 - %s\nDiff:\n%s\n[%s] \n[%s]", filename, s, tcase.V3Plan, out)
 				}
-				if err != nil {
-					out = `"` + out + `"`
-				}
-				outFirstPlanner = out
 
-				expected.WriteString(fmt.Sprintf("%s\"%s\"\n%s\n", tcase.comments, escapeNewLines(tcase.input), out))
+				outFirstPlanner = out
+				current.Comment = testName
+				current.Query = tcase.Query
 			})
 
 			vschema.version = Gen4
-			out, err := getPlanOutput(tcase, vschema)
-			if err != nil && tcase.output2ndPlanner == "" && strings.HasPrefix(err.Error(), "gen4 does not yet support") {
-				expected.WriteString("\n")
+			out, err := getPlanOutput(tcase, vschema, render)
+			if err != nil && len(tcase.Gen4Plan) == 0 && strings.HasPrefix(err.Error(), "gen4 does not yet support") {
 				continue
 			}
 
@@ -720,178 +955,96 @@ func testFile(t *testing.T, filename, tempDir string, vschema *vschemaWrapper) {
 			//       this is shown by not having any info at all after the result for the V3 planner
 			//       with this last expectation, it is an error if the Gen4 planner
 			//       produces the same plan as the V3 planner does
-			testName := fmt.Sprintf("%d Gen4: %s", tcase.lineno, tcase.comments)
-			t.Run(testName, func(t *testing.T) {
-				if out != tcase.output2ndPlanner {
-					t.Errorf("Gen4 - %s:%d\nDiff:\n%s\n[%s] \n[%s]", filename, tcase.lineno, cmp.Diff(tcase.output2ndPlanner, out), tcase.output2ndPlanner, out)
-				}
-				if err != nil {
-					out = `"` + out + `"`
+			t.Run(fmt.Sprintf("Gen4: %s", testName), func(t *testing.T) {
+				compare, s := jsondiff.Compare(tcase.Gen4Plan, []byte(out), &opts)
+				if compare != jsondiff.FullMatch {
+					t.Errorf("Gen4 - %s\nDiff:\n%s\n[%s] \n[%s]", filename, s, tcase.Gen4Plan, out)
 				}
 
 				if outFirstPlanner == out {
-					expected.WriteString(samePlanMarker)
+					current.Plan = []byte(out)
 				} else {
-					if err != nil {
-						out = out[1 : len(out)-1] // remove the double quotes
-						expected.WriteString(fmt.Sprintf("Gen4 error: %s\n", out))
-					} else {
-						expected.WriteString(fmt.Sprintf("%s\n", out))
-					}
+					current.V3Plan = []byte(outFirstPlanner)
+					current.Gen4Plan = []byte(out)
 				}
 			})
-			expected.WriteString("\n")
+			expected = append(expected, current)
 		}
-
 		if tempDir != "" {
-			gotFile := fmt.Sprintf("%s/%s", tempDir, filename)
-			_ = os.WriteFile(gotFile, []byte(strings.TrimSpace(expected.String())+"\n"), 0644)
+			name := strings.TrimSuffix(filename, filepath.Ext(filename))
+			name = filepath.Join(tempDir, name+".json")
+			file, err := os.Create(name)
+			require.NoError(t, err)
+			enc := json.NewEncoder(file)
+			enc.SetEscapeHTML(false)
+			enc.SetIndent("", "  ")
+			err = enc.Encode(expected)
+			if err != nil {
+				require.NoError(t, err)
+			}
 		}
 	})
 }
 
-func getPlanOutput(tcase testCase, vschema *vschemaWrapper) (out string, err error) {
+func readJSONTests(filename string) []planTest {
+	var output []planTest
+	file, err := os.Open(locateFile(filename))
+	if err != nil {
+		panic(err)
+	}
+	dec := json.NewDecoder(file)
+	err = dec.Decode(&output)
+	if err != nil {
+		panic(err)
+	}
+	return output
+}
+
+func getPlanOutput(tcase planTest, vschema *vschemaWrapper, render bool) (out string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			out = fmt.Sprintf("panicked: %v\n%s", r, string(debug.Stack()))
 		}
 	}()
-	plan, err := TestBuilder(tcase.input, vschema, vschema.currentDb())
+	plan, err := TestBuilder(tcase.Query, vschema, vschema.currentDb())
+	if render && plan != nil {
+		viz, err := engine.GraphViz(plan.Instructions)
+		if err == nil {
+			_ = viz.Render()
+		}
+	}
 	out = getPlanOrErrorOutput(err, plan)
 	return out, err
 }
 
 func getPlanOrErrorOutput(err error, plan *engine.Plan) string {
 	if err != nil {
-		return err.Error()
+		return "\"" + err.Error() + "\""
 	}
-	bout, _ := json.MarshalIndent(plan, "", "  ")
-	return string(bout)
-}
-
-type testCase struct {
-	file             string
-	lineno           int
-	input            string
-	output           string
-	output2ndPlanner string
-	comments         string
-}
-
-func iterateExecFile(name string) (testCaseIterator chan testCase) {
-	name = locateFile(name)
-	fd, err := os.OpenFile(name, os.O_RDONLY, 0)
+	b := new(bytes.Buffer)
+	enc := json.NewEncoder(b)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	err = enc.Encode(plan)
 	if err != nil {
-		panic(fmt.Sprintf("Could not open file %s", name))
+		panic(err)
 	}
-	testCaseIterator = make(chan testCase)
-	var comments string
-	go func() {
-		defer close(testCaseIterator)
-
-		r := bufio.NewReader(fd)
-		lineno := 0
-		for {
-			binput, err := r.ReadBytes('\n')
-			if err != nil {
-				if err != io.EOF {
-					panic(fmt.Errorf("error reading file %s: line %d: %s", name, lineno, err.Error()))
-				}
-				break
-			}
-			lineno++
-			input := string(binput)
-			if input == "" || input == "\n" || strings.HasPrefix(input, "Length:") {
-				continue
-			}
-			if input[0] == '#' {
-				comments = comments + input
-				continue
-			}
-			err = json.Unmarshal(binput, &input)
-			if err != nil {
-				panic(fmt.Sprintf("Line: %d, input: %s, error: %v\n", lineno, binput, err))
-			}
-			input = strings.Trim(input, "\"")
-			var output []byte
-			for {
-				l, err := r.ReadBytes('\n')
-				lineno++
-				if err != nil {
-					panic(fmt.Sprintf("error reading file %s line# %d: %s", name, lineno, err.Error()))
-				}
-				output = append(output, l...)
-				if l[0] == '}' {
-					output = output[:len(output)-1]
-					break
-				}
-				if l[0] == '"' {
-					output = output[1 : len(output)-2]
-					break
-				}
-			}
-
-			binput, err = r.ReadBytes('\n')
-			lineno++
-			var output2Planner []byte
-			if err != nil && err != io.EOF {
-				panic(fmt.Sprintf("error reading file %s line# %d: %s", name, lineno, err.Error()))
-			}
-			nextLine := string(binput)
-			switch {
-			case nextLine == samePlanMarker:
-				output2Planner = output
-			case strings.HasPrefix(nextLine, "{"):
-				output2Planner = append(output2Planner, binput...)
-				for {
-					l, err := r.ReadBytes('\n')
-					lineno++
-					if err != nil {
-						panic(fmt.Sprintf("error reading file %s line# %d: %s", name, lineno, err.Error()))
-					}
-					output2Planner = append(output2Planner, l...)
-					if l[0] == '}' {
-						output2Planner = output2Planner[:len(output2Planner)-1]
-						break
-					}
-					if l[0] == '"' {
-						output2Planner = output2Planner[1 : len(output2Planner)-2]
-						break
-					}
-				}
-			case strings.HasPrefix(nextLine, gen4ErrorPrefix):
-				output2Planner = []byte(nextLine[len(gen4ErrorPrefix) : len(nextLine)-1])
-			}
-			testCaseIterator <- testCase{
-				file:             name,
-				lineno:           lineno,
-				input:            input,
-				output:           string(output),
-				output2ndPlanner: string(output2Planner),
-				comments:         comments,
-			}
-			comments = ""
-		}
-	}()
-	return testCaseIterator
+	return b.String()
 }
 
 func locateFile(name string) string {
 	return "testdata/" + name
 }
 
-var benchMarkFiles = []string{"from_cases.txt", "filter_cases.txt", "large_cases.txt", "aggr_cases.txt", "select_cases.txt", "union_cases.txt"}
+var benchMarkFiles = []string{"from_cases.json", "filter_cases.json", "large_cases.json", "aggr_cases.json", "select_cases.json", "union_cases.json"}
 
 func BenchmarkPlanner(b *testing.B) {
 	vschema := &vschemaWrapper{
-		v:             loadSchema(b, "schema_test.json", true),
+		v:             loadSchema(b, "vschemas/schema.json", true),
 		sysVarEnabled: true,
 	}
 	for _, filename := range benchMarkFiles {
-		var testCases []testCase
-		for tc := range iterateExecFile(filename) {
-			testCases = append(testCases, tc)
-		}
+		testCases := readJSONTests(filename)
 		b.Run(filename+"-v3", func(b *testing.B) {
 			benchmarkPlanner(b, V3, testCases, vschema)
 		})
@@ -906,14 +1059,14 @@ func BenchmarkPlanner(b *testing.B) {
 
 func BenchmarkSemAnalysis(b *testing.B) {
 	vschema := &vschemaWrapper{
-		v:             loadSchema(b, "schema_test.json", true),
+		v:             loadSchema(b, "vschemas/schema.json", true),
 		sysVarEnabled: true,
 	}
 
 	for i := 0; i < b.N; i++ {
 		for _, filename := range benchMarkFiles {
-			for tc := range iterateExecFile(filename) {
-				exerciseAnalyzer(tc.input, vschema.currentDb(), vschema)
+			for _, tc := range readJSONTests(filename) {
+				exerciseAnalyzer(tc.Query, vschema.currentDb(), vschema)
 			}
 		}
 	}
@@ -939,23 +1092,13 @@ func exerciseAnalyzer(query, database string, s semantics.SchemaInformation) {
 
 func BenchmarkSelectVsDML(b *testing.B) {
 	vschema := &vschemaWrapper{
-		v:             loadSchema(b, "schema_test.json", true),
+		v:             loadSchema(b, "vschemas/schema.json", true),
 		sysVarEnabled: true,
 		version:       V3,
 	}
 
-	var dmlCases []testCase
-	var selectCases []testCase
-
-	for tc := range iterateExecFile("dml_cases.txt") {
-		dmlCases = append(dmlCases, tc)
-	}
-
-	for tc := range iterateExecFile("select_cases.txt") {
-		if tc.output2ndPlanner != "" {
-			selectCases = append(selectCases, tc)
-		}
-	}
+	dmlCases := readJSONTests("dml_cases.json")
+	selectCases := readJSONTests("select_cases.json")
 
 	rand.Shuffle(len(dmlCases), func(i, j int) {
 		dmlCases[i], dmlCases[j] = dmlCases[j], dmlCases[i]
@@ -974,13 +1117,13 @@ func BenchmarkSelectVsDML(b *testing.B) {
 	})
 }
 
-func benchmarkPlanner(b *testing.B, version plancontext.PlannerVersion, testCases []testCase, vschema *vschemaWrapper) {
+func benchmarkPlanner(b *testing.B, version plancontext.PlannerVersion, testCases []planTest, vschema *vschemaWrapper) {
 	b.ReportAllocs()
 	for n := 0; n < b.N; n++ {
 		for _, tcase := range testCases {
-			if tcase.output2ndPlanner != "" {
+			if len(tcase.Gen4Plan) > 0 {
 				vschema.version = version
-				_, _ = TestBuilder(tcase.input, vschema, vschema.currentDb())
+				_, _ = TestBuilder(tcase.Query, vschema, vschema.currentDb())
 			}
 		}
 	}

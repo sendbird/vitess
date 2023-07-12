@@ -18,7 +18,6 @@ limitations under the License.
 package streamlog
 
 import (
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,24 +28,15 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/spf13/pflag"
+
 	"vitess.io/vitess/go/acl"
 	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 var (
-	// RedactDebugUIQueries controls whether full queries and bind variables are suppressed from debug UIs.
-	RedactDebugUIQueries = flag.Bool("redact-debug-ui-queries", false, "redact full queries and bind variables from debug UI")
-
-	// QueryLogFormat controls the format of the query log (either text or json)
-	QueryLogFormat = flag.String("querylog-format", "text", "format for query logs (\"text\" or \"json\")")
-
-	// QueryLogFilterTag contains an optional string that must be present in the query for it to be logged
-	QueryLogFilterTag = flag.String("querylog-filter-tag", "", "string that must be present in the query for it to be logged; if using a value as the tag, you need to disable query normalization")
-
-	// QueryLogRowThreshold only log queries returning or affecting this many rows
-	QueryLogRowThreshold = flag.Uint64("querylog-row-threshold", 0, "Number of rows a query has to return or affect before being logged; not useful for streaming queries. 0 means all queries will be logged.")
-
 	sendCount      = stats.NewCountersWithSingleLabel("StreamlogSend", "stream log send count", "logger_names")
 	deliveredCount = stats.NewCountersWithMultiLabels(
 		"StreamlogDelivered",
@@ -58,6 +48,66 @@ var (
 		[]string{"Log", "Subscriber"})
 )
 
+var (
+	redactDebugUIQueries bool
+	queryLogFilterTag    string
+	queryLogRowThreshold uint64
+	queryLogFormat       = "text"
+)
+
+func GetRedactDebugUIQueries() bool {
+	return redactDebugUIQueries
+}
+
+func SetRedactDebugUIQueries(newRedactDebugUIQueries bool) {
+	redactDebugUIQueries = newRedactDebugUIQueries
+}
+
+func GetQueryLogFilterTag() string {
+	return queryLogFilterTag
+}
+
+func SetQueryLogFilterTag(newQueryLogFilterTag string) {
+	queryLogFilterTag = newQueryLogFilterTag
+}
+
+func GetQueryLogRowThreshold() uint64 {
+	return queryLogRowThreshold
+}
+
+func SetQueryLogRowThreshold(newQueryLogRowThreshold uint64) {
+	queryLogRowThreshold = newQueryLogRowThreshold
+}
+
+func GetQueryLogFormat() string {
+	return queryLogFormat
+}
+
+func SetQueryLogFormat(newQueryLogFormat string) {
+	queryLogFormat = newQueryLogFormat
+}
+
+func init() {
+	servenv.OnParseFor("vtcombo", registerStreamLogFlags)
+	servenv.OnParseFor("vttablet", registerStreamLogFlags)
+	servenv.OnParseFor("vtgate", registerStreamLogFlags)
+}
+
+func registerStreamLogFlags(fs *pflag.FlagSet) {
+	// RedactDebugUIQueries controls whether full queries and bind variables are suppressed from debug UIs.
+	fs.BoolVar(&redactDebugUIQueries, "redact-debug-ui-queries", redactDebugUIQueries, "redact full queries and bind variables from debug UI")
+
+	// QueryLogFormat controls the format of the query log (either text or json)
+	fs.StringVar(&queryLogFormat, "querylog-format", queryLogFormat, "format for query logs (\"text\" or \"json\")")
+
+	// QueryLogFilterTag contains an optional string that must be present in the query for it to be logged
+	fs.StringVar(&queryLogFilterTag, "querylog-filter-tag", queryLogFilterTag, "string that must be present in the query for it to be logged; if using a value as the tag, you need to disable query normalization")
+
+	// QueryLogRowThreshold only log queries returning or affecting this many rows
+	fs.Uint64Var(&queryLogRowThreshold, "querylog-row-threshold", queryLogRowThreshold, "Number of rows a query has to return or affect before being logged; not useful for streaming queries. 0 means all queries will be logged.")
+
+}
+
 const (
 	// QueryLogFormatText is the format specifier for text querylog output
 	QueryLogFormatText = "text"
@@ -68,11 +118,11 @@ const (
 
 // StreamLogger is a non-blocking broadcaster of messages.
 // Subscribers can use channels or HTTP.
-type StreamLogger struct {
+type StreamLogger[T any] struct {
 	name       string
 	size       int
 	mu         sync.Mutex
-	subscribed map[chan any]string
+	subscribed map[chan T]string
 }
 
 // LogFormatter is the function signature used to format an arbitrary
@@ -81,17 +131,17 @@ type LogFormatter func(out io.Writer, params url.Values, message any) error
 
 // New returns a new StreamLogger that can stream events to subscribers.
 // The size parameter defines the channel size for the subscribers.
-func New(name string, size int) *StreamLogger {
-	return &StreamLogger{
+func New[T any](name string, size int) *StreamLogger[T] {
+	return &StreamLogger[T]{
 		name:       name,
 		size:       size,
-		subscribed: make(map[chan any]string),
+		subscribed: make(map[chan T]string),
 	}
 }
 
 // Send sends message to all the writers subscribed to logger. Calling
 // Send does not block.
-func (logger *StreamLogger) Send(message any) {
+func (logger *StreamLogger[T]) Send(message T) {
 	logger.mu.Lock()
 	defer logger.mu.Unlock()
 
@@ -108,17 +158,17 @@ func (logger *StreamLogger) Send(message any) {
 
 // Subscribe returns a channel which can be used to listen
 // for messages.
-func (logger *StreamLogger) Subscribe(name string) chan any {
+func (logger *StreamLogger[T]) Subscribe(name string) chan T {
 	logger.mu.Lock()
 	defer logger.mu.Unlock()
 
-	ch := make(chan any, logger.size)
+	ch := make(chan T, logger.size)
 	logger.subscribed[ch] = name
 	return ch
 }
 
 // Unsubscribe removes the channel from the subscription.
-func (logger *StreamLogger) Unsubscribe(ch chan any) {
+func (logger *StreamLogger[T]) Unsubscribe(ch chan T) {
 	logger.mu.Lock()
 	defer logger.mu.Unlock()
 
@@ -126,14 +176,14 @@ func (logger *StreamLogger) Unsubscribe(ch chan any) {
 }
 
 // Name returns the name of StreamLogger.
-func (logger *StreamLogger) Name() string {
+func (logger *StreamLogger[T]) Name() string {
 	return logger.name
 }
 
 // ServeLogs registers the URL on which messages will be broadcast.
 // It is safe to register multiple URLs for the same StreamLogger.
-func (logger *StreamLogger) ServeLogs(url string, logf LogFormatter) {
-	http.HandleFunc(url, func(w http.ResponseWriter, r *http.Request) {
+func (logger *StreamLogger[T]) ServeLogs(url string, logf LogFormatter) {
+	servenv.HTTPHandleFunc(url, func(w http.ResponseWriter, r *http.Request) {
 		if err := acl.CheckAccessHTTP(r, acl.DEBUGGING); err != nil {
 			acl.SendError(w, err)
 			return
@@ -163,7 +213,7 @@ func (logger *StreamLogger) ServeLogs(url string, logf LogFormatter) {
 //
 // Returns the channel used for the subscription which can be used to close
 // it.
-func (logger *StreamLogger) LogToFile(path string, logf LogFormatter) (chan any, error) {
+func (logger *StreamLogger[T]) LogToFile(path string, logf LogFormatter) (chan T, error) {
 	rotateChan := make(chan os.Signal, 1)
 	signal.Notify(rotateChan, syscall.SIGUSR2)
 
@@ -198,7 +248,7 @@ type Formatter interface {
 
 // GetFormatter returns a formatter function for objects conforming to the
 // Formatter interface
-func GetFormatter(logger *StreamLogger) LogFormatter {
+func GetFormatter[T any](logger *StreamLogger[T]) LogFormatter {
 	return func(w io.Writer, params url.Values, val any) error {
 		fmter, ok := val.(Formatter)
 		if !ok {
@@ -212,11 +262,11 @@ func GetFormatter(logger *StreamLogger) LogFormatter {
 // ShouldEmitLog returns whether the log with the given SQL query
 // should be emitted or filtered
 func ShouldEmitLog(sql string, rowsAffected, rowsReturned uint64) bool {
-	if *QueryLogRowThreshold > maxUint64(rowsAffected, rowsReturned) && *QueryLogFilterTag == "" {
+	if queryLogRowThreshold > maxUint64(rowsAffected, rowsReturned) && queryLogFilterTag == "" {
 		return false
 	}
-	if *QueryLogFilterTag != "" {
-		return strings.Contains(sql, *QueryLogFilterTag)
+	if queryLogFilterTag != "" {
+		return strings.Contains(sql, queryLogFilterTag)
 	}
 	return true
 }

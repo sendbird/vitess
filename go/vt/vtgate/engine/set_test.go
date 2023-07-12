@@ -17,15 +17,16 @@ limitations under the License.
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
 
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/srvtopo"
 
 	"github.com/stretchr/testify/require"
 
-	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -58,8 +59,9 @@ func TestSetSystemVariableAsString(t *testing.T) {
 			),
 			"foobar",
 		)},
+		shardSession: []*srvtopo.ResolvedShard{{Target: &querypb.Target{Keyspace: "ks", Shard: "-20"}}},
 	}
-	_, err := set.TryExecute(vc, map[string]*querypb.BindVariable{}, false)
+	_, err := set.TryExecute(context.Background(), vc, map[string]*querypb.BindVariable{}, false)
 	require.NoError(t, err)
 
 	vc.ExpectLog(t, []string{
@@ -67,6 +69,7 @@ func TestSetSystemVariableAsString(t *testing.T) {
 		"ExecuteMultiShard ks.-20: select dummy_expr from dual where @@x != dummy_expr {} false false",
 		"SysVar set with (x,'foobar')",
 		"Needs Reserved Conn",
+		"ExecuteMultiShard ks.-20: set x = dummy_expr {} false false",
 	})
 }
 
@@ -104,7 +107,7 @@ func TestSetTable(t *testing.T) {
 		setOps: []SetOp{
 			&UserDefinedVariable{
 				Name: "x",
-				Expr: evalengine.NewColumn(0, collations.TypedCollation{}),
+				Expr: evalengine.NewColumn(0),
 			},
 		},
 		qr: []*sqltypes.Result{sqltypes.MakeTestResult(
@@ -112,12 +115,12 @@ func TestSetTable(t *testing.T) {
 				"col0",
 				"datetime",
 			),
-			"2020-10-28",
+			"2020-10-28 00:00:00",
 		)},
 		expectedQueryLog: []string{
 			`ResolveDestinations ks [] Destinations:DestinationAnyShard()`,
 			`ExecuteMultiShard ks.-20: select now() from dual {} false false`,
-			`UDV set with (x,DATETIME("2020-10-28"))`,
+			`UDV set with (x,DATETIME("2020-10-28 00:00:00"))`,
 		},
 		input: &Send{
 			Keyspace:          ks,
@@ -562,10 +565,10 @@ func TestSetTable(t *testing.T) {
 				tc.input = &SingleRow{}
 			}
 
-			oldMySQLVersion := sqlparser.MySQLVersion
-			defer func() { sqlparser.MySQLVersion = oldMySQLVersion }()
+			oldMySQLVersion := sqlparser.GetParserVersion()
+			defer func() { sqlparser.SetParserVersion(oldMySQLVersion) }()
 			if tc.mysqlVersion != "" {
-				sqlparser.MySQLVersion = tc.mysqlVersion
+				sqlparser.SetParserVersion(tc.mysqlVersion)
 			}
 
 			set := &Set{
@@ -578,7 +581,7 @@ func TestSetTable(t *testing.T) {
 				multiShardErrs: []error{tc.execErr},
 				disableSetVar:  tc.disableSetVar,
 			}
-			_, err := set.TryExecute(vc, map[string]*querypb.BindVariable{}, false)
+			_, err := set.TryExecute(context.Background(), vc, map[string]*querypb.BindVariable{}, false)
 			if tc.expectedError == "" {
 				require.NoError(t, err)
 			} else {
@@ -618,7 +621,7 @@ func TestSysVarSetErr(t *testing.T) {
 		shards:         []string{"-20", "20-"},
 		multiShardErrs: []error{fmt.Errorf("error")},
 	}
-	_, err := set.TryExecute(vc, map[string]*querypb.BindVariable{}, false)
+	_, err := set.TryExecute(context.Background(), vc, map[string]*querypb.BindVariable{}, false)
 	require.EqualError(t, err, "error")
 	vc.ExpectLog(t, expectedQueryLog)
 }

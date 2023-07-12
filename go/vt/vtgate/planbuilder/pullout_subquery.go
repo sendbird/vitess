@@ -17,10 +17,11 @@ limitations under the License.
 package planbuilder
 
 import (
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
+	popcode "vitess.io/vitess/go/vt/vtgate/engine/opcode"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 	"vitess.io/vitess/go/vt/vtgate/semantics"
 )
 
@@ -37,7 +38,7 @@ type pulloutSubquery struct {
 }
 
 // newPulloutSubquery builds a new pulloutSubquery.
-func newPulloutSubquery(opcode engine.PulloutOpcode, sqName, hasValues string, subquery logicalPlan) *pulloutSubquery {
+func newPulloutSubquery(opcode popcode.PulloutOpcode, sqName, hasValues string, subquery logicalPlan) *pulloutSubquery {
 	return &pulloutSubquery{
 		subquery: subquery,
 		eSubquery: &engine.PulloutSubquery{
@@ -88,11 +89,11 @@ func (ps *pulloutSubquery) Wireup(plan logicalPlan, jt *jointab) error {
 }
 
 // Wireup2 implements the logicalPlan interface
-func (ps *pulloutSubquery) WireupGen4(semTable *semantics.SemTable) error {
-	if err := ps.underlying.WireupGen4(semTable); err != nil {
+func (ps *pulloutSubquery) WireupGen4(ctx *plancontext.PlanningContext) error {
+	if err := ps.underlying.WireupGen4(ctx); err != nil {
 		return err
 	}
-	return ps.subquery.WireupGen4(semTable)
+	return ps.subquery.WireupGen4(ctx)
 }
 
 // SupplyVar implements the logicalPlan interface
@@ -117,7 +118,7 @@ func (ps *pulloutSubquery) SupplyWeightString(colNumber int, alsoAddToGroupBy bo
 // Rewrite implements the logicalPlan interface
 func (ps *pulloutSubquery) Rewrite(inputs ...logicalPlan) error {
 	if len(inputs) != 2 {
-		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "pulloutSubquery: wrong number of inputs")
+		return vterrors.VT13001("pulloutSubquery: wrong number of inputs")
 	}
 	ps.underlying = inputs[0]
 	ps.subquery = inputs[1]

@@ -22,6 +22,7 @@ option go_package = "vitess.io/vitess/go/vt/proto/tabletmanagerdata";
 
 package tabletmanagerdata;
 
+import "binlogdata.proto";
 import "query.proto";
 import "topodata.proto";
 import "replicationdata.proto";
@@ -63,7 +64,7 @@ message TableDefinition {
 message SchemaDefinition {
   string database_schema = 1;
   repeated TableDefinition table_definitions = 2;
-  string version = 3;
+  reserved 3;
 }
 
 message SchemaChangeResult {
@@ -135,6 +136,9 @@ message GetSchemaRequest {
   repeated string tables = 1;
   bool include_views = 2;
   repeated string exclude_tables = 3;
+  // TableSchemaOnly specifies whether to limit the results to just table/view
+  // schema definition (CREATE TABLE/VIEW statements) and skip column/field information
+  bool table_schema_only = 4;
 }
 
 message GetSchemaResponse {
@@ -351,7 +355,7 @@ message VReplicationExecResponse {
 }
 
 message VReplicationWaitForPosRequest {
-  int64 id = 1;
+  int32 id = 1;
   string position = 2;
 }
 
@@ -391,7 +395,8 @@ message DemotePrimaryRequest {
 
 message DemotePrimaryResponse {
   // Position is deprecated, and is a string representation of a demoted primaries executed position.
-  string deprecated_position = 1 [deprecated = true];
+  //string deprecated_position = 1 [deprecated = true];
+  reserved 1;
 
   // PrimaryStatus represents the response from calling `SHOW MASTER STATUS` on a primary that has been demoted.
   replicationdata.PrimaryStatus primary_status = 2;
@@ -408,6 +413,19 @@ message ReplicaWasPromotedRequest {
 }
 
 message ReplicaWasPromotedResponse {
+}
+
+message ResetReplicationParametersRequest {
+}
+
+message ResetReplicationParametersResponse {
+}
+
+message FullStatusRequest {
+}
+
+message FullStatusResponse {
+  replicationdata.FullStatus status = 1;
 }
 
 message SetReplicationSourceRequest {
@@ -437,7 +455,8 @@ message StopReplicationAndGetStatusResponse {
   // HybridStatus is deprecated. It currently represents a hybrid struct where all data represents the before state,
   // except for all position related data which comes from the after state. Please use status instead, which holds
   // discrete replication status calls before and after stopping the replica, or stopping the replica's io_thread.
-  replicationdata.Status hybrid_status = 1 [deprecated = true];
+  //replicationdata.Status hybrid_status = 1 [deprecated = true];
+  reserved 1;
 
   // Status represents the replication status call right before, and right after telling the replica to stop.
   replicationdata.StopReplicationStatus status = 2;
@@ -456,6 +475,9 @@ message PromoteReplicaResponse {
 message BackupRequest {
   int64 concurrency = 1;
   bool allow_primary = 2;
+  // IncrementalFromPos indicates a position of a previous backup. When this value is non-empty
+  // then the backup becomes incremental and applies as of given position.
+  string incremental_from_pos = 3;
 }
 
 message BackupResponse {
@@ -464,27 +486,23 @@ message BackupResponse {
 
 message RestoreFromBackupRequest {
   vttime.Time backup_time = 1;
+  // RestoreToPos indicates a position for a point-in-time recovery. The recovery
+  // is expected to utilize one full backup, followed by zero or more incremental backups,
+  // that reach the precise desired position
+  string restore_to_pos = 2;
+  // Dry run does not actually performs the restore, but validates the steps and availability of backups
+  bool dry_run = 3;
 }
 
 message RestoreFromBackupResponse {
   logutil.Event event = 1;
 }
 
-message VExecRequest {
-  string query = 1;
-  string workflow = 2;
-  string keyspace = 3;
-}
-
-message VExecResponse {
-  query.QueryResult result = 1;
-}
-
 message VDiffRequest {
   string keyspace = 1;
   string workflow = 2;
-  string command = 3;
-  string sub_command = 4;
+  string action = 3;
+  string action_arg = 4;
   string vdiff_uuid = 5;
   VDiffOptions options = 6;
 }
@@ -504,23 +522,42 @@ message VDiffPickerOptions {
 
 // options that only influence how vdiff differences are reported
 message VDiffReportOptions {
-  bool only_p_k_s = 1;
+  bool only_pks = 1;
   bool debug_query = 2;
   string format = 3;
 }
 
 message VDiffCoreOptions {
   string tables = 1;
-  bool resumable = 2;
+  bool auto_retry = 2;
   int64  max_rows = 3;
   bool checksum = 4;
   int64 sample_pct = 5;
   int64 timeout_seconds = 6;
   int64 max_extra_rows_to_compare = 7;
+  bool update_table_stats = 8;
 }
 
 message VDiffOptions {
   VDiffPickerOptions picker_options = 1;
   VDiffCoreOptions core_options = 2;
   VDiffReportOptions report_options = 3;
+}
+
+message UpdateVRWorkflowRequest {
+  string workflow = 1;
+  repeated string cells = 2;
+  repeated string tablet_types = 3;
+  binlogdata.OnDDLAction on_ddl = 4;
+}
+
+message UpdateVRWorkflowResponse {
+  query.QueryResult result = 1;
+}
+
+message ResetSequencesRequest {
+  repeated string tables = 1;
+}
+
+message ResetSequencesResponse {
 }

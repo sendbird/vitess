@@ -17,6 +17,8 @@ limitations under the License.
 package semantics
 
 import (
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -28,59 +30,68 @@ import (
 )
 
 func TestExpandStar(t *testing.T) {
+	ks := &vindexes.Keyspace{
+		Name:    "main",
+		Sharded: false,
+	}
 	schemaInfo := &FakeSI{
 		Tables: map[string]*vindexes.Table{
 			"t1": {
-				Name: sqlparser.NewTableIdent("t1"),
+				Keyspace: ks,
+				Name:     sqlparser.NewIdentifierCS("t1"),
 				Columns: []vindexes.Column{{
-					Name: sqlparser.NewColIdent("a"),
+					Name: sqlparser.NewIdentifierCI("a"),
 					Type: sqltypes.VarChar,
 				}, {
-					Name: sqlparser.NewColIdent("b"),
+					Name: sqlparser.NewIdentifierCI("b"),
 					Type: sqltypes.VarChar,
 				}, {
-					Name: sqlparser.NewColIdent("c"),
+					Name: sqlparser.NewIdentifierCI("c"),
 					Type: sqltypes.VarChar,
 				}},
 				ColumnListAuthoritative: true,
 			},
 			"t2": {
-				Name: sqlparser.NewTableIdent("t2"),
+				Keyspace: ks,
+				Name:     sqlparser.NewIdentifierCS("t2"),
 				Columns: []vindexes.Column{{
-					Name: sqlparser.NewColIdent("c1"),
+					Name: sqlparser.NewIdentifierCI("c1"),
 					Type: sqltypes.VarChar,
 				}, {
-					Name: sqlparser.NewColIdent("c2"),
+					Name: sqlparser.NewIdentifierCI("c2"),
 					Type: sqltypes.VarChar,
 				}},
 				ColumnListAuthoritative: true,
 			},
 			"t3": { // non authoritative table.
-				Name: sqlparser.NewTableIdent("t3"),
+				Keyspace: ks,
+				Name:     sqlparser.NewIdentifierCS("t3"),
 				Columns: []vindexes.Column{{
-					Name: sqlparser.NewColIdent("col"),
+					Name: sqlparser.NewIdentifierCI("col"),
 					Type: sqltypes.VarChar,
 				}},
 				ColumnListAuthoritative: false,
 			},
 			"t4": {
-				Name: sqlparser.NewTableIdent("t4"),
+				Keyspace: ks,
+				Name:     sqlparser.NewIdentifierCS("t4"),
 				Columns: []vindexes.Column{{
-					Name: sqlparser.NewColIdent("c1"),
+					Name: sqlparser.NewIdentifierCI("c1"),
 					Type: sqltypes.VarChar,
 				}, {
-					Name: sqlparser.NewColIdent("c4"),
+					Name: sqlparser.NewIdentifierCI("c4"),
 					Type: sqltypes.VarChar,
 				}},
 				ColumnListAuthoritative: true,
 			},
 			"t5": {
-				Name: sqlparser.NewTableIdent("t5"),
+				Keyspace: ks,
+				Name:     sqlparser.NewIdentifierCS("t5"),
 				Columns: []vindexes.Column{{
-					Name: sqlparser.NewColIdent("a"),
+					Name: sqlparser.NewIdentifierCI("a"),
 					Type: sqltypes.VarChar,
 				}, {
-					Name: sqlparser.NewColIdent("b"),
+					Name: sqlparser.NewIdentifierCI("b"),
 					Type: sqltypes.VarChar,
 				}},
 				ColumnListAuthoritative: true,
@@ -89,9 +100,10 @@ func TestExpandStar(t *testing.T) {
 	}
 	cDB := "db"
 	tcases := []struct {
-		sql    string
-		expSQL string
-		expErr string
+		sql      string
+		expSQL   string
+		expErr   string
+		expanded string
 	}{{
 		sql:    "select * from t1",
 		expSQL: "select a, b, c from t1",
@@ -105,8 +117,9 @@ func TestExpandStar(t *testing.T) {
 		sql:    "select 42, t1.* from t1",
 		expSQL: "select 42, a, b, c from t1",
 	}, {
-		sql:    "select * from t1, t2",
-		expSQL: "select t1.a as a, t1.b as b, t1.c as c, t2.c1 as c1, t2.c2 as c2 from t1, t2",
+		sql:      "select * from t1, t2",
+		expSQL:   "select t1.a as a, t1.b as b, t1.c as c, t2.c1 as c1, t2.c2 as c2 from t1, t2",
+		expanded: "main.t1.a, main.t1.b, main.t1.c, main.t2.c1, main.t2.c2",
 	}, {
 		sql:    "select t1.* from t1, t2",
 		expSQL: "select t1.a as a, t1.b as b, t1.c as c from t1, t2",
@@ -132,8 +145,9 @@ func TestExpandStar(t *testing.T) {
 		sql:    "select * from t1 join t2 on t1.a = t2.c1",
 		expSQL: "select t1.a as a, t1.b as b, t1.c as c, t2.c1 as c1, t2.c2 as c2 from t1 join t2 on t1.a = t2.c1",
 	}, {
-		sql:    "select * from t2 join t4 using (c1)",
-		expSQL: "select t2.c1 as c1, t2.c2 as c2, t4.c4 as c4 from t2 join t4 where t2.c1 = t4.c1",
+		sql:      "select * from t2 join t4 using (c1)",
+		expSQL:   "select t2.c1 as c1, t2.c2 as c2, t4.c4 as c4 from t2 join t4 where t2.c1 = t4.c1",
+		expanded: "main.t2.c1, main.t2.c2, main.t4.c4",
 	}, {
 		sql:    "select * from t2 join t4 using (c1) join t2 as X using (c1)",
 		expSQL: "select t2.c1 as c1, t2.c2 as c2, t4.c4 as c4, X.c2 as c2 from t2 join t4 join t2 as X where t2.c1 = t4.c1 and t2.c1 = X.c1 and t4.c1 = X.c1",
@@ -141,14 +155,25 @@ func TestExpandStar(t *testing.T) {
 		sql:    "select * from t2 join t4 using (c1), t2 as t2b join t4 as t4b using (c1)",
 		expSQL: "select t2.c1 as c1, t2.c2 as c2, t4.c4 as c4, t2b.c1 as c1, t2b.c2 as c2, t4b.c4 as c4 from t2 join t4, t2 as t2b join t4 as t4b where t2b.c1 = t4b.c1 and t2.c1 = t4.c1",
 	}, {
-		sql:    "select * from t1 join t5 using (b)",
-		expSQL: "select t1.b as b, t1.a as a, t1.c as c, t5.a as a from t1 join t5 where t1.b = t5.b",
+		sql:      "select * from t1 join t5 using (b)",
+		expSQL:   "select t1.b as b, t1.a as a, t1.c as c, t5.a as a from t1 join t5 where t1.b = t5.b",
+		expanded: "main.t1.a, main.t1.b, main.t1.c, main.t5.a",
 	}, {
 		sql:    "select * from t1 join t5 using (b) having b = 12",
 		expSQL: "select t1.b as b, t1.a as a, t1.c as c, t5.a as a from t1 join t5 where t1.b = t5.b having b = 12",
 	}, {
 		sql:    "select 1 from t1 join t5 using (b) having b = 12",
 		expSQL: "select 1 from t1 join t5 where t1.b = t5.b having t1.b = 12",
+	}, {
+		sql:    "select * from (select 12) as t",
+		expSQL: "select t.`12` from (select 12 from dual) as t",
+	}, {
+		sql:    "SELECT * FROM (SELECT *, 12 AS foo FROM t3) as results",
+		expSQL: "select * from (select *, 12 as foo from t3) as results",
+	}, {
+		// if we are only star-expanding authoritative tables, we don't need to stop the expansion
+		sql:    "SELECT * FROM (SELECT t2.*, 12 AS foo FROM t3, t2) as results",
+		expSQL: "select results.c1, results.c2, results.foo from (select t2.c1 as c1, t2.c2 as c2, 12 as foo from t3, t2) as results",
 	}}
 	for _, tcase := range tcases {
 		t.Run(tcase.sql, func(t *testing.T) {
@@ -162,6 +187,7 @@ func TestExpandStar(t *testing.T) {
 				require.NoError(t, st.NotUnshardedErr)
 				require.NoError(t, st.NotSingleRouteErr)
 				assert.Equal(t, tcase.expSQL, sqlparser.String(selectStatement))
+				assertExpandedColumns(t, st, tcase.expanded)
 			} else {
 				require.EqualError(t, err, tcase.expErr)
 			}
@@ -169,47 +195,63 @@ func TestExpandStar(t *testing.T) {
 	}
 }
 
+func assertExpandedColumns(t *testing.T, st *SemTable, expandedColumns string) {
+	t.Helper()
+	if expandedColumns == "" {
+		return
+	}
+	var expanded []string
+	for tbl, cols := range st.ExpandedColumns {
+		for _, col := range cols {
+			col.Qualifier = tbl
+			expanded = append(expanded, sqlparser.String(col))
+		}
+	}
+	sort.Strings(expanded)
+	assert.Equal(t, expandedColumns, strings.Join(expanded, ", "))
+}
+
 func TestRewriteJoinUsingColumns(t *testing.T) {
 	schemaInfo := &FakeSI{
 		Tables: map[string]*vindexes.Table{
 			"t1": {
-				Name: sqlparser.NewTableIdent("t1"),
+				Name: sqlparser.NewIdentifierCS("t1"),
 				Columns: []vindexes.Column{{
-					Name: sqlparser.NewColIdent("a"),
+					Name: sqlparser.NewIdentifierCI("a"),
 					Type: sqltypes.VarChar,
 				}, {
-					Name: sqlparser.NewColIdent("b"),
+					Name: sqlparser.NewIdentifierCI("b"),
 					Type: sqltypes.VarChar,
 				}, {
-					Name: sqlparser.NewColIdent("c"),
+					Name: sqlparser.NewIdentifierCI("c"),
 					Type: sqltypes.VarChar,
 				}},
 				ColumnListAuthoritative: true,
 			},
 			"t2": {
-				Name: sqlparser.NewTableIdent("t2"),
+				Name: sqlparser.NewIdentifierCS("t2"),
 				Columns: []vindexes.Column{{
-					Name: sqlparser.NewColIdent("a"),
+					Name: sqlparser.NewIdentifierCI("a"),
 					Type: sqltypes.VarChar,
 				}, {
-					Name: sqlparser.NewColIdent("b"),
+					Name: sqlparser.NewIdentifierCI("b"),
 					Type: sqltypes.VarChar,
 				}, {
-					Name: sqlparser.NewColIdent("c"),
+					Name: sqlparser.NewIdentifierCI("c"),
 					Type: sqltypes.VarChar,
 				}},
 				ColumnListAuthoritative: true,
 			},
 			"t3": {
-				Name: sqlparser.NewTableIdent("t3"),
+				Name: sqlparser.NewIdentifierCS("t3"),
 				Columns: []vindexes.Column{{
-					Name: sqlparser.NewColIdent("a"),
+					Name: sqlparser.NewIdentifierCI("a"),
 					Type: sqltypes.VarChar,
 				}, {
-					Name: sqlparser.NewColIdent("b"),
+					Name: sqlparser.NewIdentifierCI("b"),
 					Type: sqltypes.VarChar,
 				}, {
-					Name: sqlparser.NewColIdent("c"),
+					Name: sqlparser.NewIdentifierCI("c"),
 					Type: sqltypes.VarChar,
 				}},
 				ColumnListAuthoritative: true,
@@ -305,12 +347,47 @@ func TestOrderByGroupByLiteral(t *testing.T) {
 	}
 }
 
+func TestHavingAndOrderByColumnName(t *testing.T) {
+	schemaInfo := &FakeSI{
+		Tables: map[string]*vindexes.Table{},
+	}
+	cDB := "db"
+	tcases := []struct {
+		sql    string
+		expSQL string
+		expErr string
+	}{{
+		sql:    "select id, sum(foo) as sumOfFoo from t1 having sumOfFoo > 1",
+		expSQL: "select id, sum(foo) as sumOfFoo from t1 having sum(foo) > 1",
+	}, {
+		sql:    "select id, sum(foo) as sumOfFoo from t1 order by sumOfFoo",
+		expSQL: "select id, sum(foo) as sumOfFoo from t1 order by sum(foo) asc",
+	}, {
+		sql:    "select id, sum(foo) as foo from t1 having sum(foo) > 1",
+		expSQL: "select id, sum(foo) as foo from t1 having sum(foo) > 1",
+	}}
+	for _, tcase := range tcases {
+		t.Run(tcase.sql, func(t *testing.T) {
+			ast, err := sqlparser.Parse(tcase.sql)
+			require.NoError(t, err)
+			selectStatement := ast.(*sqlparser.Select)
+			_, err = Analyze(selectStatement, cDB, schemaInfo)
+			if tcase.expErr == "" {
+				require.NoError(t, err)
+				assert.Equal(t, tcase.expSQL, sqlparser.String(selectStatement))
+			} else {
+				require.EqualError(t, err, tcase.expErr)
+			}
+		})
+	}
+}
+
 func TestSemTableDependenciesAfterExpandStar(t *testing.T) {
 	schemaInfo := &FakeSI{Tables: map[string]*vindexes.Table{
 		"t1": {
-			Name: sqlparser.NewTableIdent("t1"),
+			Name: sqlparser.NewIdentifierCS("t1"),
 			Columns: []vindexes.Column{{
-				Name: sqlparser.NewColIdent("a"),
+				Name: sqlparser.NewIdentifierCI("a"),
 				Type: sqltypes.VarChar,
 			}},
 			ColumnListAuthoritative: true,

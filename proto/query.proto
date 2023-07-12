@@ -212,6 +212,9 @@ enum Type {
   // HEXVAL specifies a HEXVAL type (unquoted varbinary).
   // Properties: 33, IsText.
   HEXVAL = 4129;
+  // BITNUM specifies a base 2 binary type (unquoted varbinary).
+  // Properties: 34, IsText.
+  BITNUM = 4130;
 }
 
 // Value represents a typed value.
@@ -312,6 +315,7 @@ message ExecuteOptions {
     Gen4Left2Right = 4;
     Gen4WithFallback = 5;
     Gen4CompareV3 = 6;
+    V3Insert = 7;
   }
   
   // PlannerVersion specifies which planner to use. 
@@ -322,6 +326,33 @@ message ExecuteOptions {
   // if the user has created temp tables, Vitess will not reuse plans created for this session in other sessions.
   // The current session can still use other sessions cached plans.
   bool has_created_temp_tables = 12;
+
+  enum Consolidator {
+    CONSOLIDATOR_UNSPECIFIED = 0;
+    CONSOLIDATOR_DISABLED = 1;
+    CONSOLIDATOR_ENABLED = 2;
+    CONSOLIDATOR_ENABLED_REPLICAS = 3;
+  }
+
+  Consolidator consolidator = 13;
+
+  enum TransactionAccessMode {
+    CONSISTENT_SNAPSHOT = 0;
+    READ_WRITE = 1;
+    READ_ONLY = 2;
+  }
+
+  // TransactionAccessMode specifies the access modes to be used while starting the transaction i.e. READ WRITE/READ ONLY/WITH CONSISTENT SNAPSHOT
+  // If not specified, the transaction will be started with the default access mode on the connection.
+  repeated TransactionAccessMode transaction_access_mode = 14;
+
+  // WorkloadName specifies the name of the workload as indicated in query directives. This is used for instrumentation
+  // in metrics and tracing spans.
+  string WorkloadName = 15;
+
+  // priority specifies the priority of the query, between 0 and 100. This is leveraged by the transaction
+  // throttler to determine whether, under resource contention, a query should or should not be throttled.
+  string priority = 16;
 }
 
 // Field describes a single column returned by a query
@@ -385,6 +416,7 @@ message QueryResult {
   uint64 insert_id = 3;
   repeated Row rows = 4;
   string info = 6;
+  string session_state_changes = 7;
 }
 
 // QueryWarning is used to convey out of band query execution warnings
@@ -480,6 +512,9 @@ message BeginRequest {
 message BeginResponse {
   int64 transaction_id = 1;
   topodata.TabletAlias tablet_alias = 2;
+  // The session_state_changes might be set if the transaction is a snapshot transaction
+  // and the MySQL implementation supports getting a start gtid on snapshot
+  string session_state_changes = 3;
 }
 
 // CommitRequest is the payload to Commit
@@ -626,6 +661,9 @@ message BeginExecuteResponse {
   // transaction_id might be non-zero even if an error is present.
   int64 transaction_id = 3;
   topodata.TabletAlias tablet_alias = 4;
+  // The session_state_changes might be set if the transaction is a snapshot transaction
+  // and the MySQL implementation supports getting a start gtid on snapshot
+  string session_state_changes = 5;
 }
 
 // BeginStreamExecuteRequest is the payload to BeginStreamExecute
@@ -651,6 +689,9 @@ message BeginStreamExecuteResponse {
   // transaction_id might be non-zero even if an error is present.
   int64 transaction_id = 3;
   topodata.TabletAlias tablet_alias = 4;
+  // The session_state_changes might be set if the transaction is a snapshot transaction
+  // and the MySQL implementation supports getting a start gtid on snapshot
+  string session_state_changes = 5;
 }
 
 // MessageStreamRequest is the request payload for MessageStream.
@@ -750,6 +791,9 @@ message ReserveBeginExecuteResponse {
   int64 transaction_id = 3;
   int64 reserved_id = 4;
   topodata.TabletAlias tablet_alias = 5;
+  // The session_state_changes might be set if the transaction is a snapshot transaction
+  // and the MySQL implementation supports getting a start gtid on snapshot
+  string session_state_changes = 6;
 }
 
 // ReserveBeginStreamExecuteRequest is the payload to ReserveBeginStreamExecute
@@ -776,6 +820,9 @@ message ReserveBeginStreamExecuteResponse {
   int64 transaction_id = 3;
   int64 reserved_id = 4;
   topodata.TabletAlias tablet_alias = 5;
+  // The session_state_changes might be set if the transaction is a snapshot transaction
+  // and the MySQL implementation supports getting a start gtid on snapshot
+  string session_state_changes = 6;
 }
 
 // ReleaseRequest is the payload to Release
@@ -833,6 +880,9 @@ message RealtimeStats {
 
   // table_schema_changed is to provide list of tables that have schema changes detected by the tablet.
   repeated string table_schema_changed = 7;
+
+  // view_schema_changed is to provide list of views that have schema changes detected by the tablet.
+  repeated string view_schema_changed = 8;
 }
 
 // AggregateStats contains information about the health of a group of
@@ -931,4 +981,25 @@ message TransactionMetadata {
   TransactionState state = 2;
   int64 time_created = 3;
   repeated Target participants = 4;
+}
+
+
+// SchemaTableType represents the type of table requested.
+enum SchemaTableType {
+  VIEWS = 0;
+  TABLES = 1;
+  ALL = 2;
+}
+
+// GetSchemaRequest is the payload to GetSchema
+message GetSchemaRequest {
+  Target target = 1;
+  SchemaTableType table_type = 2;
+  repeated string table_names = 3;
+}
+
+// GetSchemaResponse is the returned value from GetSchema
+message GetSchemaResponse {
+  // this is for the schema definition for the requested tables.
+  map<string, string> table_definition = 2;
 }

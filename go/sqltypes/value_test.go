@@ -22,6 +22,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/stretchr/testify/require"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -84,6 +86,14 @@ func TestNewValue(t *testing.T) {
 		inType: Uint64,
 		inVal:  "1",
 		outVal: TestValue(Uint64, "1"),
+	}, {
+		inType: Uint64,
+		inVal:  "01",
+		outVal: TestValue(Uint64, "01"),
+	}, {
+		inType: Int64,
+		inVal:  "01",
+		outVal: TestValue(Int64, "01"),
 	}, {
 		inType: Float32,
 		inVal:  "1.00",
@@ -473,5 +483,32 @@ func TestEncodeMap(t *testing.T) {
 	}
 	if SQLDecodeMap[DontEscape] != DontEscape {
 		t.Errorf("SQLDecodeMap[DontEscape] = %v, want %v", SQLEncodeMap[DontEscape], DontEscape)
+	}
+}
+
+func TestHexAndBitToBytes(t *testing.T) {
+	tcases := []struct {
+		in  Value
+		out []byte
+	}{{
+		in:  MakeTrusted(HexNum, []byte("0x1234")),
+		out: []byte{0x12, 0x34},
+	}, {
+		in:  MakeTrusted(HexVal, []byte("X'1234'")),
+		out: []byte{0x12, 0x34},
+	}, {
+		in:  MakeTrusted(BitNum, []byte("0b1001000110100")),
+		out: []byte{0x12, 0x34},
+	}, {
+		in:  MakeTrusted(BitNum, []byte("0b11101010100101010010101010101010101010101000100100100100100101001101010101010101000001")),
+		out: []byte{0x3a, 0xa5, 0x4a, 0xaa, 0xaa, 0xa2, 0x49, 0x25, 0x35, 0x55, 0x41},
+	}}
+
+	for _, tcase := range tcases {
+		t.Run(tcase.in.String(), func(t *testing.T) {
+			out, err := tcase.in.ToBytes()
+			require.NoError(t, err)
+			assert.Equal(t, tcase.out, out)
+		})
 	}
 }

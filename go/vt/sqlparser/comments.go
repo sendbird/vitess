@@ -20,6 +20,11 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 const (
@@ -42,7 +47,22 @@ const (
 	DirectiveAllowHashJoin = "ALLOW_HASH_JOIN"
 	// DirectiveQueryPlanner lets the user specify per query which planner should be used
 	DirectiveQueryPlanner = "PLANNER"
+	// DirectiveVExplainRunDMLQueries tells vexplain queries/all that it is okay to also run the query.
+	DirectiveVExplainRunDMLQueries = "EXECUTE_DML_QUERIES"
+	// DirectiveConsolidator enables the query consolidator.
+	DirectiveConsolidator = "CONSOLIDATOR"
+	// DirectiveWorkloadName specifies the name of the client application workload issuing the query.
+	DirectiveWorkloadName = "WORKLOAD_NAME"
+	// DirectivePriority specifies the priority of a workload. It should be an integer between 0 and MaxPriorityValue,
+	// where 0 is the highest priority, and MaxPriorityValue is the lowest one.
+	DirectivePriority = "PRIORITY"
+
+	// MaxPriorityValue specifies the maximum value allowed for the priority query directive. Valid priority values are
+	// between zero and MaxPriorityValue.
+	MaxPriorityValue = 100
 )
+
+var ErrInvalidPriority = vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "Invalid priority value specified in query")
 
 func isNonSpace(r rune) bool {
 	return !unicode.IsSpace(r)
@@ -200,20 +220,22 @@ const commentDirectivePreamble = "/*vt+"
 
 // CommentDirectives is the parsed representation for execution directives
 // conveyed in query comments
-type CommentDirectives map[string]string
+type CommentDirectives struct {
+	m map[string]string
+}
 
 // Directives parses the comment list for any execution directives
 // of the form:
 //
-//     /*vt+ OPTION_ONE=1 OPTION_TWO OPTION_THREE=abcd */
+//	/*vt+ OPTION_ONE=1 OPTION_TWO OPTION_THREE=abcd */
 //
 // It returns the map of the directive values or nil if there aren't any.
-func (c *ParsedComments) Directives() CommentDirectives {
+func (c *ParsedComments) Directives() *CommentDirectives {
 	if c == nil {
 		return nil
 	}
 	if c._directives == nil {
-		c._directives = make(CommentDirectives)
+		c._directives = &CommentDirectives{m: make(map[string]string)}
 
 		for _, commentStr := range c.comments {
 			if commentStr[0:5] != commentDirectivePreamble {
@@ -228,7 +250,7 @@ func (c *ParsedComments) Directives() CommentDirectives {
 				if !ok {
 					val = "true"
 				}
-				c._directives[directive] = val
+				c._directives.m[strings.ToLower(directive)] = val
 			}
 		}
 	}
@@ -254,12 +276,12 @@ func (c *ParsedComments) Prepend(comment string) Comments {
 
 // IsSet checks the directive map for the named directive and returns
 // true if the directive is set and has a true/false or 0/1 value
-func (d CommentDirectives) IsSet(key string) bool {
+func (d *CommentDirectives) IsSet(key string) bool {
 	if d == nil {
 		return false
 	}
-	val, ok := d[key]
-	if !ok {
+	val, found := d.m[strings.ToLower(key)]
+	if !found {
 		return false
 	}
 	// ParseBool handles "0", "1", "true", "false" and all similars
@@ -268,15 +290,18 @@ func (d CommentDirectives) IsSet(key string) bool {
 }
 
 // GetString gets a directive value as string, with default value if not found
-func (d CommentDirectives) GetString(key string, defaultVal string) string {
-	val, ok := d[key]
+func (d *CommentDirectives) GetString(key string, defaultVal string) (string, bool) {
+	if d == nil {
+		return "", false
+	}
+	val, ok := d.m[strings.ToLower(key)]
 	if !ok {
-		return defaultVal
+		return defaultVal, false
 	}
 	if unquoted, err := strconv.Unquote(val); err == nil {
-		return unquoted
+		return unquoted, true
 	}
-	return val
+	return val, true
 }
 
 // MultiShardAutocommitDirective returns true if multishard autocommit directive is set to true in query.
@@ -363,9 +388,64 @@ func AllowScatterDirective(stmt Statement) bool {
 	return comments != nil && comments.Directives().IsSet(DirectiveAllowScatter)
 }
 
-func CommentsForStatement(stmt Statement) Comments {
-	if commented, ok := stmt.(Commented); ok {
-		return commented.GetParsedComments().comments
+// GetPriorityFromStatement gets the priority from the provided Statement, using DirectivePriority
+func GetPriorityFromStatement(statement Statement) (string, error) {
+	commentedStatement, ok := statement.(Commented)
+	// This would mean that the statement lacks comments, so we can't obtain the workload from it. Hence default to
+	// empty priority
+	if !ok {
+		return "", nil
 	}
-	return nil
+
+	directives := commentedStatement.GetParsedComments().Directives()
+	priority, ok := directives.GetString(DirectivePriority, "")
+	if !ok || priority == "" {
+		return "", nil
+	}
+
+	intPriority, err := strconv.Atoi(priority)
+	if err != nil || intPriority < 0 || intPriority > MaxPriorityValue {
+		return "", ErrInvalidPriority
+	}
+
+	return priority, nil
+}
+
+// Consolidator returns the consolidator option.
+func Consolidator(stmt Statement) querypb.ExecuteOptions_Consolidator {
+	var comments *ParsedComments
+	switch stmt := stmt.(type) {
+	case *Select:
+		comments = stmt.Comments
+	default:
+		return querypb.ExecuteOptions_CONSOLIDATOR_UNSPECIFIED
+	}
+	if comments == nil {
+		return querypb.ExecuteOptions_CONSOLIDATOR_UNSPECIFIED
+	}
+	directives := comments.Directives()
+	strv, isSet := directives.GetString(DirectiveConsolidator, "")
+	if !isSet {
+		return querypb.ExecuteOptions_CONSOLIDATOR_UNSPECIFIED
+	}
+	if i32v, ok := querypb.ExecuteOptions_Consolidator_value["CONSOLIDATOR_"+strings.ToUpper(strv)]; ok {
+		return querypb.ExecuteOptions_Consolidator(i32v)
+	}
+	return querypb.ExecuteOptions_CONSOLIDATOR_UNSPECIFIED
+}
+
+// GetWorkloadNameFromStatement gets the workload name from the provided Statement, using workloadLabel as the name of
+// the query directive that specifies it.
+func GetWorkloadNameFromStatement(statement Statement) string {
+	commentedStatement, ok := statement.(Commented)
+	// This would mean that the statement lacks comments, so we can't obtain the workload from it. Hence default to
+	// empty workload name
+	if !ok {
+		return ""
+	}
+
+	directives := commentedStatement.GetParsedComments().Directives()
+	workloadName, _ := directives.GetString(DirectiveWorkloadName, "")
+
+	return workloadName
 }

@@ -22,9 +22,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
-	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/mysql/fakesqldb"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/dbconfigs"
@@ -32,41 +30,12 @@ import (
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
-var (
-	now         = time.Now()
-	mockNowFunc = func() time.Time {
-		return now
-	}
-)
-
-func TestCreateSchema(t *testing.T) {
-	db := fakesqldb.New(t)
-	defer db.Close()
-	tw := newTestWriter(db, mockNowFunc)
-	defer tw.Close()
-	writes.Reset()
-
-	db.OrderMatters()
-	upsert := fmt.Sprintf("INSERT INTO %s.heartbeat (ts, tabletUid, keyspaceShard) VALUES (%d, %d, '%s') ON DUPLICATE KEY UPDATE ts=VALUES(ts), tabletUid=VALUES(tabletUid)",
-		"_vt", now.UnixNano(), tw.tabletAlias.Uid, tw.keyspaceShard)
-	failInsert := fakesqldb.ExpectedExecuteFetch{
-		Query: upsert,
-		Error: mysql.NewSQLError(mysql.ERBadDb, "", "bad db error"),
-	}
-	db.AddExpectedExecuteFetch(failInsert)
-	db.AddExpectedQuery(fmt.Sprintf(sqlCreateSidecarDB, "_vt"), nil)
-	db.AddExpectedQuery(fmt.Sprintf(sqlCreateHeartbeatTable, "_vt"), nil)
-	db.AddExpectedQuery(upsert, nil)
-
-	err := tw.write()
-	require.NoError(t, err)
-}
-
 func TestWriteHeartbeat(t *testing.T) {
 	db := fakesqldb.New(t)
 	defer db.Close()
 
-	tw := newTestWriter(db, mockNowFunc)
+	now := time.Now()
+	tw := newTestWriter(db, &now)
 	upsert := fmt.Sprintf("INSERT INTO %s.heartbeat (ts, tabletUid, keyspaceShard) VALUES (%d, %d, '%s') ON DUPLICATE KEY UPDATE ts=VALUES(ts), tabletUid=VALUES(tabletUid)",
 		"_vt", now.UnixNano(), tw.tabletAlias.Uid, tw.keyspaceShard)
 	db.AddQuery(upsert, &sqltypes.Result{})
@@ -83,7 +52,8 @@ func TestWriteHeartbeatError(t *testing.T) {
 	db := fakesqldb.New(t)
 	defer db.Close()
 
-	tw := newTestWriter(db, mockNowFunc)
+	now := time.Now()
+	tw := newTestWriter(db, &now)
 
 	writes.Reset()
 	writeErrors.Reset()
@@ -93,10 +63,10 @@ func TestWriteHeartbeatError(t *testing.T) {
 	assert.Equal(t, int64(1), writeErrors.Get())
 }
 
-func newTestWriter(db *fakesqldb.DB, nowFunc func() time.Time) *heartbeatWriter {
+func newTestWriter(db *fakesqldb.DB, frozenTime *time.Time) *heartbeatWriter {
 	config := tabletenv.NewDefaultConfig()
 	config.ReplicationTracker.Mode = tabletenv.Heartbeat
-	config.ReplicationTracker.HeartbeatIntervalSeconds = 1
+	_ = config.ReplicationTracker.HeartbeatIntervalSeconds.Set("1s")
 
 	params, _ := db.ConnParams().MysqlParams()
 	cp := *params
@@ -104,7 +74,13 @@ func newTestWriter(db *fakesqldb.DB, nowFunc func() time.Time) *heartbeatWriter 
 
 	tw := newHeartbeatWriter(tabletenv.NewEnv(config, "WriterTest"), &topodatapb.TabletAlias{Cell: "test", Uid: 1111})
 	tw.keyspaceShard = "test:0"
-	tw.now = nowFunc
+
+	if frozenTime != nil {
+		tw.now = func() time.Time {
+			return *frozenTime
+		}
+	}
+
 	tw.appPool.Open(dbc.AppWithDB())
 	tw.allPrivsPool.Open(dbc.AllPrivsWithDB())
 

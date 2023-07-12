@@ -18,12 +18,12 @@ package utils
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"net/http"
 	"os"
 	"os/exec"
 	"path"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -31,22 +31,19 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	// This imports toposervers to register their implementations of TopoServer.
-	_ "vitess.io/vitess/go/vt/topo/consultopo"
-	_ "vitess.io/vitess/go/vt/topo/etcd2topo"
-	_ "vitess.io/vitess/go/vt/topo/k8stopo"
-	_ "vitess.io/vitess/go/vt/topo/zk2topo"
-
 	"vitess.io/vitess/go/json2"
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/vt/log"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 
-	querypb "vitess.io/vitess/go/vt/proto/query"
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	// Register topo implementations.
+	_ "vitess.io/vitess/go/vt/topo/consultopo"
+	_ "vitess.io/vitess/go/vt/topo/etcd2topo"
+	_ "vitess.io/vitess/go/vt/topo/zk2topo"
 )
 
 const (
@@ -68,17 +65,16 @@ type CellInfo struct {
 	UIDBase     int
 }
 
-// VtOrcClusterInfo stores the information for a cluster. This is supposed to be used only for VtOrc tests.
-type VtOrcClusterInfo struct {
-	ClusterInstance     *cluster.LocalProcessCluster
-	Ts                  *topo.Server
-	CellInfos           []*CellInfo
-	VtctldClientProcess *cluster.VtctldClientProcess
-	lastUsedValue       int
+// VTOrcClusterInfo stores the information for a cluster. This is supposed to be used only for VTOrc tests.
+type VTOrcClusterInfo struct {
+	ClusterInstance *cluster.LocalProcessCluster
+	Ts              *topo.Server
+	CellInfos       []*CellInfo
+	lastUsedValue   int
 }
 
 // CreateClusterAndStartTopo starts the cluster and topology service
-func CreateClusterAndStartTopo(cellInfos []*CellInfo) (*VtOrcClusterInfo, error) {
+func CreateClusterAndStartTopo(cellInfos []*CellInfo) (*VTOrcClusterInfo, error) {
 	clusterInstance := cluster.NewCluster(Cell1, Hostname)
 
 	// Start topo server
@@ -103,17 +99,13 @@ func CreateClusterAndStartTopo(cellInfos []*CellInfo) (*VtOrcClusterInfo, error)
 		return nil, err
 	}
 
-	// store the vtctldclient process
-	vtctldClientProcess := cluster.VtctldClientProcessInstance("localhost", clusterInstance.VtctldProcess.GrpcPort, clusterInstance.TmpDirectory)
-
 	// create topo server connection
 	ts, err := topo.OpenServer(*clusterInstance.TopoFlavorString(), clusterInstance.VtctlProcess.TopoGlobalAddress, clusterInstance.VtctlProcess.TopoGlobalRoot)
-	return &VtOrcClusterInfo{
-		ClusterInstance:     clusterInstance,
-		Ts:                  ts,
-		CellInfos:           cellInfos,
-		lastUsedValue:       100,
-		VtctldClientProcess: vtctldClientProcess,
+	return &VTOrcClusterInfo{
+		ClusterInstance: clusterInstance,
+		Ts:              ts,
+		CellInfos:       cellInfos,
+		lastUsedValue:   100,
 	}, err
 }
 
@@ -194,9 +186,9 @@ func createVttablets(clusterInstance *cluster.LocalProcessCluster, cellInfos []*
 }
 
 // shutdownVttablets shuts down all the vttablets and removes them from the topology
-func shutdownVttablets(clusterInfo *VtOrcClusterInfo) error {
-	// demote the primary tablet if there is
-	err := demotePrimaryTablet(clusterInfo.Ts)
+func shutdownVttablets(clusterInfo *VTOrcClusterInfo) error {
+	// reset the shard primary
+	err := resetShardPrimary(clusterInfo.Ts)
 	if err != nil {
 		return err
 	}
@@ -204,11 +196,6 @@ func shutdownVttablets(clusterInfo *VtOrcClusterInfo) error {
 	for _, vttablet := range clusterInfo.ClusterInstance.Keyspaces[0].Shards[0].Vttablets {
 		// we need to stop a vttablet only if it is not shutdown
 		if !vttablet.VttabletProcess.IsShutdown() {
-			// wait for primary tablet to demote. For all others, it will not wait
-			err = vttablet.VttabletProcess.WaitForTabletTypes([]string{vttablet.Type})
-			if err != nil {
-				return err
-			}
 			// Stop the vttablets
 			err := vttablet.VttabletProcess.TearDown()
 			if err != nil {
@@ -225,10 +212,10 @@ func shutdownVttablets(clusterInfo *VtOrcClusterInfo) error {
 	return nil
 }
 
-// demotePrimaryTablet demotes the primary tablet for our shard
-func demotePrimaryTablet(ts *topo.Server) (err error) {
+// resetShardPrimary resets the shard's primary
+func resetShardPrimary(ts *topo.Server) (err error) {
 	// lock the shard
-	ctx, unlock, lockErr := ts.LockShard(context.Background(), keyspaceName, shardName, "demotePrimaryTablet-vtorc-endtoend-test")
+	ctx, unlock, lockErr := ts.LockShard(context.Background(), keyspaceName, shardName, "resetShardPrimary-vtorc-endtoend-test")
 	if lockErr != nil {
 		return lockErr
 	}
@@ -237,7 +224,6 @@ func demotePrimaryTablet(ts *topo.Server) (err error) {
 	// update the shard record's primary
 	if _, err = ts.UpdateShardFields(ctx, keyspaceName, shardName, func(si *topo.ShardInfo) error {
 		si.PrimaryAlias = nil
-		si.SetPrimaryTermStartTime(time.Now())
 		return nil
 	}); err != nil {
 		return err
@@ -245,35 +231,35 @@ func demotePrimaryTablet(ts *topo.Server) (err error) {
 	return
 }
 
-// StartVtorcs is used to start the orchestrator with the given extra arguments
-func StartVtorcs(t *testing.T, clusterInfo *VtOrcClusterInfo, orcExtraArgs []string, config cluster.VtorcConfiguration, count int) {
+// StartVTOrcs is used to start the vtorcs with the given extra arguments
+func StartVTOrcs(t *testing.T, clusterInfo *VTOrcClusterInfo, orcExtraArgs []string, config cluster.VTOrcConfiguration, count int) {
 	t.Helper()
 	// Start vtorc
 	for i := 0; i < count; i++ {
-		vtorcProcess := clusterInfo.ClusterInstance.NewOrcProcess(config)
+		vtorcProcess := clusterInfo.ClusterInstance.NewVTOrcProcess(config)
 		vtorcProcess.ExtraArgs = orcExtraArgs
 		err := vtorcProcess.Setup()
 		require.NoError(t, err)
-		clusterInfo.ClusterInstance.VtorcProcesses = append(clusterInfo.ClusterInstance.VtorcProcesses, vtorcProcess)
+		clusterInfo.ClusterInstance.VTOrcProcesses = append(clusterInfo.ClusterInstance.VTOrcProcesses, vtorcProcess)
 	}
 }
 
-// StopVtorcs is used to stop the orchestrator
-func StopVtorcs(t *testing.T, clusterInfo *VtOrcClusterInfo) {
+// StopVTOrcs is used to stop the vtorcs
+func StopVTOrcs(t *testing.T, clusterInfo *VTOrcClusterInfo) {
 	t.Helper()
 	// Stop vtorc
-	for _, vtorcProcess := range clusterInfo.ClusterInstance.VtorcProcesses {
+	for _, vtorcProcess := range clusterInfo.ClusterInstance.VTOrcProcesses {
 		if err := vtorcProcess.TearDown(); err != nil {
 			log.Errorf("Error in vtorc teardown: %v", err)
 		}
 	}
-	clusterInfo.ClusterInstance.VtorcProcesses = nil
+	clusterInfo.ClusterInstance.VTOrcProcesses = nil
 }
 
-// SetupVttabletsAndVtorc is used to setup the vttablets and start the orchestrator
-func SetupVttabletsAndVtorc(t *testing.T, clusterInfo *VtOrcClusterInfo, numReplicasReqCell1, numRdonlyReqCell1 int, orcExtraArgs []string, config cluster.VtorcConfiguration, vtorcCount int, durability string) {
+// SetupVttabletsAndVTOrcs is used to setup the vttablets and start the vtorcs
+func SetupVttabletsAndVTOrcs(t *testing.T, clusterInfo *VTOrcClusterInfo, numReplicasReqCell1, numRdonlyReqCell1 int, orcExtraArgs []string, config cluster.VTOrcConfiguration, vtorcCount int, durability string) {
 	// stop vtorc if it is running
-	StopVtorcs(t, clusterInfo)
+	StopVTOrcs(t, clusterInfo)
 
 	// remove all the vttablets so that each test can add the amount that they require
 	err := shutdownVttablets(clusterInfo)
@@ -316,17 +302,17 @@ func SetupVttabletsAndVtorc(t *testing.T, clusterInfo *VtOrcClusterInfo, numRepl
 	if durability == "" {
 		durability = "none"
 	}
-	out, err := clusterInfo.VtctldClientProcess.ExecuteCommandWithOutput("SetKeyspaceDurabilityPolicy", keyspaceName, fmt.Sprintf("--durability-policy=%s", durability))
+	out, err := clusterInfo.ClusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("SetKeyspaceDurabilityPolicy", keyspaceName, fmt.Sprintf("--durability-policy=%s", durability))
 	require.NoError(t, err, out)
 
 	// start vtorc
-	StartVtorcs(t, clusterInfo, orcExtraArgs, config, vtorcCount)
+	StartVTOrcs(t, clusterInfo, orcExtraArgs, config, vtorcCount)
 }
 
 // cleanAndStartVttablet cleans the MySQL instance underneath for running a new test. It also starts the vttablet.
-func cleanAndStartVttablet(t *testing.T, clusterInfo *VtOrcClusterInfo, vttablet *cluster.Vttablet) {
+func cleanAndStartVttablet(t *testing.T, clusterInfo *VTOrcClusterInfo, vttablet *cluster.Vttablet) {
 	t.Helper()
-	// set super-read-only to false
+	// set super_read_only to false
 	_, err := RunSQL(t, "SET GLOBAL super_read_only = OFF", vttablet, "")
 	require.NoError(t, err)
 	// remove the databases if they exist
@@ -340,6 +326,9 @@ func cleanAndStartVttablet(t *testing.T, clusterInfo *VtOrcClusterInfo, vttablet
 	// reset the binlog
 	_, err = RunSQL(t, "RESET MASTER", vttablet, "")
 	require.NoError(t, err)
+	// set read-only to true
+	_, err = RunSQL(t, "SET GLOBAL read_only = ON", vttablet, "")
+	require.NoError(t, err)
 
 	// start the vttablet
 	err = vttablet.VttabletProcess.Setup()
@@ -349,7 +338,7 @@ func cleanAndStartVttablet(t *testing.T, clusterInfo *VtOrcClusterInfo, vttablet
 }
 
 // ShardPrimaryTablet waits until a primary tablet has been elected for the given shard and returns it
-func ShardPrimaryTablet(t *testing.T, clusterInfo *VtOrcClusterInfo, keyspace *cluster.Keyspace, shard *cluster.Shard) *cluster.Vttablet {
+func ShardPrimaryTablet(t *testing.T, clusterInfo *VTOrcClusterInfo, keyspace *cluster.Keyspace, shard *cluster.Shard) *cluster.Vttablet {
 	start := time.Now()
 	for {
 		now := time.Now()
@@ -377,7 +366,7 @@ func ShardPrimaryTablet(t *testing.T, clusterInfo *VtOrcClusterInfo, keyspace *c
 
 // CheckPrimaryTablet waits until the specified tablet becomes the primary tablet
 // Makes sure the tablet type is primary, and its health check agrees.
-func CheckPrimaryTablet(t *testing.T, clusterInfo *VtOrcClusterInfo, tablet *cluster.Vttablet, checkServing bool) {
+func CheckPrimaryTablet(t *testing.T, clusterInfo *VTOrcClusterInfo, tablet *cluster.Vttablet, checkServing bool) {
 	start := time.Now()
 	for {
 		now := time.Now()
@@ -397,12 +386,11 @@ func CheckPrimaryTablet(t *testing.T, clusterInfo *VtOrcClusterInfo, tablet *clu
 			continue
 		}
 		// make sure the health stream is updated
-		result, err = clusterInfo.ClusterInstance.VtctlclientProcess.ExecuteCommandWithOutput("VtTabletStreamHealth", "--", "--count", "1", tablet.Alias)
+		shrs, err := clusterInfo.ClusterInstance.StreamTabletHealth(context.Background(), tablet, 1)
 		require.NoError(t, err)
-		var streamHealthResponse querypb.StreamHealthResponse
 
-		err = json2.Unmarshal([]byte(result), &streamHealthResponse)
-		require.NoError(t, err)
+		streamHealthResponse := shrs[0]
+
 		if checkServing && !streamHealthResponse.GetServing() {
 			log.Warningf("Tablet %v is not serving in health stream yet, sleep for 1 second\n", tablet.Alias)
 			time.Sleep(time.Second)
@@ -419,7 +407,7 @@ func CheckPrimaryTablet(t *testing.T, clusterInfo *VtOrcClusterInfo, tablet *clu
 }
 
 // CheckReplication checks that the replication is setup correctly and writes succeed and are replicated on all the replicas
-func CheckReplication(t *testing.T, clusterInfo *VtOrcClusterInfo, primary *cluster.Vttablet, replicas []*cluster.Vttablet, timeToWait time.Duration) {
+func CheckReplication(t *testing.T, clusterInfo *VTOrcClusterInfo, primary *cluster.Vttablet, replicas []*cluster.Vttablet, timeToWait time.Duration) {
 	endTime := time.Now().Add(timeToWait)
 	// create tables, insert data and make sure it is replicated correctly
 	sqlSchema := `
@@ -452,7 +440,7 @@ func CheckReplication(t *testing.T, clusterInfo *VtOrcClusterInfo, primary *clus
 
 // VerifyWritesSucceed inserts more data into the table vt_insert_test and checks that it is replicated too
 // Call this function only after CheckReplication has been executed once, since that function creates the table that this function uses.
-func VerifyWritesSucceed(t *testing.T, clusterInfo *VtOrcClusterInfo, primary *cluster.Vttablet, replicas []*cluster.Vttablet, timeToWait time.Duration) {
+func VerifyWritesSucceed(t *testing.T, clusterInfo *VTOrcClusterInfo, primary *cluster.Vttablet, replicas []*cluster.Vttablet, timeToWait time.Duration) {
 	t.Helper()
 	confirmReplication(t, primary, replicas, timeToWait, clusterInfo.lastUsedValue)
 	clusterInfo.lastUsedValue++
@@ -521,7 +509,7 @@ func WaitForReplicationToStop(t *testing.T, vttablet *cluster.Vttablet) error {
 	}
 }
 
-func validateTopology(t *testing.T, clusterInfo *VtOrcClusterInfo, pingTablets bool, timeToWait time.Duration) {
+func validateTopology(t *testing.T, clusterInfo *VTOrcClusterInfo, pingTablets bool, timeToWait time.Duration) {
 	ch := make(chan error)
 	timeout := time.After(timeToWait)
 	go func() {
@@ -593,13 +581,33 @@ func RunSQL(t *testing.T, sql string, tablet *cluster.Vttablet, db string) (*sql
 	return execute(t, conn, sql)
 }
 
+// RunSQLs is used to run a list of SQL statements on the given tablet
+func RunSQLs(t *testing.T, sqls []string, tablet *cluster.Vttablet, db string) error {
+	// Get Connection
+	tabletParams := getMysqlConnParam(tablet, db)
+	var timeoutDuration = time.Duration(5 * len(sqls))
+	ctx, cancel := context.WithTimeout(context.Background(), timeoutDuration*time.Second)
+	defer cancel()
+	conn, err := mysql.Connect(ctx, &tabletParams)
+	require.Nil(t, err)
+	defer conn.Close()
+
+	// Run SQLs
+	for _, sql := range sqls {
+		if _, err := execute(t, conn, sql); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func execute(t *testing.T, conn *mysql.Conn, query string) (*sqltypes.Result, error) {
 	t.Helper()
 	return conn.ExecuteFetch(query, 1000, true)
 }
 
 // StartVttablet is used to start a vttablet from the given cell and type
-func StartVttablet(t *testing.T, clusterInfo *VtOrcClusterInfo, cell string, isRdonly bool) *cluster.Vttablet {
+func StartVttablet(t *testing.T, clusterInfo *VTOrcClusterInfo, cell string, isRdonly bool) *cluster.Vttablet {
 
 	var tablet *cluster.Vttablet
 	for _, cellInfo := range clusterInfo.CellInfos {
@@ -629,7 +637,7 @@ func StartVttablet(t *testing.T, clusterInfo *VtOrcClusterInfo, cell string, isR
 	return tablet
 }
 
-func isVttabletInUse(clusterInfo *VtOrcClusterInfo, tablet *cluster.Vttablet) bool {
+func isVttabletInUse(clusterInfo *VTOrcClusterInfo, tablet *cluster.Vttablet) bool {
 	for _, vttablet := range clusterInfo.ClusterInstance.Keyspaces[0].Shards[0].Vttablets {
 		if tablet == vttablet {
 			return true
@@ -640,7 +648,7 @@ func isVttabletInUse(clusterInfo *VtOrcClusterInfo, tablet *cluster.Vttablet) bo
 
 // PermanentlyRemoveVttablet removes the tablet specified from the cluster. It makes it so that
 // this vttablet or mysql instance are not reused for any other test.
-func PermanentlyRemoveVttablet(clusterInfo *VtOrcClusterInfo, tablet *cluster.Vttablet) {
+func PermanentlyRemoveVttablet(clusterInfo *VTOrcClusterInfo, tablet *cluster.Vttablet) {
 	// remove the tablet from our global list
 	for _, cellInfo := range clusterInfo.CellInfos {
 		for i, vttablet := range cellInfo.ReplicaTablets {
@@ -654,7 +662,7 @@ func PermanentlyRemoveVttablet(clusterInfo *VtOrcClusterInfo, tablet *cluster.Vt
 		for i, vttablet := range cellInfo.RdonlyTablets {
 			if vttablet == tablet {
 				// remove this tablet since its mysql has stopped
-				cellInfo.ReplicaTablets = append(cellInfo.ReplicaTablets[:i], cellInfo.ReplicaTablets[i+1:]...)
+				cellInfo.RdonlyTablets = append(cellInfo.RdonlyTablets[:i], cellInfo.RdonlyTablets[i+1:]...)
 				KillTablets([]*cluster.Vttablet{tablet})
 				return
 			}
@@ -725,19 +733,36 @@ func CheckSourcePort(t *testing.T, replica *cluster.Vttablet, source *cluster.Vt
 }
 
 // MakeAPICall is used make an API call given the url. It returns the status and the body of the response received
-func MakeAPICall(t *testing.T, url string) (status int, response string) {
+func MakeAPICall(t *testing.T, vtorc *cluster.VTOrcProcess, url string) (status int, response string, err error) {
 	t.Helper()
-	res, err := http.Get(url)
-	require.NoError(t, err)
-	bodyBytes, err := ioutil.ReadAll(res.Body)
-	require.NoError(t, err)
-	body := string(bodyBytes)
-	return res.StatusCode, body
+	status, response, err = vtorc.MakeAPICall(url)
+	return status, response, err
+}
+
+// MakeAPICallRetry is used to make an API call and retry on the given condition.
+// The function provided takes in the status and response and returns if we should continue to retry or not
+func MakeAPICallRetry(t *testing.T, vtorc *cluster.VTOrcProcess, url string, retry func(int, string) bool) (status int, response string) {
+	t.Helper()
+	timeout := time.After(10 * time.Second)
+	for {
+		select {
+		case <-timeout:
+			t.Fatal("timed out waiting for api to work")
+			return
+		default:
+			status, response, _ := MakeAPICall(t, vtorc, url)
+			if retry(status, response) {
+				time.Sleep(1 * time.Second)
+				break
+			}
+			return status, response
+		}
+	}
 }
 
 // SetupNewClusterSemiSync is used to setup a new cluster with semi-sync set.
 // It creates a cluster with 4 tablets, one of which is a Replica
-func SetupNewClusterSemiSync(t *testing.T) *VtOrcClusterInfo {
+func SetupNewClusterSemiSync(t *testing.T) *VTOrcClusterInfo {
 	var tablets []*cluster.Vttablet
 	clusterInstance := cluster.NewCluster(Cell1, Hostname)
 	keyspace := &cluster.Keyspace{Name: keyspaceName}
@@ -761,7 +786,6 @@ func SetupNewClusterSemiSync(t *testing.T) *VtOrcClusterInfo {
 	clusterInstance.VtTabletExtraArgs = []string{
 		"--lock_tables_timeout", "5s",
 		"--disable_active_reparents",
-		"--enable_semi_sync",
 	}
 
 	// Initialize Cluster
@@ -800,24 +824,24 @@ func SetupNewClusterSemiSync(t *testing.T) *VtOrcClusterInfo {
 		require.NoError(t, err)
 	}
 
-	vtctldClientProcess := cluster.VtctldClientProcessInstance("localhost", clusterInstance.VtctldProcess.GrpcPort, clusterInstance.TmpDirectory)
-
-	out, err := vtctldClientProcess.ExecuteCommandWithOutput("SetKeyspaceDurabilityPolicy", keyspaceName, fmt.Sprintf("--durability-policy=semi_sync"))
+	out, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("SetKeyspaceDurabilityPolicy", keyspaceName, "--durability-policy=semi_sync")
 	require.NoError(t, err, out)
 
-	clusterInfo := &VtOrcClusterInfo{
-		ClusterInstance:     clusterInstance,
-		Ts:                  nil,
-		CellInfos:           nil,
-		lastUsedValue:       100,
-		VtctldClientProcess: vtctldClientProcess,
+	// create topo server connection
+	ts, err := topo.OpenServer(*clusterInstance.TopoFlavorString(), clusterInstance.VtctlProcess.TopoGlobalAddress, clusterInstance.VtctlProcess.TopoGlobalRoot)
+	require.NoError(t, err)
+	clusterInfo := &VTOrcClusterInfo{
+		ClusterInstance: clusterInstance,
+		Ts:              ts,
+		CellInfos:       nil,
+		lastUsedValue:   100,
 	}
 	return clusterInfo
 }
 
 // AddSemiSyncKeyspace is used to setup a new keyspace with semi-sync.
 // It creates a keyspace with 3 tablets
-func AddSemiSyncKeyspace(t *testing.T, clusterInfo *VtOrcClusterInfo) {
+func AddSemiSyncKeyspace(t *testing.T, clusterInfo *VTOrcClusterInfo) {
 	var tablets []*cluster.Vttablet
 	keyspaceSemiSyncName := "ks2"
 	keyspace := &cluster.Keyspace{Name: keyspaceSemiSyncName}
@@ -837,7 +861,6 @@ func AddSemiSyncKeyspace(t *testing.T, clusterInfo *VtOrcClusterInfo) {
 	clusterInfo.ClusterInstance.VtTabletExtraArgs = []string{
 		"--lock_tables_timeout", "5s",
 		"--disable_active_reparents",
-		"--enable_semi_sync",
 	}
 
 	// Initialize Cluster
@@ -877,7 +900,7 @@ func AddSemiSyncKeyspace(t *testing.T, clusterInfo *VtOrcClusterInfo) {
 	}
 
 	vtctldClientProcess := cluster.VtctldClientProcessInstance("localhost", clusterInfo.ClusterInstance.VtctldProcess.GrpcPort, clusterInfo.ClusterInstance.TmpDirectory)
-	out, err := vtctldClientProcess.ExecuteCommandWithOutput("SetKeyspaceDurabilityPolicy", keyspaceSemiSyncName, fmt.Sprintf("--durability-policy=semi_sync"))
+	out, err := vtctldClientProcess.ExecuteCommandWithOutput("SetKeyspaceDurabilityPolicy", keyspaceSemiSyncName, "--durability-policy=semi_sync")
 	require.NoError(t, err, out)
 }
 
@@ -913,4 +936,55 @@ func WaitForReadOnlyValue(t *testing.T, curPrimary *cluster.Vttablet, expectValu
 		time.Sleep(time.Second)
 	}
 	return false
+}
+
+// WaitForSuccessfulRecoveryCount waits until the given recovery name's count of successful runs matches the count expected
+func WaitForSuccessfulRecoveryCount(t *testing.T, vtorcInstance *cluster.VTOrcProcess, recoveryName string, countExpected int) {
+	t.Helper()
+	timeout := 15 * time.Second
+	startTime := time.Now()
+	for time.Since(startTime) < timeout {
+		vars := vtorcInstance.GetVars()
+		successfulRecoveriesMap := vars["SuccessfulRecoveries"].(map[string]interface{})
+		successCount := successfulRecoveriesMap[recoveryName]
+		if successCount == countExpected {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	vars := vtorcInstance.GetVars()
+	successfulRecoveriesMap := vars["SuccessfulRecoveries"].(map[string]interface{})
+	successCount := successfulRecoveriesMap[recoveryName]
+	assert.EqualValues(t, countExpected, successCount)
+}
+
+// WaitForInstancePollSecondsExceededCount waits for 30 seconds and then queries api/aggregated-discovery-metrics.
+// It expects to find minimum occurrence or exact count of `keyName` provided.
+func WaitForInstancePollSecondsExceededCount(t *testing.T, vtorcInstance *cluster.VTOrcProcess, keyName string, minCountExpected float64, enforceEquality bool) {
+	t.Helper()
+	var sinceInSeconds = 30
+	duration := time.Duration(sinceInSeconds)
+	time.Sleep(duration * time.Second)
+
+	statusCode, res, err := vtorcInstance.MakeAPICall("api/aggregated-discovery-metrics?seconds=" + strconv.Itoa(sinceInSeconds))
+	if err != nil {
+		assert.Fail(t, "Not able to call api/aggregated-discovery-metrics")
+	}
+	if statusCode == 200 {
+		resultMap := make(map[string]any)
+		err := json.Unmarshal([]byte(res), &resultMap)
+		if err != nil {
+			assert.Fail(t, "invalid response from api/aggregated-discovery-metrics")
+		}
+		successCount := resultMap[keyName]
+		if iSuccessCount, ok := successCount.(float64); ok {
+			if enforceEquality {
+				assert.Equal(t, iSuccessCount, minCountExpected)
+			} else {
+				assert.GreaterOrEqual(t, iSuccessCount, minCountExpected)
+			}
+			return
+		}
+	}
+	assert.Fail(t, "invalid response from api/aggregated-discovery-metrics")
 }

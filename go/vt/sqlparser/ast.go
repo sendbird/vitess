@@ -16,6 +16,11 @@ limitations under the License.
 
 package sqlparser
 
+import (
+	"vitess.io/vitess/go/mysql/datetime"
+	"vitess.io/vitess/go/sqltypes"
+)
+
 /*
 This is the Vitess AST. This file should only contain pure struct declarations,
 or methods used to mark a struct as implementing an interface. All other methods
@@ -56,12 +61,14 @@ type (
 		AddOrder(*Order)
 		SetOrderBy(OrderBy)
 		GetOrderBy() OrderBy
+		GetLimit() *Limit
 		SetLimit(*Limit)
 		SetLock(lock Lock)
 		SetInto(into *SelectInto)
 		SetWith(with *With)
 		MakeDistinct()
 		GetColumnCount() int
+		GetColumns() SelectExprs
 		Commented
 	}
 
@@ -144,7 +151,7 @@ type (
 
 	// CommonTableExpr is the structure for supporting common table expressions
 	CommonTableExpr struct {
-		TableID  TableIdent
+		ID       IdentifierCS
 		Columns  Columns
 		Subquery *Subquery
 	}
@@ -177,13 +184,13 @@ type (
 
 	// AlterCheck represents the `ALTER CHECK` part in an `ALTER TABLE ALTER CHECK` command.
 	AlterCheck struct {
-		Name     ColIdent
+		Name     IdentifierCI
 		Enforced bool
 	}
 
 	// AlterIndex represents the `ALTER INDEX` part in an `ALTER TABLE ALTER INDEX` command.
 	AlterIndex struct {
-		Name      ColIdent
+		Name      IdentifierCI
 		Invisible bool
 	}
 
@@ -208,7 +215,7 @@ type (
 	// DropKey is used to drop a key in an alter table statement
 	DropKey struct {
 		Type DropKeyType
-		Name ColIdent
+		Name IdentifierCI
 	}
 
 	// Force is used to specify force alter option in an alter table statement
@@ -234,8 +241,8 @@ type (
 
 	// RenameIndex clause is used to rename indexes in an alter table statement
 	RenameIndex struct {
-		OldName ColIdent
-		NewName ColIdent
+		OldName IdentifierCI
+		NewName IdentifierCI
 	}
 
 	// Validation clause is used to specify whether to use validation or not
@@ -318,10 +325,12 @@ type (
 	// of the implications the deletion part may have on vindexes.
 	// If you add fields here, consider adding them to calls to validateUnshardedRoute.
 	Insert struct {
-		Action     InsertAction
-		Comments   *ParsedComments
-		Ignore     Ignore
-		Table      TableName
+		Action   InsertAction
+		Comments *ParsedComments
+		Ignore   Ignore
+		// The Insert as syntax still take TableName.
+		// The change is made for semantic analyzer as it takes AliasedTableExpr to provide TableInfo
+		Table      *AliasedTableExpr
 		Partitions Partitions
 		Columns    Columns
 		Rows       InsertRows
@@ -367,33 +376,10 @@ type (
 		Exprs    SetExprs
 	}
 
-	// SetTransaction represents a SET TRANSACTION statement.
-	SetTransaction struct {
-		SQLNode
-		Comments        *ParsedComments
-		Scope           Scope
-		Characteristics []Characteristic
-	}
-
-	// Scope is an enum for scope of query
-	Scope int8
-
-	// Characteristic is a transaction related change
-	Characteristic interface {
-		SQLNode
-		iChar()
-	}
-
-	// IsolationLevel is an enum for isolation levels
-	IsolationLevel int8
-
-	// AccessMode is enum for the mode - ReadOnly or ReadWrite
-	AccessMode int8
-
 	// DropDatabase represents a DROP database statement.
 	DropDatabase struct {
 		Comments *ParsedComments
-		DBName   TableIdent
+		DBName   IdentifierCS
 		IfExists bool
 	}
 
@@ -410,7 +396,7 @@ type (
 	// CreateDatabase represents a CREATE database statement.
 	CreateDatabase struct {
 		Comments      *ParsedComments
-		DBName        TableIdent
+		DBName        IdentifierCS
 		IfNotExists   bool
 		CreateOptions []DatabaseOption
 		FullyParsed   bool
@@ -418,7 +404,7 @@ type (
 
 	// AlterDatabase represents a ALTER database statement.
 	AlterDatabase struct {
-		DBName              TableIdent
+		DBName              IdentifierCS
 		UpdateDataDirectory bool
 		AlterOptions        []DatabaseOption
 		FullyParsed         bool
@@ -458,7 +444,7 @@ type (
 		VindexSpec *VindexSpec
 
 		// VindexCols is set for AddColVindexDDLAction.
-		VindexCols []ColIdent
+		VindexCols []IdentifierCI
 
 		// AutoIncSpec is set for AddAutoIncDDLAction.
 		AutoIncSpec *AutoIncSpec
@@ -472,6 +458,11 @@ type (
 
 	// ShowThrottledApps represents a SHOW VITESS_THROTTLED_APPS statement
 	ShowThrottledApps struct {
+		Comments Comments
+	}
+
+	// ShowThrottlerStatus represents a SHOW VITESS_THROTTLED_APPS statement
+	ShowThrottlerStatus struct {
 		Comments Comments
 	}
 
@@ -490,6 +481,7 @@ type (
 		UUID   string
 		Expire string
 		Ratio  *Literal
+		Shards string
 	}
 
 	// AlterTable represents a ALTER TABLE statement.
@@ -567,6 +559,12 @@ type (
 	Load struct {
 	}
 
+	// PurgeBinaryLogs represents a PURGE BINARY LOGS statement
+	PurgeBinaryLogs struct {
+		To     string
+		Before string
+	}
+
 	// Show represents a show statement.
 	Show struct {
 		Internal ShowInternal
@@ -574,11 +572,16 @@ type (
 
 	// Use represents a use statement.
 	Use struct {
-		DBName TableIdent
+		DBName IdentifierCS
 	}
 
+	// TxAccessMode is an enum for Transaction Access Mode
+	TxAccessMode int8
+
 	// Begin represents a Begin statement.
-	Begin struct{}
+	Begin struct {
+		TxAccessModes []TxAccessMode
+	}
 
 	// Commit represents a Commit statement.
 	Commit struct{}
@@ -588,17 +591,17 @@ type (
 
 	// SRollback represents a rollback to savepoint statement.
 	SRollback struct {
-		Name ColIdent
+		Name IdentifierCI
 	}
 
 	// Savepoint represents a savepoint statement.
 	Savepoint struct {
-		Name ColIdent
+		Name IdentifierCI
 	}
 
 	// Release represents a release savepoint statement.
 	Release struct {
-		Name ColIdent
+		Name IdentifierCI
 	}
 
 	// CallProc represents a CALL statement
@@ -634,6 +637,17 @@ type (
 	ExplainStmt struct {
 		Type      ExplainType
 		Statement Statement
+		Comments  *ParsedComments
+	}
+
+	// VExplainType is an enum for VExplainStmt.Type
+	VExplainType int8
+
+	// VExplainStmt represents an VtExplain statement
+	VExplainStmt struct {
+		Type      VExplainType
+		Statement Statement
+		Comments  *ParsedComments
 	}
 
 	// ExplainTab represents the Explain table
@@ -645,7 +659,7 @@ type (
 	// PrepareStmt represents a Prepare Statement
 	// More info available on https://dev.mysql.com/doc/refman/8.0/en/sql-prepared-statements.html
 	PrepareStmt struct {
-		Name      ColIdent
+		Name      IdentifierCI
 		Statement Expr
 		Comments  *ParsedComments
 	}
@@ -653,24 +667,17 @@ type (
 	// ExecuteStmt represents an Execute Statement
 	// More info available on https://dev.mysql.com/doc/refman/8.0/en/execute.html
 	ExecuteStmt struct {
-		Name      ColIdent
+		Name      IdentifierCI
 		Comments  *ParsedComments
-		Arguments Columns
+		Arguments []*Variable
 	}
 
 	// DeallocateStmt represents a Deallocate Statement
 	// More info available on https://dev.mysql.com/doc/refman/8.0/en/deallocate-prepare.html
 	DeallocateStmt struct {
-		Type     DeallocateStmtType
 		Comments *ParsedComments
-		Name     ColIdent
+		Name     IdentifierCI
 	}
-
-	// DeallocateStmtType is an enum to get types of deallocate
-	DeallocateStmtType int8
-
-	// IntervalTypes is an enum to get types of intervals
-	IntervalTypes int8
 
 	// OtherRead represents a DESCRIBE, or EXPLAIN statement.
 	// It should be used only as an indicator. It does not contain
@@ -682,55 +689,73 @@ type (
 	// It should be used only as an indicator. It does not contain
 	// the full AST for the statement.
 	OtherAdmin struct{}
+
+	// CommentOnly represents a query which only has comments
+	CommentOnly struct {
+		Comments []string
+	}
+
+	// KillType is an enum for Kill.Type
+	KillType int8
+
+	// Kill represents a kill statement
+	Kill struct {
+		Type          KillType
+		ProcesslistID uint64
+	}
 )
 
-func (*Union) iStatement()             {}
-func (*Select) iStatement()            {}
-func (*Stream) iStatement()            {}
-func (*VStream) iStatement()           {}
-func (*Insert) iStatement()            {}
-func (*Update) iStatement()            {}
-func (*Delete) iStatement()            {}
-func (*Set) iStatement()               {}
-func (*SetTransaction) iStatement()    {}
-func (*DropDatabase) iStatement()      {}
-func (*Flush) iStatement()             {}
-func (*Show) iStatement()              {}
-func (*Use) iStatement()               {}
-func (*Begin) iStatement()             {}
-func (*Commit) iStatement()            {}
-func (*Rollback) iStatement()          {}
-func (*SRollback) iStatement()         {}
-func (*Savepoint) iStatement()         {}
-func (*Release) iStatement()           {}
-func (*OtherRead) iStatement()         {}
-func (*OtherAdmin) iStatement()        {}
-func (*Select) iSelectStatement()      {}
-func (*Union) iSelectStatement()       {}
-func (*Load) iStatement()              {}
-func (*CreateDatabase) iStatement()    {}
-func (*AlterDatabase) iStatement()     {}
-func (*CreateTable) iStatement()       {}
-func (*CreateView) iStatement()        {}
-func (*AlterView) iStatement()         {}
-func (*LockTables) iStatement()        {}
-func (*UnlockTables) iStatement()      {}
-func (*AlterTable) iStatement()        {}
-func (*AlterVschema) iStatement()      {}
-func (*AlterMigration) iStatement()    {}
-func (*RevertMigration) iStatement()   {}
-func (*ShowMigrationLogs) iStatement() {}
-func (*ShowThrottledApps) iStatement() {}
-func (*DropTable) iStatement()         {}
-func (*DropView) iStatement()          {}
-func (*TruncateTable) iStatement()     {}
-func (*RenameTable) iStatement()       {}
-func (*CallProc) iStatement()          {}
-func (*ExplainStmt) iStatement()       {}
-func (*ExplainTab) iStatement()        {}
-func (*PrepareStmt) iStatement()       {}
-func (*ExecuteStmt) iStatement()       {}
-func (*DeallocateStmt) iStatement()    {}
+func (*Union) iStatement()               {}
+func (*Select) iStatement()              {}
+func (*Stream) iStatement()              {}
+func (*VStream) iStatement()             {}
+func (*Insert) iStatement()              {}
+func (*Update) iStatement()              {}
+func (*Delete) iStatement()              {}
+func (*Set) iStatement()                 {}
+func (*DropDatabase) iStatement()        {}
+func (*Flush) iStatement()               {}
+func (*Show) iStatement()                {}
+func (*Use) iStatement()                 {}
+func (*Begin) iStatement()               {}
+func (*Commit) iStatement()              {}
+func (*Rollback) iStatement()            {}
+func (*SRollback) iStatement()           {}
+func (*Savepoint) iStatement()           {}
+func (*Release) iStatement()             {}
+func (*OtherRead) iStatement()           {}
+func (*OtherAdmin) iStatement()          {}
+func (*CommentOnly) iStatement()         {}
+func (*Select) iSelectStatement()        {}
+func (*Union) iSelectStatement()         {}
+func (*Load) iStatement()                {}
+func (*CreateDatabase) iStatement()      {}
+func (*AlterDatabase) iStatement()       {}
+func (*CreateTable) iStatement()         {}
+func (*CreateView) iStatement()          {}
+func (*AlterView) iStatement()           {}
+func (*LockTables) iStatement()          {}
+func (*UnlockTables) iStatement()        {}
+func (*AlterTable) iStatement()          {}
+func (*AlterVschema) iStatement()        {}
+func (*AlterMigration) iStatement()      {}
+func (*RevertMigration) iStatement()     {}
+func (*ShowMigrationLogs) iStatement()   {}
+func (*ShowThrottledApps) iStatement()   {}
+func (*ShowThrottlerStatus) iStatement() {}
+func (*DropTable) iStatement()           {}
+func (*DropView) iStatement()            {}
+func (*TruncateTable) iStatement()       {}
+func (*RenameTable) iStatement()         {}
+func (*CallProc) iStatement()            {}
+func (*ExplainStmt) iStatement()         {}
+func (*VExplainStmt) iStatement()        {}
+func (*ExplainTab) iStatement()          {}
+func (*PrepareStmt) iStatement()         {}
+func (*ExecuteStmt) iStatement()         {}
+func (*DeallocateStmt) iStatement()      {}
+func (*PurgeBinaryLogs) iStatement()     {}
+func (*Kill) iStatement()                {}
 
 func (*CreateView) iDDLStatement()    {}
 func (*AlterView) iDDLStatement()     {}
@@ -1252,42 +1277,52 @@ func (node *AlterView) SetFromTables(tables TableNames) {
 	// irrelevant
 }
 
-// SetComments implements DDLStatement.
+// SetComments implements Commented interface.
 func (node *RenameTable) SetComments(comments Comments) {
 	// irrelevant
 }
 
-// SetComments implements DDLStatement.
+// SetComments implements Commented interface.
 func (node *TruncateTable) SetComments(comments Comments) {
 	// irrelevant
 }
 
-// SetComments implements DDLStatement.
+// SetComments implements Commented interface.
 func (node *AlterTable) SetComments(comments Comments) {
 	node.Comments = comments.Parsed()
 }
 
-// SetComments implements DDLStatement.
+// SetComments implements Commented interface.
+func (node *ExplainStmt) SetComments(comments Comments) {
+	node.Comments = comments.Parsed()
+}
+
+// SetComments implements Commented interface.
+func (node *VExplainStmt) SetComments(comments Comments) {
+	node.Comments = comments.Parsed()
+}
+
+// SetComments implements Commented interface.
 func (node *CreateTable) SetComments(comments Comments) {
 	node.Comments = comments.Parsed()
 }
 
-// SetComments implements DDLStatement.
+// SetComments implements Commented interface.
 func (node *CreateView) SetComments(comments Comments) {
 	node.Comments = comments.Parsed()
 }
 
-// SetComments implements DDLStatement.
+// SetComments implements Commented interface.
 func (node *DropTable) SetComments(comments Comments) {
 	node.Comments = comments.Parsed()
 }
 
-// SetComments implements DDLStatement.
+// SetComments implements Commented interface.
 func (node *DropView) SetComments(comments Comments) {
 	node.Comments = comments.Parsed()
 }
 
-// SetComments implements DDLStatement.
+// SetComments implements Commented interface.
 func (node *AlterView) SetComments(comments Comments) {
 	node.Comments = comments.Parsed()
 }
@@ -1322,44 +1357,54 @@ func (node *VStream) SetComments(comments Comments) {
 	node.Comments = comments.Parsed()
 }
 
-// GetParsedComments implements DDLStatement.
+// GetParsedComments implements Commented interface.
 func (node *RenameTable) GetParsedComments() *ParsedComments {
 	// irrelevant
 	return nil
 }
 
-// GetParsedComments implements DDLStatement.
+// GetParsedComments implements Commented interface.
 func (node *TruncateTable) GetParsedComments() *ParsedComments {
 	// irrelevant
 	return nil
 }
 
-// GetParsedComments implements DDLStatement.
+// GetParsedComments implements Commented interface.
 func (node *AlterTable) GetParsedComments() *ParsedComments {
 	return node.Comments
 }
 
-// GetParsedComments implements DDLStatement.
+// GetParsedComments implements Commented interface.
+func (node *ExplainStmt) GetParsedComments() *ParsedComments {
+	return node.Comments
+}
+
+// GetParsedComments implements Commented interface.
+func (node *VExplainStmt) GetParsedComments() *ParsedComments {
+	return node.Comments
+}
+
+// GetParsedComments implements Commented interface.
 func (node *CreateTable) GetParsedComments() *ParsedComments {
 	return node.Comments
 }
 
-// GetParsedComments implements DDLStatement.
+// GetParsedComments implements Commented interface.
 func (node *CreateView) GetParsedComments() *ParsedComments {
 	return node.Comments
 }
 
-// GetParsedComments implements DDLStatement.
+// GetParsedComments implements Commented interface.
 func (node *DropTable) GetParsedComments() *ParsedComments {
 	return node.Comments
 }
 
-// GetParsedComments implements DDLStatement.
+// GetParsedComments implements Commented interface.
 func (node *DropView) GetParsedComments() *ParsedComments {
 	return node.Comments
 }
 
-// GetParsedComments implements DDLStatement.
+// GetParsedComments implements Commented interface.
 func (node *AlterView) GetParsedComments() *ParsedComments {
 	return node.Comments
 }
@@ -1493,32 +1538,32 @@ func (node *DropView) AffectedTables() TableNames {
 
 // SetTable implements DDLStatement.
 func (node *TruncateTable) SetTable(qualifier string, name string) {
-	node.Table.Qualifier = NewTableIdent(qualifier)
-	node.Table.Name = NewTableIdent(name)
+	node.Table.Qualifier = NewIdentifierCS(qualifier)
+	node.Table.Name = NewIdentifierCS(name)
 }
 
 // SetTable implements DDLStatement.
 func (node *AlterTable) SetTable(qualifier string, name string) {
-	node.Table.Qualifier = NewTableIdent(qualifier)
-	node.Table.Name = NewTableIdent(name)
+	node.Table.Qualifier = NewIdentifierCS(qualifier)
+	node.Table.Name = NewIdentifierCS(name)
 }
 
 // SetTable implements DDLStatement.
 func (node *CreateTable) SetTable(qualifier string, name string) {
-	node.Table.Qualifier = NewTableIdent(qualifier)
-	node.Table.Name = NewTableIdent(name)
+	node.Table.Qualifier = NewIdentifierCS(qualifier)
+	node.Table.Name = NewIdentifierCS(name)
 }
 
 // SetTable implements DDLStatement.
 func (node *CreateView) SetTable(qualifier string, name string) {
-	node.ViewName.Qualifier = NewTableIdent(qualifier)
-	node.ViewName.Name = NewTableIdent(name)
+	node.ViewName.Qualifier = NewIdentifierCS(qualifier)
+	node.ViewName.Name = NewIdentifierCS(name)
 }
 
 // SetTable implements DDLStatement.
 func (node *AlterView) SetTable(qualifier string, name string) {
-	node.ViewName.Qualifier = NewTableIdent(qualifier)
-	node.ViewName.Name = NewTableIdent(name)
+	node.ViewName.Qualifier = NewIdentifierCS(qualifier)
+	node.ViewName.Name = NewIdentifierCS(name)
 }
 
 // SetTable implements DDLStatement.
@@ -1593,7 +1638,7 @@ type (
 		Command ShowCommandType
 		Full    bool
 		Tbl     TableName
-		DbName  TableIdent
+		DbName  IdentifierCS
 		Filter  *ShowFilter
 	}
 
@@ -1644,7 +1689,7 @@ type PartitionSpecAction int8
 
 // PartitionDefinition describes a very minimal partition definition
 type PartitionDefinition struct {
-	Name    ColIdent
+	Name    IdentifierCI
 	Options *PartitionDefinitionOptions
 }
 
@@ -1662,7 +1707,7 @@ type PartitionDefinitionOptions struct {
 
 // Subpartition Definition Corresponds to the subpartition_definition option of partition_definition
 type SubPartitionDefinition struct {
-	Name    ColIdent
+	Name    IdentifierCI
 	Options *SubPartitionDefinitionOptions
 }
 
@@ -1733,9 +1778,8 @@ type TableSpec struct {
 
 // ColumnDefinition describes a column in a CREATE TABLE statement
 type ColumnDefinition struct {
-	Name ColIdent
-	// TODO: Should this not be a reference?
-	Type ColumnType
+	Name IdentifierCI
+	Type *ColumnType
 }
 
 // ColumnType represents a sql type in a CREATE TABLE statement
@@ -1838,8 +1882,8 @@ type IndexDefinition struct {
 // IndexInfo describes the name and type of an index in a CREATE TABLE statement
 type IndexInfo struct {
 	Type           string
-	Name           ColIdent
-	ConstraintName ColIdent
+	Name           IdentifierCI
+	ConstraintName IdentifierCI
 	Primary        bool
 	Spatial        bool
 	Fulltext       bool
@@ -1848,26 +1892,26 @@ type IndexInfo struct {
 
 // VindexSpec defines a vindex for a CREATE VINDEX or DROP VINDEX statement
 type VindexSpec struct {
-	Name   ColIdent
-	Type   ColIdent
+	Name   IdentifierCI
+	Type   IdentifierCI
 	Params []VindexParam
 }
 
 // AutoIncSpec defines and autoincrement value for a ADD AUTO_INCREMENT statement
 type AutoIncSpec struct {
-	Column   ColIdent
+	Column   IdentifierCI
 	Sequence TableName
 }
 
 // VindexParam defines a key/value parameter for a CREATE VINDEX statement
 type VindexParam struct {
-	Key ColIdent
+	Key IdentifierCI
 	Val string
 }
 
 // ConstraintDefinition describes a constraint in a CREATE TABLE statement
 type ConstraintDefinition struct {
-	Name    ColIdent
+	Name    IdentifierCI
 	Details ConstraintInfo
 }
 
@@ -1881,7 +1925,7 @@ type (
 	// ForeignKeyDefinition describes a foreign key in a CREATE TABLE statement
 	ForeignKeyDefinition struct {
 		Source              Columns
-		IndexName           ColIdent
+		IndexName           IdentifierCI
 		ReferenceDefinition *ReferenceDefinition
 	}
 
@@ -1919,7 +1963,7 @@ func (c Comments) Parsed() *ParsedComments {
 
 type ParsedComments struct {
 	comments    Comments
-	_directives CommentDirectives
+	_directives *CommentDirectives
 }
 
 // SelectExprs represents SELECT expressions.
@@ -1940,7 +1984,7 @@ type (
 	// AliasedExpr defines an aliased SELECT expression.
 	AliasedExpr struct {
 		Expr Expr
-		As   ColIdent
+		As   IdentifierCI
 	}
 
 	// Nextval defines the NEXT VALUE expression.
@@ -1954,7 +1998,7 @@ func (*AliasedExpr) iSelectExpr() {}
 func (*Nextval) iSelectExpr()     {}
 
 // Columns represents an insert column list.
-type Columns []ColIdent
+type Columns []IdentifierCI
 
 // Partitions is a type alias for Columns so we can handle printing efficiently
 type Partitions Columns
@@ -1975,7 +2019,7 @@ type (
 	AliasedTableExpr struct {
 		Expr       SimpleTableExpr
 		Partitions Partitions
-		As         TableIdent
+		As         IdentifierCS
 		Hints      IndexHints
 		Columns    Columns
 	}
@@ -2009,13 +2053,13 @@ type (
 		SQLNode
 	}
 
-	// TableName represents a table  name.
+	// TableName represents a table name.
 	// Qualifier, if specified, represents a database or keyspace.
 	// TableName is a value struct whose fields are case sensitive.
 	// This means two TableName vars can be compared for equality
 	// and a TableName can also be used as key in a map.
 	TableName struct {
-		Name, Qualifier TableIdent
+		Name, Qualifier IdentifierCS
 	}
 
 	// Subquery represents a subquery used as an value expression.
@@ -2048,7 +2092,7 @@ type JoinCondition struct {
 type IndexHint struct {
 	Type    IndexHintType
 	ForType IndexHintForType
-	Indexes []ColIdent
+	Indexes []IdentifierCI
 }
 
 // IndexHints represents a list of index hints.
@@ -2091,14 +2135,14 @@ type (
 	// WindowSpecification represents window_spec
 	// More information available here: https://dev.mysql.com/doc/refman/8.0/en/window-functions-usage.html
 	WindowSpecification struct {
-		Name            ColIdent
+		Name            IdentifierCI
 		PartitionClause Exprs
 		OrderClause     OrderBy
 		FrameClause     *FrameClause
 	}
 
 	WindowDefinition struct {
-		Name       ColIdent
+		Name       IdentifierCI
 		WindowSpec *WindowSpecification
 	}
 
@@ -2122,13 +2166,14 @@ type (
 	// More information available here: https://dev.mysql.com/doc/refman/8.0/en/window-functions-frames.html
 	FramePoint struct {
 		Type FramePointType
+		Unit IntervalType
 		Expr Expr
 	}
 
 	// OverClause refers to over_clause
 	// More information available here: https://dev.mysql.com/doc/refman/8.0/en/window-functions-usage.html
 	OverClause struct {
-		WindowName ColIdent
+		WindowName IdentifierCI
 		WindowSpec *WindowSpecification
 	}
 
@@ -2229,6 +2274,11 @@ type (
 		Subquery *Subquery
 	}
 
+	// AssignmentExpr represents an expression of type @value := x.
+	AssignmentExpr struct {
+		Left, Right Expr
+	}
+
 	// Literal represents a fixed value.
 	Literal struct {
 		Type ValType
@@ -2236,7 +2286,10 @@ type (
 	}
 
 	// Argument represents bindvariable expression
-	Argument string
+	Argument struct {
+		Name string
+		Type sqltypes.Type
+	}
 
 	// NullVal represents a NULL value.
 	NullVal struct{}
@@ -2251,8 +2304,16 @@ type (
 		// additional data, typically info about which
 		// table or column this node references.
 		Metadata  any
-		Name      ColIdent
+		Name      IdentifierCI
 		Qualifier TableName
+	}
+
+	// Scope is an enum for scope of query
+	Scope int8
+
+	Variable struct {
+		Scope Scope
+		Name  IdentifierCI
 	}
 
 	// ColTuple represents a list of column values.
@@ -2292,24 +2353,17 @@ type (
 		Expr         Expr
 	}
 
-	// IntervalExpr represents a date-time INTERVAL expression.
-	IntervalExpr struct {
-		Expr Expr
-		Unit string
-	}
-
-	// TimestampFuncExpr represents the function and arguments for TIMESTAMP{ADD,DIFF} functions.
-	TimestampFuncExpr struct {
-		Name  string
+	// TimestampDiffExpr represents the function and arguments for TIMESTAMPDIFF functions.
+	TimestampDiffExpr struct {
 		Expr1 Expr
 		Expr2 Expr
-		Unit  string
+		Unit  IntervalType
 	}
 
 	// ExtractFuncExpr represents the function and arguments for EXTRACT(YEAR FROM '2019-07-02') type functions.
 	ExtractFuncExpr struct {
-		IntervalTypes IntervalTypes
-		Expr          Expr
+		IntervalType IntervalType
+		Expr         Expr
 	}
 
 	// CollateExpr represents dynamic collate operator.
@@ -2326,19 +2380,9 @@ type (
 
 	// FuncExpr represents a function call.
 	FuncExpr struct {
-		Qualifier TableIdent
-		Name      ColIdent
-		Distinct  bool
+		Qualifier IdentifierCS
+		Name      IdentifierCI
 		Exprs     SelectExprs
-	}
-
-	// GroupConcatExpr represents a call to GROUP_CONCAT
-	GroupConcatExpr struct {
-		Distinct  bool
-		Exprs     SelectExprs
-		OrderBy   OrderBy
-		Separator string
-		Limit     *Limit
 	}
 
 	// ValuesFuncExpr represents a function call.
@@ -2357,12 +2401,20 @@ type (
 		To   Expr
 	}
 
-	// ConvertExpr represents a call to CONVERT(expr, type)
-	// or it's equivalent CAST(expr AS type). Both are rewritten to the former.
-	ConvertExpr struct {
+	// CastExpr represents a call to CAST(expr AS type)
+	// This is separate from CONVERT(expr, type) since there are
+	// places such as in CREATE TABLE statements where they
+	// are treated differently.
+	CastExpr struct {
 		Expr  Expr
 		Type  *ConvertType
 		Array bool
+	}
+
+	// ConvertExpr represents a call to CONVERT(expr, type)
+	ConvertExpr struct {
+		Expr Expr
+		Type *ConvertType
 	}
 
 	// ConvertUsingExpr represents a call to CONVERT(expr USING charset).
@@ -2373,7 +2425,7 @@ type (
 
 	// MatchExpr represents a call to the MATCH function
 	MatchExpr struct {
-		Columns SelectExprs
+		Columns []*ColName
 		Expr    Expr
 		Option  MatchExprOption
 	}
@@ -2386,6 +2438,33 @@ type (
 		Expr  Expr
 		Whens []*When
 		Else  Expr
+	}
+
+	// InsertExpr represents an INSERT expression
+	InsertExpr struct {
+		Str    Expr
+		Pos    Expr
+		Len    Expr
+		NewStr Expr
+	}
+
+	// IntervalFuncExpr represents an INTERVAL function expression
+	IntervalFuncExpr struct {
+		Expr  Expr
+		Exprs Exprs
+	}
+
+	// LocateExpr represents a LOCATE function expression
+	LocateExpr struct {
+		SubStr Expr
+		Str    Expr
+		Pos    Expr
+	}
+
+	// CharExpr represents a CHAR function expression
+	CharExpr struct {
+		Exprs   Exprs
+		Charset string
 	}
 
 	// Default represents a DEFAULT expression.
@@ -2402,19 +2481,19 @@ type (
 	// CurTimeFuncExpr represents the function and arguments for CURRENT DATE/TIME functions
 	// supported functions are documented in the grammar
 	CurTimeFuncExpr struct {
-		Name ColIdent
-		Fsp  Expr // fractional seconds precision, integer from 0 to 6 or an Argument
+		Name IdentifierCI
+		Fsp  int // fractional seconds precision, integer from 0 to 6 or an Argument
 	}
 
 	// ExtractedSubquery is a subquery that has been extracted from the original AST
 	// This is a struct that the parser will never produce - it's written and read by the gen4 planner
 	// CAUTION: you should only change argName and hasValuesArg through the setter methods
 	ExtractedSubquery struct {
-		Original     Expr // original expression that was replaced by this ExtractedSubquery
-		OpCode       int  // this should really be engine.PulloutOpCode, but we cannot depend on engine :(
-		Subquery     *Subquery
-		OtherSide    Expr // represents the side of the comparison, this field will be nil if Original is not a comparison
-		NeedsRewrite bool // tells whether we need to rewrite this subquery to Original or not
+		Original  Expr // original expression that was replaced by this ExtractedSubquery
+		OpCode    int  // this should really be engine.PulloutOpCode, but we cannot depend on engine :(
+		Subquery  *Subquery
+		OtherSide Expr // represents the side of the comparison, this field will be nil if Original is not a comparison
+		Merged    bool // tells whether we need to rewrite this subquery to Original or not
 
 		hasValuesArg string
 		argName      string
@@ -2443,7 +2522,7 @@ type (
 	// it is the column offset from the incoming result stream
 	Offset struct {
 		V        int
-		Original string
+		Original Expr
 	}
 
 	// JSONArrayExpr represents JSON_ARRAY()
@@ -2471,10 +2550,10 @@ type (
 	}
 
 	// JSONTableExpr describes the components of JSON_TABLE()
-	// For more information, visit https://dev.mysql.com/doc/refman/8.0/en/json-table-functions.html#function_json-table
+	// For more information, postVisit https://dev.mysql.com/doc/refman/8.0/en/json-table-functions.html#function_json-table
 	JSONTableExpr struct {
 		Expr    Expr
-		Alias   TableIdent
+		Alias   IdentifierCS
 		Filter  Expr
 		Columns []*JtColumnDefinition
 	}
@@ -2491,13 +2570,13 @@ type (
 
 	// JtOrdinalColDef is a type of column definition similar to using AUTO_INCREMENT with a column
 	JtOrdinalColDef struct {
-		Name ColIdent
+		Name IdentifierCI
 	}
 
 	// JtPathColDef is a type of column definition specifying the path in JSON structure to extract values
 	JtPathColDef struct {
-		Name            ColIdent
-		Type            ColumnType
+		Name            IdentifierCI
+		Type            *ColumnType
 		JtColExists     bool
 		Path            Expr
 		EmptyOnResponse *JtOnResponse
@@ -2516,15 +2595,12 @@ type (
 		Expr         Expr
 	}
 
-	// JSONPathParam is used to store the path used as arguments in different JSON functions
-	JSONPathParam Expr
-
 	// JSONContainsExpr represents the function and arguments for JSON_CONTAINS()
 	// For more information, see https://dev.mysql.com/doc/refman/8.0/en/json-search-functions.html#function_json-contains
 	JSONContainsExpr struct {
 		Target    Expr
 		Candidate Expr
-		PathList  []JSONPathParam
+		PathList  []Expr
 	}
 
 	// JSONContainsPathExpr represents the function and arguments for JSON_CONTAINS_PATH()
@@ -2532,7 +2608,7 @@ type (
 	JSONContainsPathExpr struct {
 		JSONDoc  Expr
 		OneOrAll Expr
-		PathList []JSONPathParam
+		PathList []Expr
 	}
 
 	// JSONContainsPathType is an enum to get types of Trim
@@ -2542,14 +2618,14 @@ type (
 	// For more information, see https://dev.mysql.com/doc/refman/8.0/en/json-search-functions.html#function_json-extract
 	JSONExtractExpr struct {
 		JSONDoc  Expr
-		PathList []JSONPathParam
+		PathList []Expr
 	}
 
 	// JSONKeysExpr represents the function and arguments for JSON_KEYS()
 	// For more information, see https://dev.mysql.com/doc/refman/8.0/en/json-search-functions.html#function_json-keys
 	JSONKeysExpr struct {
-		JSONDoc  Expr
-		PathList []JSONPathParam
+		JSONDoc Expr
+		Path    Expr
 	}
 
 	// JSONOverlapsExpr represents the function and arguments for JSON_OVERLAPS()
@@ -2566,14 +2642,14 @@ type (
 		OneOrAll   Expr
 		SearchStr  Expr
 		EscapeChar Expr
-		PathList   []JSONPathParam
+		PathList   []Expr
 	}
 
 	// JSONValueExpr represents the function and arguments for JSON_VALUE()
 	// For more information, see https://dev.mysql.com/doc/refman/8.0/en/json-search-functions.html#function_json-value
 	JSONValueExpr struct {
 		JSONDoc         Expr
-		Path            JSONPathParam
+		Path            Expr
 		ReturningType   *ConvertType
 		EmptyOnResponse *JtOnResponse
 		ErrorOnResponse *JtOnResponse
@@ -2605,7 +2681,7 @@ type (
 	JSONAttributesExpr struct {
 		Type    JSONAttributeType
 		JSONDoc Expr
-		Path    JSONPathParam
+		Path    Expr
 	}
 
 	// JSONAttributeType is an enum to get types of TrimFunc.
@@ -2635,20 +2711,279 @@ type (
 	JSONValueMergeType int8
 
 	// JSONRemoveExpr represents the JSON_REMOVE()
-	// For more information, visit https://dev.mysql.com/doc/refman/8.0/en/json-modification-functions.html#function_json-remove
+	// For more information, postVisit https://dev.mysql.com/doc/refman/8.0/en/json-modification-functions.html#function_json-remove
 	JSONRemoveExpr struct {
 		JSONDoc  Expr
 		PathList Exprs
 	}
 
 	// JSONRemoveExpr represents the JSON_UNQUOTE()
-	// For more information, visit https://dev.mysql.com/doc/refman/8.0/en/json-modification-functions.html#function_json-unquote
+	// For more information, postVisit https://dev.mysql.com/doc/refman/8.0/en/json-modification-functions.html#function_json-unquote
 	JSONUnquoteExpr struct {
 		JSONValue Expr
 	}
 
+	// PointExpr represents POINT(x,y) expression
+	PointExpr struct {
+		XCordinate Expr
+		YCordinate Expr
+	}
+
+	// LineString represents LineString(POINT(x,y), POINT(x,y), ..) expression
+	LineStringExpr struct {
+		PointParams Exprs
+	}
+
+	// PolygonExpr represents Polygon(LineString(POINT(x,y), POINT(x,y), ..)) expressions
+	PolygonExpr struct {
+		LinestringParams Exprs
+	}
+
+	// MultiPoint represents a geometry collection for points
+	MultiPointExpr struct {
+		PointParams Exprs
+	}
+
+	// MultiPoint represents a geometry collection for linestrings
+	MultiLinestringExpr struct {
+		LinestringParams Exprs
+	}
+
+	// MultiPolygon represents a geometry collection for polygons
+	MultiPolygonExpr struct {
+		PolygonParams Exprs
+	}
+
+	// GeomFromWktType is an enum to get the types of wkt functions with possible values: GeometryFromText GeometryCollectionFromText PointFromText LineStringFromText PolygonFromText MultiPointFromText MultiPolygonFromText MultiLinestringFromText
+	GeomFromWktType int8
+
+	GeomFromTextExpr struct {
+		Type         GeomFromWktType
+		WktText      Expr
+		Srid         Expr
+		AxisOrderOpt Expr
+	}
+
+	// GeomFromWkbType is an enum to get the types of wkb functions with possible values: GeometryFromWKB GeometryCollectionFromWKB PointFromWKB LineStringFromWKB PolygonFromWKB MultiPointFromWKB MultiPolygonFromWKB MultiLinestringFromWKB
+	GeomFromWkbType int8
+
+	GeomFromWKBExpr struct {
+		Type         GeomFromWkbType
+		WkbBlob      Expr
+		Srid         Expr
+		AxisOrderOpt Expr
+	}
+
+	// GeomFormatType is an enum to get the types of geom format functions with possible values: BinaryFormat TextFormat
+	GeomFormatType int8
+
+	GeomFormatExpr struct {
+		FormatType   GeomFormatType
+		Geom         Expr
+		AxisOrderOpt Expr
+	}
+
+	// GeomPropertyType is an enum to get the types of geom property functions with possible values: Dimension Envelope IsSimple IsEmpty GeometryType
+	GeomPropertyType int8
+
+	GeomPropertyFuncExpr struct {
+		Property GeomPropertyType
+		Geom     Expr
+	}
+
+	// PointPropertyType is an that enumerates the kind of point property functions: XCordinate YCordinate Latitude Longitude
+	PointPropertyType int8
+
+	PointPropertyFuncExpr struct {
+		Property   PointPropertyType
+		Point      Expr
+		ValueToSet Expr
+	}
+
+	// LinestrPropType is an enum that enumerates the kind of line string property functions: EndPoint IsClosed Length NumPoints PointN StartPoint
+	LinestrPropType int8
+
+	LinestrPropertyFuncExpr struct {
+		Property       LinestrPropType
+		Linestring     Expr
+		PropertyDefArg Expr
+	}
+
+	// PolygonPropType is an enum that enumerates the kind of polygon property functions: Area Centroid ExteriorRing InteriorRingN NumInteriorRing
+	PolygonPropType int8
+
+	PolygonPropertyFuncExpr struct {
+		Property       PolygonPropType
+		Polygon        Expr
+		PropertyDefArg Expr
+	}
+
+	// GeomCollPropType is an enumthat enumerates the kind of geom coll property functions with possible values: GeometryN NumGeometries
+	GeomCollPropType int8
+
+	GeomCollPropertyFuncExpr struct {
+		Property       GeomCollPropType
+		GeomColl       Expr
+		PropertyDefArg Expr
+	}
+
+	GeoHashFromLatLongExpr struct {
+		Latitude  Expr
+		Longitude Expr
+		MaxLength Expr
+	}
+
+	GeoHashFromPointExpr struct {
+		Point     Expr
+		MaxLength Expr
+	}
+
+	// GeomFromHashType is an enum that determines what kind geom being retireived from hash
+	GeomFromHashType int8
+
+	GeomFromGeoHashExpr struct {
+		GeomType GeomFromHashType
+		GeoHash  Expr
+		SridOpt  Expr
+	}
+
+	GeoJSONFromGeomExpr struct {
+		Geom             Expr
+		MaxDecimalDigits Expr
+		Bitmask          Expr
+	}
+
+	GeomFromGeoJSONExpr struct {
+		GeoJSON             Expr
+		HigherDimHandlerOpt Expr // This value determine how the higher dimensions are handled while converting json to geometry
+		Srid                Expr
+	}
+
+	AggrFunc interface {
+		Expr
+		GetArg() Expr
+		GetArgs() Exprs
+		// AggrName returns the lower case string representing this aggregation function
+		AggrName() string
+	}
+
+	DistinctableAggr interface {
+		IsDistinct() bool
+	}
+
+	Count struct {
+		Args     Exprs
+		Distinct bool
+	}
+
+	CountStar struct {
+		_ bool
+		// TL;DR; This makes sure that reference equality checks works as expected
+		//
+		// You're correct that this might seem a bit strange at first glance.
+		// It's a quirk of Go's handling of empty structs. In Go, two instances of an empty struct are considered
+		// identical, which can be problematic when using these as keys in maps.
+		// They would be treated as the same key and potentially lead to incorrect map behavior.
+		//
+		// Here's a brief example:
+		//
+		// ```golang
+		// func TestWeirdGo(t *testing.T) {
+		// 	type CountStar struct{}
+		//
+		// 	cs1 := &CountStar{}
+		// 	cs2 := &CountStar{}
+		//  if cs1 == cs2 {
+		// 	  panic("what the what!?")
+		//  }
+		// }
+		// ```
+		//
+		// In the above code, cs1 and cs2, despite being distinct variables, would be treated as the same object.
+		//
+		// The solution we employed was to add a dummy field `_ bool` to the otherwise empty struct `CountStar`.
+		// This ensures that each instance of `CountStar` is treated as a separate object,
+		// even in the context of out semantic state which uses these objects as map keys.
+	}
+
+	Avg struct {
+		Arg      Expr
+		Distinct bool
+	}
+
+	Max struct {
+		Arg      Expr
+		Distinct bool
+	}
+
+	Min struct {
+		Arg      Expr
+		Distinct bool
+	}
+
+	Sum struct {
+		Arg      Expr
+		Distinct bool
+	}
+
+	BitAnd struct {
+		Arg Expr
+	}
+
+	BitOr struct {
+		Arg Expr
+	}
+
+	BitXor struct {
+		Arg Expr
+	}
+
+	Std struct {
+		Arg Expr
+	}
+
+	StdDev struct {
+		Arg Expr
+	}
+
+	StdPop struct {
+		Arg Expr
+	}
+
+	StdSamp struct {
+		Arg Expr
+	}
+
+	VarPop struct {
+		Arg Expr
+	}
+
+	VarSamp struct {
+		Arg Expr
+	}
+
+	Variance struct {
+		Arg Expr
+	}
+
+	// GroupConcatExpr represents a call to GROUP_CONCAT
+	GroupConcatExpr struct {
+		Distinct  bool
+		Exprs     Exprs
+		OrderBy   OrderBy
+		Separator string
+		Limit     *Limit
+	}
+
+	// AnyValue is an aggregation function in Vitess, even if the MySQL manual explicitly says it's not
+	// It's just simpler to treat it as one
+	// see https://dev.mysql.com/doc/refman/8.0/en/miscellaneous-functions.html#function_any-value
+	AnyValue struct {
+		Arg Expr
+	}
+
 	// RegexpInstrExpr represents REGEXP_INSTR()
-	// For more information, visit https://dev.mysql.com/doc/refman/8.0/en/regexp.html#function_regexp-instr
+	// For more information, see https://dev.mysql.com/doc/refman/8.0/en/regexp.html#function_regexp-instr
 	RegexpInstrExpr struct {
 		Expr         Expr
 		Pattern      Expr
@@ -2659,7 +2994,7 @@ type (
 	}
 
 	// RegexpLikeExpr represents REGEXP_LIKE()
-	// For more information, visit https://dev.mysql.com/doc/refman/8.0/en/regexp.html#function_regexp-like
+	// For more information, see https://dev.mysql.com/doc/refman/8.0/en/regexp.html#function_regexp-like
 	RegexpLikeExpr struct {
 		Expr      Expr
 		Pattern   Expr
@@ -2667,7 +3002,7 @@ type (
 	}
 
 	// RegexpReplaceExpr represents REGEXP_REPLACE()
-	// For more information, visit https://dev.mysql.com/doc/refman/8.0/en/regexp.html#function_regexp-replace
+	// For more information, see https://dev.mysql.com/doc/refman/8.0/en/regexp.html#function_regexp-replace
 	RegexpReplaceExpr struct {
 		Expr       Expr
 		Pattern    Expr
@@ -2678,13 +3013,23 @@ type (
 	}
 
 	// RegexpSubstrExpr represents REGEXP_SUBSTR()
-	// For more information, visit https://dev.mysql.com/doc/refman/8.0/en/regexp.html#function_regexp-substr
+	// For more information, see https://dev.mysql.com/doc/refman/8.0/en/regexp.html#function_regexp-substr
 	RegexpSubstrExpr struct {
 		Expr       Expr
 		Pattern    Expr
 		Occurrence Expr
 		Position   Expr
 		MatchType  Expr
+	}
+
+	IntervalType = datetime.IntervalType
+
+	// IntervalDateExpr represents ADDDATE(), DATE_ADD()
+	IntervalDateExpr struct {
+		Syntax   IntervalExprSyntax
+		Date     Expr
+		Interval Expr
+		Unit     IntervalType
 	}
 
 	// ArgumentLessWindowExpr stands for the following window_functions: CUME_DIST, DENSE_RANK, PERCENT_RANK, RANK, ROW_NUMBER
@@ -2738,7 +3083,7 @@ type (
 
 	// ExtractValueExpr stands for EXTRACTVALUE() XML function
 	// Extract a value from an XML string using XPath notation
-	// For more details, visit https://dev.mysql.com/doc/refman/8.0/en/xml-functions.html#function_extractvalue
+	// For more details, postVisit https://dev.mysql.com/doc/refman/8.0/en/xml-functions.html#function_extractvalue
 	ExtractValueExpr struct {
 		Fragment  Expr
 		XPathExpr Expr
@@ -2746,7 +3091,7 @@ type (
 
 	// UpdateXMLExpr stands for UpdateXML() XML function
 	// Return replaced XML fragment
-	// For more details, visit https://dev.mysql.com/doc/refman/8.0/en/xml-functions.html#function_updatexml
+	// For more details, postVisit https://dev.mysql.com/doc/refman/8.0/en/xml-functions.html#function_updatexml
 	UpdateXMLExpr struct {
 		Target    Expr
 		XPathExpr Expr
@@ -2762,6 +3107,34 @@ type (
 		Name    Expr
 		Timeout Expr
 	}
+
+	// PerformanceSchemaType is an enum that get types of LockingFunc
+	PerformanceSchemaType int8
+
+	// PerformanceSchemaFuncExpr stands for Performance Schema Functions
+	// Argument has different meanings for different types
+	// For FORMAT_BYTES, it means count
+	// For FORMAT_PICO_TIME, it means time_val
+	// For PS_THREAD_ID it means connection_id
+	// For more details, postVisit https://dev.mysql.com/doc/refman/8.0/en/performance-schema-functions.html
+	PerformanceSchemaFuncExpr struct {
+		Type     PerformanceSchemaType
+		Argument Expr
+	}
+
+	// GTIDType is an enum that get types of GTIDFunc
+	GTIDType int8
+
+	// GTIDFuncExpr stands for GTID Functions
+	// Set1 Acts as gtid_set for WAIT_FOR_EXECUTED_GTID_SET() and WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS()
+	// For more details, postVisit https://dev.mysql.com/doc/refman/8.0/en/gtid-functions.html
+	GTIDFuncExpr struct {
+		Type    GTIDType
+		Set1    Expr
+		Set2    Expr
+		Timeout Expr
+		Channel Expr
+	}
 )
 
 // iExpr ensures that only expressions nodes can be assigned to a Expr
@@ -2773,8 +3146,9 @@ func (*ComparisonExpr) iExpr()                     {}
 func (*BetweenExpr) iExpr()                        {}
 func (*IsExpr) iExpr()                             {}
 func (*ExistsExpr) iExpr()                         {}
+func (*AssignmentExpr) iExpr()                     {}
 func (*Literal) iExpr()                            {}
-func (Argument) iExpr()                            {}
+func (*Argument) iExpr()                           {}
 func (*NullVal) iExpr()                            {}
 func (BoolVal) iExpr()                             {}
 func (*ColName) iExpr()                            {}
@@ -2784,20 +3158,23 @@ func (ListArg) iExpr()                             {}
 func (*BinaryExpr) iExpr()                         {}
 func (*UnaryExpr) iExpr()                          {}
 func (*IntroducerExpr) iExpr()                     {}
-func (*IntervalExpr) iExpr()                       {}
 func (*CollateExpr) iExpr()                        {}
 func (*FuncExpr) iExpr()                           {}
-func (*TimestampFuncExpr) iExpr()                  {}
+func (*TimestampDiffExpr) iExpr()                  {}
 func (*ExtractFuncExpr) iExpr()                    {}
 func (*WeightStringFuncExpr) iExpr()               {}
 func (*CurTimeFuncExpr) iExpr()                    {}
 func (*CaseExpr) iExpr()                           {}
 func (*ValuesFuncExpr) iExpr()                     {}
+func (*CastExpr) iExpr()                           {}
 func (*ConvertExpr) iExpr()                        {}
 func (*SubstrExpr) iExpr()                         {}
+func (*InsertExpr) iExpr()                         {}
+func (*IntervalFuncExpr) iExpr()                   {}
+func (*LocateExpr) iExpr()                         {}
+func (*CharExpr) iExpr()                           {}
 func (*ConvertUsingExpr) iExpr()                   {}
 func (*MatchExpr) iExpr()                          {}
-func (*GroupConcatExpr) iExpr()                    {}
 func (*Default) iExpr()                            {}
 func (*ExtractedSubquery) iExpr()                  {}
 func (*TrimFuncExpr) iExpr()                       {}
@@ -2827,6 +3204,7 @@ func (*RegexpInstrExpr) iExpr()                    {}
 func (*RegexpLikeExpr) iExpr()                     {}
 func (*RegexpReplaceExpr) iExpr()                  {}
 func (*RegexpSubstrExpr) iExpr()                   {}
+func (*IntervalDateExpr) iExpr()                   {}
 func (*ArgumentLessWindowExpr) iExpr()             {}
 func (*FirstOrLastValueExpr) iExpr()               {}
 func (*NtileExpr) iExpr()                          {}
@@ -2836,10 +3214,50 @@ func (*NamedWindow) iExpr()                        {}
 func (*ExtractValueExpr) iExpr()                   {}
 func (*UpdateXMLExpr) iExpr()                      {}
 func (*LockingFunc) iExpr()                        {}
+func (*PerformanceSchemaFuncExpr) iExpr()          {}
+func (*GTIDFuncExpr) iExpr()                       {}
+func (*Sum) iExpr()                                {}
+func (*Min) iExpr()                                {}
+func (*Max) iExpr()                                {}
+func (*Avg) iExpr()                                {}
+func (*CountStar) iExpr()                          {}
+func (*Count) iExpr()                              {}
+func (*GroupConcatExpr) iExpr()                    {}
+func (*AnyValue) iExpr()                           {}
+func (*BitAnd) iExpr()                             {}
+func (*BitOr) iExpr()                              {}
+func (*BitXor) iExpr()                             {}
+func (*Std) iExpr()                                {}
+func (*StdDev) iExpr()                             {}
+func (*StdPop) iExpr()                             {}
+func (*StdSamp) iExpr()                            {}
+func (*VarPop) iExpr()                             {}
+func (*VarSamp) iExpr()                            {}
+func (*Variance) iExpr()                           {}
+func (*Variable) iExpr()                           {}
+func (*PointExpr) iExpr()                          {}
+func (*LineStringExpr) iExpr()                     {}
+func (*PolygonExpr) iExpr()                        {}
+func (*MultiPolygonExpr) iExpr()                   {}
+func (*MultiPointExpr) iExpr()                     {}
+func (*MultiLinestringExpr) iExpr()                {}
+func (*GeomFromTextExpr) iExpr()                   {}
+func (*GeomFromWKBExpr) iExpr()                    {}
+func (*GeomFormatExpr) iExpr()                     {}
+func (*GeomPropertyFuncExpr) iExpr()               {}
+func (*PointPropertyFuncExpr) iExpr()              {}
+func (*LinestrPropertyFuncExpr) iExpr()            {}
+func (*PolygonPropertyFuncExpr) iExpr()            {}
+func (*GeomCollPropertyFuncExpr) iExpr()           {}
+func (*GeoHashFromLatLongExpr) iExpr()             {}
+func (*GeoHashFromPointExpr) iExpr()               {}
+func (*GeomFromGeoHashExpr) iExpr()                {}
+func (*GeoJSONFromGeomExpr) iExpr()                {}
+func (*GeomFromGeoJSONExpr) iExpr()                {}
 
 // iCallable marks all expressions that represent function calls
 func (*FuncExpr) iCallable()                           {}
-func (*TimestampFuncExpr) iCallable()                  {}
+func (*TimestampDiffExpr) iCallable()                  {}
 func (*ExtractFuncExpr) iCallable()                    {}
 func (*WeightStringFuncExpr) iCallable()               {}
 func (*CurTimeFuncExpr) iCallable()                    {}
@@ -2847,9 +3265,14 @@ func (*ValuesFuncExpr) iCallable()                     {}
 func (*ConvertExpr) iCallable()                        {}
 func (*TrimFuncExpr) iCallable()                       {}
 func (*SubstrExpr) iCallable()                         {}
+func (*InsertExpr) iCallable()                         {}
+func (*IntervalFuncExpr) iCallable()                   {}
+func (*LocateExpr) iCallable()                         {}
+func (*CharExpr) iCallable()                           {}
 func (*ConvertUsingExpr) iCallable()                   {}
 func (*MatchExpr) iCallable()                          {}
 func (*GroupConcatExpr) iCallable()                    {}
+func (*AnyValue) iCallable()                           {}
 func (*JSONSchemaValidFuncExpr) iCallable()            {}
 func (*JSONSchemaValidationReportFuncExpr) iCallable() {}
 func (*JSONPrettyExpr) iCallable()                     {}
@@ -2875,6 +3298,7 @@ func (*RegexpInstrExpr) iCallable()                    {}
 func (*RegexpLikeExpr) iCallable()                     {}
 func (*RegexpReplaceExpr) iCallable()                  {}
 func (*RegexpSubstrExpr) iCallable()                   {}
+func (*IntervalDateExpr) iCallable()                   {}
 func (*ArgumentLessWindowExpr) iCallable()             {}
 func (*FirstOrLastValueExpr) iCallable()               {}
 func (*NtileExpr) iCallable()                          {}
@@ -2883,6 +3307,98 @@ func (*LagLeadExpr) iCallable()                        {}
 func (*NamedWindow) iCallable()                        {}
 func (*ExtractValueExpr) iCallable()                   {}
 func (*UpdateXMLExpr) iCallable()                      {}
+func (*PerformanceSchemaFuncExpr) iCallable()          {}
+func (*GTIDFuncExpr) iCallable()                       {}
+func (*PointExpr) iCallable()                          {}
+func (*LineStringExpr) iCallable()                     {}
+func (*PolygonExpr) iCallable()                        {}
+func (*MultiPolygonExpr) iCallable()                   {}
+func (*MultiPointExpr) iCallable()                     {}
+func (*MultiLinestringExpr) iCallable()                {}
+func (*GeomFromTextExpr) iCallable()                   {}
+func (*GeomFromWKBExpr) iCallable()                    {}
+func (*GeomFormatExpr) iCallable()                     {}
+func (*GeomPropertyFuncExpr) iCallable()               {}
+func (*PointPropertyFuncExpr) iCallable()              {}
+func (*LinestrPropertyFuncExpr) iCallable()            {}
+func (*PolygonPropertyFuncExpr) iCallable()            {}
+func (*GeomCollPropertyFuncExpr) iCallable()           {}
+func (*GeoHashFromLatLongExpr) iCallable()             {}
+func (*GeoHashFromPointExpr) iCallable()               {}
+func (*GeomFromGeoHashExpr) iCallable()                {}
+func (*GeoJSONFromGeomExpr) iCallable()                {}
+func (*GeomFromGeoJSONExpr) iCallable()                {}
+
+func (*Sum) iCallable()       {}
+func (*Min) iCallable()       {}
+func (*Max) iCallable()       {}
+func (*Avg) iCallable()       {}
+func (*CountStar) iCallable() {}
+func (*Count) iCallable()     {}
+
+func (sum *Sum) GetArg() Expr                   { return sum.Arg }
+func (min *Min) GetArg() Expr                   { return min.Arg }
+func (max *Max) GetArg() Expr                   { return max.Arg }
+func (avg *Avg) GetArg() Expr                   { return avg.Arg }
+func (*CountStar) GetArg() Expr                 { return nil }
+func (count *Count) GetArg() Expr               { return count.Args[0] }
+func (grpConcat *GroupConcatExpr) GetArg() Expr { return grpConcat.Exprs[0] }
+func (bAnd *BitAnd) GetArg() Expr               { return bAnd.Arg }
+func (bOr *BitOr) GetArg() Expr                 { return bOr.Arg }
+func (bXor *BitXor) GetArg() Expr               { return bXor.Arg }
+func (std *Std) GetArg() Expr                   { return std.Arg }
+func (stdD *StdDev) GetArg() Expr               { return stdD.Arg }
+func (stdP *StdPop) GetArg() Expr               { return stdP.Arg }
+func (stdS *StdSamp) GetArg() Expr              { return stdS.Arg }
+func (varP *VarPop) GetArg() Expr               { return varP.Arg }
+func (varS *VarSamp) GetArg() Expr              { return varS.Arg }
+func (variance *Variance) GetArg() Expr         { return variance.Arg }
+func (av *AnyValue) GetArg() Expr               { return av.Arg }
+
+func (sum *Sum) GetArgs() Exprs                   { return Exprs{sum.Arg} }
+func (min *Min) GetArgs() Exprs                   { return Exprs{min.Arg} }
+func (max *Max) GetArgs() Exprs                   { return Exprs{max.Arg} }
+func (avg *Avg) GetArgs() Exprs                   { return Exprs{avg.Arg} }
+func (*CountStar) GetArgs() Exprs                 { return nil }
+func (count *Count) GetArgs() Exprs               { return count.Args }
+func (grpConcat *GroupConcatExpr) GetArgs() Exprs { return grpConcat.Exprs }
+func (bAnd *BitAnd) GetArgs() Exprs               { return Exprs{bAnd.Arg} }
+func (bOr *BitOr) GetArgs() Exprs                 { return Exprs{bOr.Arg} }
+func (bXor *BitXor) GetArgs() Exprs               { return Exprs{bXor.Arg} }
+func (std *Std) GetArgs() Exprs                   { return Exprs{std.Arg} }
+func (stdD *StdDev) GetArgs() Exprs               { return Exprs{stdD.Arg} }
+func (stdP *StdPop) GetArgs() Exprs               { return Exprs{stdP.Arg} }
+func (stdS *StdSamp) GetArgs() Exprs              { return Exprs{stdS.Arg} }
+func (varP *VarPop) GetArgs() Exprs               { return Exprs{varP.Arg} }
+func (varS *VarSamp) GetArgs() Exprs              { return Exprs{varS.Arg} }
+func (variance *Variance) GetArgs() Exprs         { return Exprs{variance.Arg} }
+func (av *AnyValue) GetArgs() Exprs               { return Exprs{av.Arg} }
+
+func (sum *Sum) IsDistinct() bool                   { return sum.Distinct }
+func (min *Min) IsDistinct() bool                   { return min.Distinct }
+func (max *Max) IsDistinct() bool                   { return max.Distinct }
+func (avg *Avg) IsDistinct() bool                   { return avg.Distinct }
+func (count *Count) IsDistinct() bool               { return count.Distinct }
+func (grpConcat *GroupConcatExpr) IsDistinct() bool { return grpConcat.Distinct }
+
+func (*Sum) AggrName() string             { return "sum" }
+func (*Min) AggrName() string             { return "min" }
+func (*Max) AggrName() string             { return "max" }
+func (*Avg) AggrName() string             { return "avg" }
+func (*CountStar) AggrName() string       { return "count" }
+func (*Count) AggrName() string           { return "count" }
+func (*GroupConcatExpr) AggrName() string { return "group_concat" }
+func (*BitAnd) AggrName() string          { return "bit_and" }
+func (*BitOr) AggrName() string           { return "bit_or" }
+func (*BitXor) AggrName() string          { return "bit_xor" }
+func (*Std) AggrName() string             { return "std" }
+func (*StdDev) AggrName() string          { return "stddev" }
+func (*StdPop) AggrName() string          { return "stddev_pop" }
+func (*StdSamp) AggrName() string         { return "stddev_samp" }
+func (*VarPop) AggrName() string          { return "var_pop" }
+func (*VarSamp) AggrName() string         { return "var_samp" }
+func (*Variance) AggrName() string        { return "variance" }
+func (*AnyValue) AggrName() string        { return "any_value" }
 
 // Exprs represents a list of value expressions.
 // It's not a valid expression because it's not parenthesized.
@@ -2937,35 +3453,25 @@ type SetExprs []*SetExpr
 
 // SetExpr represents a set expression.
 type SetExpr struct {
-	Scope Scope
-	Name  ColIdent
-	Expr  Expr
+	Var  *Variable
+	Expr Expr
 }
 
 // OnDup represents an ON DUPLICATE KEY clause.
 type OnDup UpdateExprs
 
-// ColIdent is a case insensitive SQL identifier. It will be escaped with
+// IdentifierCI is a case insensitive SQL identifier. It will be escaped with
 // backquotes if necessary.
-type ColIdent struct {
+type IdentifierCI struct {
 	// This artifact prevents this struct from being compared
 	// with itself. It consumes no space as long as it's not the
 	// last field in the struct.
 	_            [0]struct{ _ []byte }
 	val, lowered string
-	at           AtCount
 }
 
-// TableIdent is a case sensitive SQL identifier. It will be escaped with
+// IdentifierCS is a case sensitive SQL identifier. It will be escaped with
 // backquotes if necessary.
-type TableIdent struct {
+type IdentifierCS struct {
 	v string
 }
-
-// AtCount return the '@' count present in ColIdent Name
-func (node ColIdent) AtCount() AtCount {
-	return node.at
-}
-
-func (IsolationLevel) iChar() {}
-func (AccessMode) iChar()     {}

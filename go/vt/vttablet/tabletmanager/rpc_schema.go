@@ -30,8 +30,8 @@ import (
 )
 
 // GetSchema returns the schema.
-func (tm *TabletManager) GetSchema(ctx context.Context, tables, excludeTables []string, includeViews bool) (*tabletmanagerdatapb.SchemaDefinition, error) {
-	return tm.MysqlDaemon.GetSchema(ctx, topoproto.TabletDbName(tm.Tablet()), tables, excludeTables, includeViews)
+func (tm *TabletManager) GetSchema(ctx context.Context, request *tabletmanagerdatapb.GetSchemaRequest) (*tabletmanagerdatapb.SchemaDefinition, error) {
+	return tm.MysqlDaemon.GetSchema(ctx, topoproto.TabletDbName(tm.Tablet()), request)
 }
 
 // ReloadSchema will reload the schema
@@ -56,6 +56,11 @@ func (tm *TabletManager) ReloadSchema(ctx context.Context, waitPosition string) 
 
 	log.Infof("ReloadSchema requested via RPC")
 	return tm.QueryServiceControl.ReloadSchema(ctx)
+}
+
+// ResetSequences will reset the auto-inc counters on the specified tables.
+func (tm *TabletManager) ResetSequences(ctx context.Context, tables []string) error {
+	return tm.QueryServiceControl.SchemaEngine().ResetSequences(tables)
 }
 
 // PreflightSchema will try out the schema changes in "changes".

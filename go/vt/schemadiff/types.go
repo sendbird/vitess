@@ -30,22 +30,26 @@ type Entity interface {
 	Diff(other Entity, hints *DiffHints) (diff EntityDiff, err error)
 	// Create returns an entity diff that describes how to create this entity
 	Create() EntityDiff
-	// Create returns an entity diff that describes how to drop this entity
+	// Drop returns an entity diff that describes how to drop this entity
 	Drop() EntityDiff
+	// Clone returns a deep copy of the entity.
+	Clone() Entity
 }
 
 // EntityDiff represents the diff between two entities
 type EntityDiff interface {
 	// IsEmpty returns true when the two entities are considered identical
 	IsEmpty() bool
+	// EntityName returns the name of affected entity
+	EntityName() string
 	// Entities returns the two diffed entitied, aka "from" and "to"
 	Entities() (from Entity, to Entity)
 	// Statement returns a valid SQL statement that applies the diff, e.g. an ALTER TABLE ...
 	// It returns nil if the diff is empty
 	Statement() sqlparser.Statement
-	// StatementString "stringifies" the this diff's Statement(). It returns an empty string if the diff is empty
+	// StatementString "stringifies" this diff's Statement(). It returns an empty string if the diff is empty
 	StatementString() string
-	// CanonicalStatementString "stringifies" the this diff's Statement() to a canonical string. It returns an empty string if the diff is empty
+	// CanonicalStatementString "stringifies" this diff's Statement() to a canonical string. It returns an empty string if the diff is empty
 	CanonicalStatementString() string
 	// SubsequentDiff returns a followup diff to this one, if exists
 	SubsequentDiff() EntityDiff
@@ -81,12 +85,45 @@ const (
 	TableRenameHeuristicStatement
 )
 
+const (
+	FullTextKeyDistinctStatements = iota
+	FullTextKeyUnifyStatements
+)
+
+const (
+	TableCharsetCollateStrict int = iota
+	TableCharsetCollateIgnoreEmpty
+	TableCharsetCollateIgnoreAlways
+)
+
+const (
+	TableQualifierDefault int = iota
+	TableQualifierDeclared
+)
+
+const (
+	AlterTableAlgorithmStrategyNone int = iota
+	AlterTableAlgorithmStrategyInstant
+	AlterTableAlgorithmStrategyInplace
+	AlterTableAlgorithmStrategyCopy
+)
+
 // DiffHints is an assortment of rules for diffing entities
 type DiffHints struct {
-	StrictIndexOrdering     bool
-	AutoIncrementStrategy   int
-	RangeRotationStrategy   int
-	ConstraintNamesStrategy int
-	ColumnRenameStrategy    int
-	TableRenameStrategy     int
+	StrictIndexOrdering         bool
+	AutoIncrementStrategy       int
+	RangeRotationStrategy       int
+	ConstraintNamesStrategy     int
+	ColumnRenameStrategy        int
+	TableRenameStrategy         int
+	FullTextKeyStrategy         int
+	TableCharsetCollateStrategy int
+	TableQualifierHint          int
+	AlterTableAlgorithmStrategy int
 }
+
+const (
+	ApplyDiffsNoConstraint = "ApplyDiffsNoConstraint"
+	ApplyDiffsInOrder      = "ApplyDiffsInOrder"
+	ApplyDiffsSequential   = "ApplyDiffsSequential"
+)

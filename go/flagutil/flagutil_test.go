@@ -17,14 +17,15 @@ limitations under the License.
 package flagutil
 
 import (
-	"flag"
 	"strings"
 	"testing"
+
+	"github.com/spf13/pflag"
 )
 
 func TestStringList(t *testing.T) {
 	p := StringListValue([]string{})
-	var _ flag.Value = &p
+	var _ pflag.Value = &p
 	wanted := map[string]string{
 		"0ala,ma,kota":   "0ala.ma.kota",
 		`1ala\,ma,kota`:  "1ala,ma.kota",
@@ -48,7 +49,7 @@ func TestStringList(t *testing.T) {
 // TestEmptyStringList verifies that an empty parameter results in an empty list
 func TestEmptyStringList(t *testing.T) {
 	var p StringListValue
-	var _ flag.Value = &p
+	var _ pflag.Value = &p
 	if err := p.Set(""); err != nil {
 		t.Fatalf("p.Set(\"\"): %v", err)
 	}
@@ -65,7 +66,7 @@ type pair struct {
 
 func TestStringMap(t *testing.T) {
 	v := StringMapValue(nil)
-	var _ flag.Value = &v
+	var _ pflag.Value = &v
 	wanted := []pair{
 		{
 			in:  "tag1:value1,tag2:value2",

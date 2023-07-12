@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
@@ -30,7 +31,7 @@ import (
 
 // SQLError is the error structure returned from calling a db library function
 type SQLError struct {
-	Num     int
+	Num     ErrorCode
 	State   string
 	Message string
 	Query   string
@@ -39,7 +40,7 @@ type SQLError struct {
 // NewSQLError creates a new SQLError.
 // If sqlState is left empty, it will default to "HY000" (general error).
 // TODO: Should be aligned with vterrors, stack traces and wrapping
-func NewSQLError(number int, sqlState string, format string, args ...any) *SQLError {
+func NewSQLError(number ErrorCode, sqlState string, format string, args ...any) *SQLError {
 	if sqlState == "" {
 		sqlState = SSUnknownSQLState
 	}
@@ -69,7 +70,7 @@ func (se *SQLError) Error() string {
 }
 
 // Number returns the internal MySQL error code.
-func (se *SQLError) Number() int {
+func (se *SQLError) Number() ErrorCode {
 	return se.Num
 }
 
@@ -82,6 +83,17 @@ var errExtract = regexp.MustCompile(`.*\(errno ([0-9]*)\) \(sqlstate ([0-9a-zA-Z
 
 // NewSQLErrorFromError returns a *SQLError from the provided error.
 // If it's not the right type, it still tries to get it from a regexp.
+// Notes about the `error` return type:
+// The function really returns *SQLError or `nil`. Seemingly, the function could just return
+// `*SQLError` type. However, it really must return `error`. The reason is the way `golang`
+// treats `nil` interfaces vs `nil` implementing values.
+// If this function were to return a nil `*SQLError`, the following undesired behavior would happen:
+//
+//	var err error
+//	err = NewSQLErrorFromError(nil) // returns a nil `*SQLError`
+//	if err != nil {
+//	  doSomething() // this actually runs
+//	}
 func NewSQLErrorFromError(err error) error {
 	if err == nil {
 		return nil
@@ -106,7 +118,7 @@ func NewSQLErrorFromError(err error) error {
 }
 
 func extractSQLErrorFromMessage(match []string, msg string) *SQLError {
-	num, err := strconv.Atoi(match[1])
+	num, err := strconv.ParseUint(match[1], 10, 16)
 	if err != nil {
 		return &SQLError{
 			Num:     ERUnknownError,
@@ -116,7 +128,7 @@ func extractSQLErrorFromMessage(match []string, msg string) *SQLError {
 	}
 
 	return &SQLError{
-		Num:     num,
+		Num:     ErrorCode(num),
 		State:   match[2],
 		Message: msg,
 	}
@@ -135,7 +147,11 @@ func mapToSQLErrorFromErrorCode(err error, msg string) *SQLError {
 		ss = SSAccessDeniedError
 	case vtrpcpb.Code_RESOURCE_EXHAUSTED:
 		num = demuxResourceExhaustedErrors(err.Error())
-		ss = SSClientError
+		// 1041 ER_OUT_OF_RESOURCES has SQLSTATE HYOOO as per https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html#error_er_out_of_resources,
+		// so don't override it here in that case.
+		if num != EROutOfResources {
+			ss = SSClientError
+		}
 	case vtrpcpb.Code_UNIMPLEMENTED:
 		num = ERNotSupportedYet
 		ss = SSClientError
@@ -152,10 +168,12 @@ func mapToSQLErrorFromErrorCode(err error, msg string) *SQLError {
 	}
 }
 
-var stateToMysqlCode = map[vterrors.State]struct {
-	num   int
+type mysqlCode struct {
+	num   ErrorCode
 	state string
-}{
+}
+
+var stateToMysqlCode = map[vterrors.State]mysqlCode{
 	vterrors.Undefined:                    {num: ERUnknownError, state: SSUnknownSQLState},
 	vterrors.AccessDeniedError:            {num: ERAccessDeniedError, state: SSAccessDeniedError},
 	vterrors.BadDb:                        {num: ERBadDb, state: SSClientError},
@@ -189,6 +207,7 @@ var stateToMysqlCode = map[vterrors.State]struct {
 	vterrors.WrongNumberOfColumnsInSelect: {num: ERWrongNumberOfColumnsInSelect, state: SSWrongNumberOfColumns},
 	vterrors.WrongTypeForVar:              {num: ERWrongTypeForVar, state: SSClientError},
 	vterrors.WrongValueForVar:             {num: ERWrongValueForVar, state: SSClientError},
+	vterrors.WrongValue:                   {num: ERWrongValue, state: SSUnknownSQLState},
 	vterrors.WrongFieldWithGroup:          {num: ERWrongFieldWithGroup, state: SSClientError},
 	vterrors.ServerNotAvailable:           {num: ERServerIsntAvailable, state: SSNetError},
 	vterrors.CantDoThisInTransaction:      {num: ERCantDoThisDuringAnTransaction, state: SSCantDoThisDuringAnTransaction},
@@ -196,6 +215,54 @@ var stateToMysqlCode = map[vterrors.State]struct {
 	vterrors.NoSuchSession:                {num: ERUnknownComError, state: SSNetError},
 	vterrors.OperandColumns:               {num: EROperandColumns, state: SSWrongNumberOfColumns},
 	vterrors.WrongValueCountOnRow:         {num: ERWrongValueCountOnRow, state: SSWrongValueCountOnRow},
+	vterrors.WrongArguments:               {num: ERWrongArguments, state: SSUnknownSQLState},
+	vterrors.UnknownStmtHandler:           {num: ERUnknownStmtHandler, state: SSUnknownSQLState},
+	vterrors.UnknownTimeZone:              {num: ERUnknownTimeZone, state: SSUnknownSQLState},
+	vterrors.RegexpStringNotTerminated:    {num: ERRegexpStringNotTerminated, state: SSUnknownSQLState},
+	vterrors.RegexpBufferOverflow:         {num: ERRegexpBufferOverflow, state: SSUnknownSQLState},
+	vterrors.RegexpIllegalArgument:        {num: ERRegexpIllegalArgument, state: SSUnknownSQLState},
+	vterrors.RegexpIndexOutOfBounds:       {num: ERRegexpIndexOutOfBounds, state: SSUnknownSQLState},
+	vterrors.RegexpInternal:               {num: ERRegexpInternal, state: SSUnknownSQLState},
+	vterrors.RegexpRuleSyntax:             {num: ERRegexpRuleSyntax, state: SSUnknownSQLState},
+	vterrors.RegexpBadEscapeSequence:      {num: ERRegexpBadEscapeSequence, state: SSUnknownSQLState},
+	vterrors.RegexpUnimplemented:          {num: ERRegexpUnimplemented, state: SSUnknownSQLState},
+	vterrors.RegexpMismatchParen:          {num: ERRegexpMismatchParen, state: SSUnknownSQLState},
+	vterrors.RegexpBadInterval:            {num: ERRegexpBadInterval, state: SSUnknownSQLState},
+	vterrors.RegexpMaxLtMin:               {num: ERRRegexpMaxLtMin, state: SSUnknownSQLState},
+	vterrors.RegexpInvalidBackRef:         {num: ERRegexpInvalidBackRef, state: SSUnknownSQLState},
+	vterrors.RegexpLookBehindLimit:        {num: ERRegexpLookBehindLimit, state: SSUnknownSQLState},
+	vterrors.RegexpMissingCloseBracket:    {num: ERRegexpMissingCloseBracket, state: SSUnknownSQLState},
+	vterrors.RegexpInvalidRange:           {num: ERRegexpInvalidRange, state: SSUnknownSQLState},
+	vterrors.RegexpStackOverflow:          {num: ERRegexpStackOverflow, state: SSUnknownSQLState},
+	vterrors.RegexpTimeOut:                {num: ERRegexpTimeOut, state: SSUnknownSQLState},
+	vterrors.RegexpPatternTooBig:          {num: ERRegexpPatternTooBig, state: SSUnknownSQLState},
+	vterrors.RegexpInvalidFlag:            {num: ERRegexpInvalidFlag, state: SSUnknownSQLState},
+	vterrors.RegexpInvalidCaptureGroup:    {num: ERRegexpInvalidCaptureGroup, state: SSUnknownSQLState},
+	vterrors.CharacterSetMismatch:         {num: ERCharacterSetMismatch, state: SSUnknownSQLState},
+	vterrors.WrongParametersToNativeFct:   {num: ERWrongParametersToNativeFct, state: SSUnknownSQLState},
+	vterrors.KillDeniedError:              {num: ERKillDenied, state: SSUnknownSQLState},
+}
+
+func getStateToMySQLState(state vterrors.State) mysqlCode {
+	if state == 0 {
+		return mysqlCode{}
+	}
+	s := stateToMysqlCode[state]
+	return s
+}
+
+// ConvertStateToMySQLErrorCode returns MySQL error code for the given vterrors.State
+// If the state is == 0, an empty string is returned
+func ConvertStateToMySQLErrorCode(state vterrors.State) string {
+	s := getStateToMySQLState(state)
+	return s.num.ToString()
+}
+
+// ConvertStateToMySQLState returns MySQL state for the given vterrors.State
+// If the state is == 0, an empty string is returned
+func ConvertStateToMySQLState(state vterrors.State) string {
+	s := getStateToMySQLState(state)
+	return s.state
 }
 
 func init() {
@@ -218,10 +285,12 @@ func convertToMysqlError(err error) error {
 
 var isGRPCOverflowRE = regexp.MustCompile(`.*?grpc: (received|trying to send) message larger than max \(\d+ vs. \d+\)`)
 
-func demuxResourceExhaustedErrors(msg string) int {
+func demuxResourceExhaustedErrors(msg string) ErrorCode {
 	switch {
 	case isGRPCOverflowRE.Match([]byte(msg)):
 		return ERNetPacketTooLarge
+	case strings.Contains(msg, "Transaction throttled"):
+		return EROutOfResources
 	default:
 		return ERTooManyUserConnections
 	}

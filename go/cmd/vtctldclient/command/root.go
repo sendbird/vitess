@@ -19,12 +19,16 @@ package command
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"strconv"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"vitess.io/vitess/go/trace"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/vtctl/vtctldclient"
 )
 
@@ -42,18 +46,14 @@ var (
 
 	// Root is the main entrypoint to the vtctldclient CLI.
 	Root = &cobra.Command{
+		Use:   "vtctldclient",
+		Short: "Executes a cluster management command on the remote vtctld server.",
 		// We use PersistentPreRun to set up the tracer, grpc client, and
 		// command context for every command.
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) (err error) {
+			logutil.PurgeLogs()
 			traceCloser = trace.StartTracing("vtctldclient")
-			if VtctldClientProtocol != "local" {
-				if err := ensureServerArg(); err != nil {
-					return err
-				}
-			}
-
-			client, err = vtctldclient.New(VtctldClientProtocol, server)
-
+			client, err = getClientForCommand(cmd)
 			ctx := cmd.Context()
 			if ctx == nil {
 				ctx = context.Background()
@@ -63,9 +63,11 @@ var (
 		},
 		// Similarly, PersistentPostRun cleans up the resources spawned by
 		// PersistentPreRun.
-		PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
+		PersistentPostRunE: func(cmd *cobra.Command, args []string) (err error) {
 			commandCancel()
-			err := client.Close()
+			if client != nil {
+				err = client.Close()
+			}
 			trace.LogErrorsWhenClosing(traceCloser)
 			return err
 		},
@@ -78,21 +80,56 @@ var (
 		// all errors in cobra (just from being output, they still get
 		// propagated).
 		SilenceErrors: true,
+		Version:       servenv.AppVersion.String(),
+		// If we've reached this function, it means that:
+		//
+		// (1) The user specified some positional arguments, which, for the way
+		// we've structured things can only be a subcommand name, **and**
+		//
+		// (2) Cobra was unable to find a subcommand with that name for which to
+		// call a Run or RunE function.
+		//
+		// From this we conclude that the user was trying to either run a
+		// command that doesn't exist (e.g. "vtctldclient delete-my-data") or
+		// has misspelled a legitimate command (e.g. "vtctldclient StapReplication").
+		// If we think this has happened, return an error, which will get
+		// displayed to the user in main.go along with the usage.
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if cmd.Flags().NArg() > 0 {
+				return fmt.Errorf("unknown command: %s", cmd.Flags().Arg(0))
+			}
+
+			return nil
+		},
 	}
 )
 
 var errNoServer = errors.New("please specify --server <vtctld_host:vtctld_port> to specify the vtctld server to connect to")
 
-// ensureServerArg validates that --server was passed to the CLI.
-func ensureServerArg() error {
-	if server == "" {
-		return errNoServer
+const skipClientCreationKey = "skip_client_creation"
+
+// getClientForCommand returns a vtctldclient.VtctldClient for a given command.
+// It validates that --server was passed to the CLI for commands that need it.
+func getClientForCommand(cmd *cobra.Command) (vtctldclient.VtctldClient, error) {
+	if skipStr, ok := cmd.Annotations[skipClientCreationKey]; ok {
+		skipClientCreation, err := strconv.ParseBool(skipStr)
+		if err != nil {
+			skipClientCreation = false
+		}
+
+		if skipClientCreation {
+			return nil, nil
+		}
 	}
 
-	return nil
+	if VtctldClientProtocol != "local" && server == "" {
+		return nil, errNoServer
+	}
+
+	return vtctldclient.New(VtctldClientProtocol, server)
 }
 
 func init() {
-	Root.PersistentFlags().StringVar(&server, "server", "", "server to use for connection")
+	Root.PersistentFlags().StringVar(&server, "server", "", "server to use for connection (required)")
 	Root.PersistentFlags().DurationVar(&actionTimeout, "action_timeout", time.Hour, "timeout for the total command")
 }

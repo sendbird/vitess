@@ -21,13 +21,13 @@ import (
 	"strconv"
 	"strings"
 
+	"vitess.io/vitess/go/vt/sysvars"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/vt/key"
@@ -47,10 +47,11 @@ type (
 		// SET transaction_mode = two_pc => SET transaction_mode = 'two_pc'
 		identifierAsString bool
 		supportSetVar      bool
+		storageCase        sysvars.StorageCase
 	}
 )
 
-func buildSetPlan(stmt *sqlparser.Set, vschema plancontext.VSchema) (engine.Primitive, error) {
+func buildSetPlan(stmt *sqlparser.Set, vschema plancontext.VSchema) (*planResult, error) {
 	var setOps []engine.SetOp
 	var err error
 
@@ -61,24 +62,24 @@ func buildSetPlan(stmt *sqlparser.Set, vschema plancontext.VSchema) (engine.Prim
 		// we have a UDV. If the original query didn't explicitly specify the scope, it
 		// would have been explictly set to sqlparser.SessionStr before reaching this
 		// phase of planning
-		switch expr.Scope {
+		switch expr.Var.Scope {
 		case sqlparser.GlobalScope:
 			setOp, err := planSysVarCheckIgnore(expr, vschema, true)
 			if err != nil {
 				return nil, err
 			}
 			setOps = append(setOps, setOp)
-		case sqlparser.ImplicitScope:
+		case sqlparser.VariableScope:
 			evalExpr, err := ec.convert(expr.Expr /*boolean*/, false /*identifierAsString*/, false)
 			if err != nil {
 				return nil, err
 			}
 			setOp := &engine.UserDefinedVariable{
-				Name: expr.Name.Lowered(),
+				Name: expr.Var.Name.Lowered(),
 				Expr: evalExpr,
 			}
 			setOps = append(setOps, setOp)
-		case sqlparser.SessionScope:
+		case sqlparser.NextTxScope, sqlparser.SessionScope:
 			planFunc, err := sysvarPlanningFuncs.Get(expr)
 			if err != nil {
 				return nil, err
@@ -88,6 +89,12 @@ func buildSetPlan(stmt *sqlparser.Set, vschema plancontext.VSchema) (engine.Prim
 				return nil, err
 			}
 			setOps = append(setOps, setOp)
+			if expr.Var.Scope == sqlparser.NextTxScope {
+				// This is to keep the backward compatibility.
+				// 'transaction_isolation' was added as a reserved connection system variable, so it used to change the setting at session level already.
+				// logging warning now to
+				vschema.PlannerWarning("converted 'next transaction' scope to 'session' scope")
+			}
 		case sqlparser.VitessMetadataScope:
 			value, err := getValueFor(expr)
 			if err != nil {
@@ -95,13 +102,13 @@ func buildSetPlan(stmt *sqlparser.Set, vschema plancontext.VSchema) (engine.Prim
 			}
 			val, ok := value.(string)
 			if !ok {
-				return nil, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.WrongValueForVar, "unexpected value type for '%s': %v", expr.Name, value)
+				return nil, vterrors.VT03009(expr.Var.Name, value)
 			}
 
 			setOps = append(setOps,
-				&engine.VitessMetadata{Name: expr.Name.Lowered(), Value: val})
+				&engine.VitessMetadata{Name: expr.Var.Name.Lowered(), Value: val})
 		default:
-			return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG]: undefined set type: %v", expr.Scope)
+			return nil, vterrors.VT13001(fmt.Sprintf("undefined set type: %v", expr.Var.Scope.ToString()))
 		}
 	}
 
@@ -110,21 +117,21 @@ func buildSetPlan(stmt *sqlparser.Set, vschema plancontext.VSchema) (engine.Prim
 		return nil, err
 	}
 
-	return &engine.Set{
+	return newPlanResult(&engine.Set{
 		Ops:   setOps,
 		Input: input,
-	}, nil
+	}), nil
 }
 
-func buildSetOpReadOnly(s setting) planFunc {
+func buildSetOpReadOnly(setting) planFunc {
 	return func(expr *sqlparser.SetExpr, schema plancontext.VSchema, _ *expressionConverter) (engine.SetOp, error) {
-		return nil, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.IncorrectGlobalLocalVar, "variable '%s' is a read only variable", expr.Name)
+		return nil, vterrors.VT03010(expr.Var.Name)
 	}
 }
 
 func buildNotSupported(setting) planFunc {
 	return func(expr *sqlparser.SetExpr, schema plancontext.VSchema, _ *expressionConverter) (engine.SetOp, error) {
-		return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "%s: system setting is not supported", expr.Name)
+		return nil, vterrors.VT12001(fmt.Sprintf("system setting: %s", expr.Var.Name))
 	}
 }
 
@@ -135,7 +142,7 @@ func buildSetOpIgnore(s setting) planFunc {
 			return nil, err
 		}
 		return &engine.SysVarIgnore{
-			Name: expr.Name.Lowered(),
+			Name: expr.Var.Name.Lowered(),
 			Expr: value,
 		}, nil
 	}
@@ -158,7 +165,7 @@ func planSysVarCheckIgnore(expr *sqlparser.SetExpr, schema plancontext.VSchema, 
 	}
 
 	return &engine.SysVarCheckAndIgnore{
-		Name:              expr.Name.Lowered(),
+		Name:              expr.Var.Name.Lowered(),
 		Keyspace:          keyspace,
 		TargetDestination: dest,
 		Expr:              value,
@@ -179,8 +186,10 @@ func buildSetOpReservedConn(s setting) planFunc {
 			return nil, err
 		}
 
+		value = provideAppliedCase(value, s.storageCase)
+
 		return &engine.SysVarReservedConn{
-			Name:              expr.Name.Lowered(),
+			Name:              expr.Var.Name.Lowered(),
 			Keyspace:          ks,
 			TargetDestination: vschema.Destination(),
 			Expr:              value,
@@ -189,7 +198,17 @@ func buildSetOpReservedConn(s setting) planFunc {
 	}
 }
 
-const defaultNotSupportedErrFmt = "DEFAULT not supported for @@%s"
+func provideAppliedCase(value string, storageCase sysvars.StorageCase) string {
+	switch storageCase {
+	case sysvars.SCUpper:
+		return strings.ToUpper(value)
+	case sysvars.SCLower:
+		return strings.ToLower(value)
+	}
+	return value
+}
+
+const defaultNotSupportedErrFmt = "DEFAULT for @@%s"
 
 func buildSetOpVitessAware(s setting) planFunc {
 	return func(astExpr *sqlparser.SetExpr, vschema plancontext.VSchema, ec *expressionConverter) (engine.SetOp, error) {
@@ -199,7 +218,7 @@ func buildSetOpVitessAware(s setting) planFunc {
 		_, isDefault := astExpr.Expr.(*sqlparser.Default)
 		if isDefault {
 			if s.defaultValue == nil {
-				return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, defaultNotSupportedErrFmt, astExpr.Name)
+				return nil, vterrors.VT12001(fmt.Sprintf(defaultNotSupportedErrFmt, astExpr.Var.Name))
 			}
 			runtimeExpr = s.defaultValue
 		} else {
@@ -210,7 +229,7 @@ func buildSetOpVitessAware(s setting) planFunc {
 		}
 
 		return &engine.SysVarSetAware{
-			Name: astExpr.Name.Lowered(),
+			Name: astExpr.Var.Name.Lowered(),
 			Expr: runtimeExpr,
 		}, nil
 	}
@@ -233,7 +252,7 @@ func extractValue(expr *sqlparser.SetExpr, boolean bool) (string, error) {
 	switch node := expr.Expr.(type) {
 	case *sqlparser.Literal:
 		if node.Type == sqlparser.StrVal && boolean {
-			switch strings.ToLower(string(node.Val)) {
+			switch strings.ToLower(node.Val) {
 			case "on":
 				return "1", nil
 			case "off":
@@ -243,17 +262,16 @@ func extractValue(expr *sqlparser.SetExpr, boolean bool) (string, error) {
 	case *sqlparser.ColName:
 		// this is a little of a hack. it's used when the setting is not a normal expression, but rather
 		// an enumeration, such as utf8, utf8mb4, etc
-		if node.Name.AtCount() == sqlparser.NoAt {
-			switch node.Name.Lowered() {
-			case "on":
-				return "1", nil
-			case "off":
-				return "0", nil
-			}
-			return fmt.Sprintf("'%s'", sqlparser.String(expr.Expr)), nil
+		switch node.Name.Lowered() {
+		case "on":
+			return "1", nil
+		case "off":
+			return "0", nil
 		}
+		return fmt.Sprintf("'%s'", sqlparser.String(expr.Expr)), nil
+
 	case *sqlparser.Default:
-		return "", vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, defaultNotSupportedErrFmt, expr.Name)
+		return "", vterrors.VT12001(defaultNotSupportedErrFmt, expr.Var.Name)
 	}
 
 	return sqlparser.String(expr.Expr), nil
@@ -278,7 +296,7 @@ func getValueFor(expr *sqlparser.SetExpr) (any, error) {
 			}
 			return num, nil
 		default:
-			return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "invalid value type: %v", sqlparser.String(expr))
+			return nil, vterrors.VT03011(sqlparser.String(expr))
 		}
 	case sqlparser.BoolVal:
 		var val int64
@@ -293,6 +311,6 @@ func getValueFor(expr *sqlparser.SetExpr) (any, error) {
 	case *sqlparser.Default:
 		return "default", nil
 	default:
-		return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "invalid syntax: %s", sqlparser.String(expr))
+		return nil, vterrors.VT03012(sqlparser.String(expr))
 	}
 }

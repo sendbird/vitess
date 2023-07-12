@@ -18,17 +18,17 @@ package vtexplain
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
 	"sync"
 
-	"vitess.io/vitess/go/sqlescape"
-	"vitess.io/vitess/go/vt/vttablet/onlineddl"
+	"vitess.io/vitess/go/vt/sidecardb"
 
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/mysql/fakesqldb"
+	"vitess.io/vitess/go/sqlescape"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/log"
@@ -36,6 +36,7 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
 	"vitess.io/vitess/go/vt/vttablet/queryservice"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver"
@@ -103,6 +104,7 @@ var _ queryservice.QueryService = (*explainTablet)(nil)
 
 func (vte *VTExplain) newTablet(opts *Options, t *topodatapb.Tablet) *explainTablet {
 	db := fakesqldb.New(nil)
+	sidecardb.AddSchemaInitQueries(db, true)
 
 	config := tabletenv.NewCurrentConfig()
 	config.TrackSchemaVersions = false
@@ -112,6 +114,7 @@ func (vte *VTExplain) newTablet(opts *Options, t *topodatapb.Tablet) *explainTab
 		config.TwoPCEnable = true
 	}
 	config.EnableOnlineDDL = false
+	config.EnableTableGC = false
 
 	// XXX much of this is cloned from the tabletserver tests
 	tsv := tabletserver.NewTabletServer(topoproto.TabletAliasString(t.Alias), config, memorytopo.NewServer(""), t.Alias)
@@ -140,7 +143,7 @@ func (vte *VTExplain) newTablet(opts *Options, t *topodatapb.Tablet) *explainTab
 	tsv.StartService(&target, dbcfgs, nil /* mysqld */)
 
 	// clear all the schema initialization queries out of the tablet
-	// to avoid clutttering the output
+	// to avoid cluttering the output
 	tablet.mysqlQueries = nil
 
 	return &tablet
@@ -149,7 +152,7 @@ func (vte *VTExplain) newTablet(opts *Options, t *topodatapb.Tablet) *explainTab
 var _ queryservice.QueryService = (*explainTablet)(nil) // compile-time interface check
 
 // Begin is part of the QueryService interface.
-func (t *explainTablet) Begin(ctx context.Context, target *querypb.Target, options *querypb.ExecuteOptions) (int64, *topodatapb.TabletAlias, error) {
+func (t *explainTablet) Begin(ctx context.Context, target *querypb.Target, options *querypb.ExecuteOptions) (queryservice.TransactionState, error) {
 	t.mu.Lock()
 	t.currentTime = t.vte.batchTime.Wait()
 	t.tabletQueries = append(t.tabletQueries, &TabletQuery{
@@ -258,7 +261,7 @@ func (t *explainTablet) ReadTransaction(ctx context.Context, target *querypb.Tar
 }
 
 // BeginExecute is part of the QueryService interface.
-func (t *explainTablet) BeginExecute(ctx context.Context, target *querypb.Target, preQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, reservedID int64, options *querypb.ExecuteOptions) (*sqltypes.Result, int64, *topodatapb.TabletAlias, error) {
+func (t *explainTablet) BeginExecute(ctx context.Context, target *querypb.Target, preQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, reservedID int64, options *querypb.ExecuteOptions) (queryservice.TransactionState, *sqltypes.Result, error) {
 	t.mu.Lock()
 	t.currentTime = t.vte.batchTime.Wait()
 	bindVariables = sqltypes.CopyBindVariables(bindVariables)
@@ -290,6 +293,15 @@ func newTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options) (*tablet
 		},
 		"select @@global.sql_mode": {
 			Fields: []*querypb.Field{{
+				Type: sqltypes.VarChar,
+			}},
+			Rows: [][]sqltypes.Value{
+				{sqltypes.NewVarBinary("STRICT_TRANS_TABLES")},
+			},
+		},
+		"select @@session.sql_mode as sql_mode": {
+			Fields: []*querypb.Field{{
+				Name: "sql_mode",
 				Type: sqltypes.VarChar,
 			}},
 			Rows: [][]sqltypes.Value{
@@ -385,12 +397,6 @@ func newTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options) (*tablet
 	for query, result := range schemaQueries {
 		tEnv.addResult(query, result)
 	}
-	for _, query := range onlineddl.ApplyDDL {
-		tEnv.addResult(query, &sqltypes.Result{
-			Fields: []*querypb.Field{{Type: sqltypes.Uint64}},
-			Rows:   [][]sqltypes.Value{},
-		})
-	}
 
 	showTableRows := make([][]sqltypes.Value, 0, 4)
 	for _, ddl := range ddls {
@@ -407,6 +413,10 @@ func newTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options) (*tablet
 		showTableRows = append(showTableRows, mysql.BaseShowTablesRow(table, false, options))
 	}
 	tEnv.addResult(mysql.TablesWithSize57, &sqltypes.Result{
+		Fields: mysql.BaseShowTablesFields,
+		Rows:   showTableRows,
+	})
+	tEnv.addResult(mysql.TablesWithSize80, &sqltypes.Result{
 		Fields: mysql.BaseShowTablesFields,
 		Rows:   showTableRows,
 	})
@@ -486,6 +496,30 @@ func (t *explainTablet) HandleQuery(c *mysql.Conn, query string, callback func(*
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	// If query is part of rejected list then return error right away.
+	if err := t.db.GetRejectedQueryResult(query); err != nil {
+		return err
+	}
+
+	// If query is expected to have a specific result then return the result.
+	if result := t.db.GetQueryResult(query); result != nil {
+		if f := result.BeforeFunc; f != nil {
+			f()
+		}
+		return callback(result.Result)
+	}
+
+	// return result if query is part of defined pattern.
+	if userCallback, expResult, ok, err := t.db.GetQueryPatternResult(query); ok {
+		if userCallback != nil {
+			userCallback(query)
+		}
+		if err != nil {
+			return err
+		}
+		return callback(expResult.Result)
+	}
+
 	if !strings.Contains(query, "1 != 1") {
 		t.mysqlQueries = append(t.mysqlQueries, &MysqlQuery{
 			Time: t.currentTime,
@@ -496,160 +530,17 @@ func (t *explainTablet) HandleQuery(c *mysql.Conn, query string, callback func(*
 	// return the pre-computed results for any schema introspection queries
 	tEnv := t.vte.getGlobalTabletEnv()
 	result := tEnv.getResult(query)
-
 	if result != nil {
 		return callback(result)
 	}
+
 	switch sqlparser.Preview(query) {
 	case sqlparser.StmtSelect:
-		// Parse the select statement to figure out the table and columns
-		// that were referenced so that the synthetic response has the
-		// expected field names and types.
-		stmt, err := sqlparser.Parse(query)
+		var err error
+		result, err = t.handleSelect(query)
 		if err != nil {
 			return err
 		}
-
-		var selStmt *sqlparser.Select
-		switch stmt := stmt.(type) {
-		case *sqlparser.Select:
-			selStmt = stmt
-		case *sqlparser.Union:
-			selStmt = sqlparser.GetFirstSelect(stmt)
-		default:
-			return fmt.Errorf("vtexplain: unsupported statement type +%v", reflect.TypeOf(stmt))
-		}
-
-		// Gen4 supports more complex queries so we now need to
-		// handle multiple FROM clauses
-		tables := make([]*sqlparser.AliasedTableExpr, len(selStmt.From))
-		for _, from := range selStmt.From {
-			tables = append(tables, getTables(from)...)
-		}
-
-		tableColumnMap := map[sqlparser.TableIdent]map[string]querypb.Type{}
-		for _, table := range tables {
-			if table == nil {
-				continue
-			}
-
-			tableName := sqlparser.String(sqlparser.GetTableName(table.Expr))
-			columns, exists := t.vte.getGlobalTabletEnv().tableColumns[tableName]
-			if !exists && tableName != "" && tableName != "dual" {
-				return fmt.Errorf("unable to resolve table name %s", tableName)
-			}
-
-			colTypeMap := map[string]querypb.Type{}
-
-			if table.As.IsEmpty() {
-				tableColumnMap[sqlparser.GetTableName(table.Expr)] = colTypeMap
-			} else {
-				tableColumnMap[table.As] = colTypeMap
-			}
-
-			for k, v := range columns {
-				if colType, exists := colTypeMap[k]; exists {
-					if colType != v {
-						return fmt.Errorf("column type mismatch for column : %s, types: %d vs %d", k, colType, v)
-					}
-					continue
-				}
-				colTypeMap[k] = v
-			}
-
-		}
-
-		colNames := make([]string, 0, 4)
-		colTypes := make([]querypb.Type, 0, 4)
-		for _, node := range selStmt.SelectExprs {
-			switch node := node.(type) {
-			case *sqlparser.AliasedExpr:
-				colNames, colTypes = inferColTypeFromExpr(node.Expr, tableColumnMap, colNames, colTypes)
-			case *sqlparser.StarExpr:
-				if node.TableName.Name.IsEmpty() {
-					// SELECT *
-					for _, colTypeMap := range tableColumnMap {
-						for col, colType := range colTypeMap {
-							colNames = append(colNames, col)
-							colTypes = append(colTypes, colType)
-						}
-					}
-				} else {
-					// SELECT tableName.*
-					colTypeMap := tableColumnMap[node.TableName.Name]
-					for col, colType := range colTypeMap {
-						colNames = append(colNames, col)
-						colTypes = append(colTypes, colType)
-					}
-				}
-			}
-		}
-
-		// the query against lookup table is in-query, handle it specifically
-		var inColName string
-		inVal := make([][]byte, 0, 10)
-		rowCount := 1
-		if selStmt.Where != nil {
-			switch v := selStmt.Where.Expr.(type) {
-			case *sqlparser.ComparisonExpr:
-				if v.Operator == sqlparser.InOp {
-					switch c := v.Left.(type) {
-					case *sqlparser.ColName:
-						switch values := v.Right.(type) {
-						case sqlparser.ValTuple:
-							for _, val := range values {
-								switch v := val.(type) {
-								case *sqlparser.Literal:
-									inVal = append(inVal, v.Bytes())
-								}
-							}
-							rowCount = len(inVal)
-						}
-						inColName = strings.ToLower(c.Name.String())
-					}
-				}
-			}
-		}
-
-		fields := make([]*querypb.Field, len(colNames))
-		rows := make([][]sqltypes.Value, 0, rowCount)
-		for i, col := range colNames {
-			colType := colTypes[i]
-			fields[i] = &querypb.Field{
-				Name: col,
-				Type: colType,
-			}
-		}
-
-		for j := 0; j < rowCount; j++ {
-			values := make([]sqltypes.Value, len(colNames))
-			for i, col := range colNames {
-				// Generate a fake value for the given column. For the column in the IN clause,
-				// use the provided values in the query, For numeric types,
-				// use the column index. For all other types, just shortcut to using
-				// a string type that encodes the column name + index.
-				colType := colTypes[i]
-				if len(inVal) > j && col == inColName {
-					values[i], _ = sqltypes.NewValue(querypb.Type_VARBINARY, inVal[j])
-				} else if sqltypes.IsIntegral(colType) {
-					values[i] = sqltypes.NewInt32(int32(i + 1))
-				} else if sqltypes.IsFloat(colType) {
-					values[i] = sqltypes.NewFloat64(1.0 + float64(i))
-				} else {
-					values[i] = sqltypes.NewVarChar(fmt.Sprintf("%s_val_%d", col, i+1))
-				}
-			}
-			rows = append(rows, values)
-		}
-		result = &sqltypes.Result{
-			Fields:   fields,
-			InsertID: 0,
-			Rows:     rows,
-		}
-
-		resultJSON, _ := json.MarshalIndent(result, "", "    ")
-		log.V(100).Infof("query %s result %s\n", query, string(resultJSON))
-
 	case sqlparser.StmtBegin, sqlparser.StmtCommit, sqlparser.StmtSet,
 		sqlparser.StmtSavepoint, sqlparser.StmtSRollback, sqlparser.StmtRelease:
 		result = &sqltypes.Result{}
@@ -666,6 +557,208 @@ func (t *explainTablet) HandleQuery(c *mysql.Conn, query string, callback func(*
 	return callback(result)
 }
 
+func (t *explainTablet) handleSelect(query string) (*sqltypes.Result, error) {
+	// Parse the select statement to figure out the table and columns
+	// that were referenced so that the synthetic response has the
+	// expected field names and types.
+	stmt, err := sqlparser.Parse(query)
+	if err != nil {
+		return nil, err
+	}
+
+	var selStmt *sqlparser.Select
+	switch stmt := stmt.(type) {
+	case *sqlparser.Select:
+		selStmt = stmt
+	case *sqlparser.Union:
+		selStmt = sqlparser.GetFirstSelect(stmt)
+	default:
+		return nil, fmt.Errorf("vtexplain: unsupported statement type +%v", reflect.TypeOf(stmt))
+	}
+
+	// Gen4 supports more complex queries so we now need to
+	// handle multiple FROM clauses
+	tables := make([]*sqlparser.AliasedTableExpr, len(selStmt.From))
+	for _, from := range selStmt.From {
+		tables = append(tables, getTables(from)...)
+	}
+
+	tableColumnMap := map[sqlparser.IdentifierCS]map[string]querypb.Type{}
+	for _, table := range tables {
+		if table == nil {
+			continue
+		}
+
+		tableName := sqlparser.String(sqlparser.GetTableName(table.Expr))
+		columns, exists := t.vte.getGlobalTabletEnv().tableColumns[tableName]
+		if !exists && tableName != "" && tableName != "dual" {
+			return nil, fmt.Errorf("unable to resolve table name %s", tableName)
+		}
+
+		colTypeMap := map[string]querypb.Type{}
+
+		if table.As.IsEmpty() {
+			tableColumnMap[sqlparser.GetTableName(table.Expr)] = colTypeMap
+		} else {
+			tableColumnMap[table.As] = colTypeMap
+		}
+
+		for k, v := range columns {
+			if colType, exists := colTypeMap[k]; exists {
+				if colType != v {
+					return nil, fmt.Errorf("column type mismatch for column : %s, types: %d vs %d", k, colType, v)
+				}
+				continue
+			}
+			colTypeMap[k] = v
+		}
+
+	}
+
+	colNames, colTypes := t.analyzeExpressions(selStmt, tableColumnMap)
+
+	inColName, inVal, rowCount, s, err := t.analyzeWhere(selStmt, tableColumnMap)
+	if err != nil {
+		return s, err
+	}
+
+	fields := make([]*querypb.Field, len(colNames))
+	rows := make([][]sqltypes.Value, 0, rowCount)
+	for i, col := range colNames {
+		colType := colTypes[i]
+		fields[i] = &querypb.Field{
+			Name: col,
+			Type: colType,
+		}
+	}
+
+	for j := 0; j < rowCount; j++ {
+		values := make([]sqltypes.Value, len(colNames))
+		for i, col := range colNames {
+			// Generate a fake value for the given column. For the column in the IN clause,
+			// use the provided values in the query, For numeric types,
+			// use the column index. For all other types, just shortcut to using
+			// a string type that encodes the column name + index.
+			colType := colTypes[i]
+			if len(inVal) > j && col == inColName {
+				values[i], _ = sqltypes.NewValue(querypb.Type_VARBINARY, inVal[j].Raw())
+			} else if sqltypes.IsIntegral(colType) {
+				values[i] = sqltypes.NewInt32(int32(i + 1))
+			} else if sqltypes.IsFloat(colType) {
+				values[i] = sqltypes.NewFloat64(1.0 + float64(i))
+			} else {
+				values[i] = sqltypes.NewVarChar(fmt.Sprintf("%s_val_%d", col, i+1))
+			}
+		}
+		rows = append(rows, values)
+	}
+	result := &sqltypes.Result{
+		Fields:   fields,
+		InsertID: 0,
+		Rows:     rows,
+	}
+	return result, nil
+}
+
+func (t *explainTablet) analyzeWhere(selStmt *sqlparser.Select, tableColumnMap map[sqlparser.IdentifierCS]map[string]querypb.Type) (inColName string, inVal []sqltypes.Value, rowCount int, result *sqltypes.Result, err error) {
+	// the query against lookup table is in-query, handle it specifically
+	rowCount = 1
+	if selStmt.Where == nil {
+		return
+	}
+	v, ok := selStmt.Where.Expr.(*sqlparser.ComparisonExpr)
+	if !ok || v.Operator != sqlparser.InOp {
+		return
+	}
+	c, ok := v.Left.(*sqlparser.ColName)
+	if !ok {
+		return
+	}
+	colName := strings.ToLower(c.Name.String())
+	colType := querypb.Type_VARCHAR
+	tableExpr := selStmt.From[0]
+	expr, ok := tableExpr.(*sqlparser.AliasedTableExpr)
+	if ok {
+		m := tableColumnMap[sqlparser.GetTableName(expr.Expr)]
+		if m != nil {
+			t, found := m[colName]
+			if found {
+				colType = t
+			}
+		}
+	}
+
+	values, ok := v.Right.(sqlparser.ValTuple)
+	if !ok {
+		return
+	}
+	for _, val := range values {
+		lit, ok := val.(*sqlparser.Literal)
+		if !ok {
+			continue
+		}
+		value, err := evalengine.LiteralToValue(lit)
+		if err != nil {
+			return "", nil, 0, nil, err
+		}
+
+		// Cast the value in the tuple to the expected value of the column
+		castedValue, err := evalengine.Cast(value, colType)
+		if err != nil {
+			return "", nil, 0, nil, err
+		}
+
+		// Check if we have a duplicate value
+		isNewValue := true
+		for _, v := range inVal {
+			result, err := evalengine.NullsafeCompare(v, value, collations.Default())
+			if err != nil {
+				return "", nil, 0, nil, err
+			}
+
+			if result == 0 {
+				isNewValue = false
+				break
+			}
+		}
+
+		if isNewValue {
+			inVal = append(inVal, castedValue)
+		}
+	}
+	inColName = strings.ToLower(c.Name.String())
+	return inColName, inVal, rowCount, nil, nil
+}
+
+func (t *explainTablet) analyzeExpressions(selStmt *sqlparser.Select, tableColumnMap map[sqlparser.IdentifierCS]map[string]querypb.Type) ([]string, []querypb.Type) {
+	colNames := make([]string, 0, 4)
+	colTypes := make([]querypb.Type, 0, 4)
+	for _, node := range selStmt.SelectExprs {
+		switch node := node.(type) {
+		case *sqlparser.AliasedExpr:
+			colNames, colTypes = inferColTypeFromExpr(node.Expr, tableColumnMap, colNames, colTypes)
+		case *sqlparser.StarExpr:
+			if node.TableName.Name.IsEmpty() {
+				// SELECT *
+				for _, colTypeMap := range tableColumnMap {
+					for col, colType := range colTypeMap {
+						colNames = append(colNames, col)
+						colTypes = append(colTypes, colType)
+					}
+				}
+			} else {
+				// SELECT tableName.*
+				colTypeMap := tableColumnMap[node.TableName.Name]
+				for col, colType := range colTypeMap {
+					colNames = append(colNames, col)
+					colTypes = append(colTypes, colType)
+				}
+			}
+		}
+	}
+	return colNames, colTypes
+}
+
 func getTables(node sqlparser.SQLNode) []*sqlparser.AliasedTableExpr {
 	var tables []*sqlparser.AliasedTableExpr
 	switch expr := node.(type) {
@@ -678,7 +771,7 @@ func getTables(node sqlparser.SQLNode) []*sqlparser.AliasedTableExpr {
 	return tables
 }
 
-func inferColTypeFromExpr(node sqlparser.Expr, tableColumnMap map[sqlparser.TableIdent]map[string]querypb.Type, colNames []string, colTypes []querypb.Type) ([]string, []querypb.Type) {
+func inferColTypeFromExpr(node sqlparser.Expr, tableColumnMap map[sqlparser.IdentifierCS]map[string]querypb.Type, colNames []string, colTypes []querypb.Type) ([]string, []querypb.Type) {
 	switch node := node.(type) {
 	case *sqlparser.ColName:
 		if node.Qualifier.Name.IsEmpty() {

@@ -18,22 +18,22 @@ package vtgate
 
 import (
 	"bytes"
+	"context"
+	_ "embed"
 	"fmt"
 	"strconv"
 	"strings"
 	"testing"
 
 	"vitess.io/vitess/go/vt/log"
-
-	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/sidecardb"
+	"vitess.io/vitess/go/vt/vtgate/logstats"
 
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/stretchr/testify/assert"
-
-	"context"
 
 	"vitess.io/vitess/go/cache"
 	"vitess.io/vitess/go/sqltypes"
@@ -48,313 +48,17 @@ import (
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
-var executorVSchema = `
-{
-	"sharded": true,
-	"vindexes": {
-		"hash_index": {
-			"type": "hash"
-		},
-		"music_user_map": {
-			"type": "lookup_hash_unique",
-			"owner": "music",
-			"params": {
-				"table": "music_user_map",
-				"from": "music_id",
-				"to": "user_id"
-			}
-		},
-		"name_user_map": {
-			"type": "lookup_hash",
-			"owner": "user",
-			"params": {
-				"table": "name_user_map",
-				"from": "name",
-				"to": "user_id"
-			}
-		},
-		"name_lastname_keyspace_id_map": {
-			"type": "lookup",
-			"owner": "user2",
-			"params": {
-				"table": "name_lastname_keyspace_id_map",
-				"from": "name,lastname",
-				"to": "keyspace_id"
-			}
-		},
-		"insert_ignore_idx": {
-			"type": "lookup_hash",
-			"owner": "insert_ignore_test",
-			"params": {
-				"table": "ins_lookup",
-				"from": "fromcol",
-				"to": "tocol"
-			}
-		},
-		"idx1": {
-			"type": "hash"
-		},
-		"idx_noauto": {
-			"type": "hash",
-			"owner": "noauto_table"
-		},
-		"keyspace_id": {
-			"type": "numeric"
-		},
-		"krcol_unique_vdx": {
-			"type": "keyrange_lookuper_unique"
-		},
-		"krcol_vdx": {
-			"type": "keyrange_lookuper"
-		},
-    	"t1_lkp_vdx": {
-      		"type": "consistent_lookup_unique",
-      		"params": {
-        		"table": "t1_lkp_idx",
-        		"from": "unq_col",
-        		"to": "keyspace_id"
-      		},
-      		"owner": "t1"
-    	},
-		"t2_wo_lu_vdx": {
-      		"type": "lookup_unique",
-      		"params": {
-        		"table": "TestUnsharded.wo_lu_idx",
-        		"from": "wo_lu_col",
-        		"to": "keyspace_id",
-				"write_only": "true"
-      		},
-      		"owner": "t2_wo_lookup"
-    	},
-		"t2_lu_vdx": {
-      		"type": "lookup_hash_unique",
-      		"params": {
-        		"table": "TestUnsharded.lu_idx",
-        		"from": "lu_col",
-        		"to": "keyspace_id"
-      		},
-      		"owner": "t2_wo_lookup"
-    	},
-		"regional_vdx": {
-			"type": "region_experimental",
-			"params": {
-				"region_bytes": "1"
-			}
-    	}
-	},
-	"tables": {
-		"user": {
-			"column_vindexes": [
-				{
-					"column": "Id",
-					"name": "hash_index"
-				},
-				{
-					"column": "name",
-					"name": "name_user_map"
-				}
-			],
-			"auto_increment": {
-				"column": "id",
-				"sequence": "user_seq"
-			},
-			"columns": [
-				{
-					"name": "textcol",
-					"type": "VARCHAR"
-				}
-			]
-		},
-		"user2": {
-			"column_vindexes": [
-				{
-					"column": "id",
-					"name": "hash_index"
-				},
-				{
-					"columns": ["name", "lastname"],
-					"name": "name_lastname_keyspace_id_map"
-				}
-			]
-		},
-		"user_extra": {
-			"column_vindexes": [
-				{
-					"column": "user_id",
-					"name": "hash_index"
-				}
-			]
-		},
-		"sharded_user_msgs": {
-			"column_vindexes": [
-				{
-					"column": "user_id",
-					"name": "hash_index"
-				}
-			]
-		},
-		"music": {
-			"column_vindexes": [
-				{
-					"column": "user_id",
-					"name": "hash_index"
-				},
-				{
-					"column": "id",
-					"name": "music_user_map"
-				}
-			],
-			"auto_increment": {
-				"column": "id",
-				"sequence": "user_seq"
-			}
-		},
-		"music_extra": {
-			"column_vindexes": [
-				{
-					"column": "user_id",
-					"name": "hash_index"
-				},
-				{
-					"column": "music_id",
-					"name": "music_user_map"
-				}
-			]
-		},
-		"music_extra_reversed": {
-			"column_vindexes": [
-				{
-					"column": "music_id",
-					"name": "music_user_map"
-				},
-				{
-					"column": "user_id",
-					"name": "hash_index"
-				}
-			]
-		},
-		"insert_ignore_test": {
-			"column_vindexes": [
-				{
-					"column": "pv",
-					"name": "music_user_map"
-				},
-				{
-					"column": "owned",
-					"name": "insert_ignore_idx"
-				},
-				{
-					"column": "verify",
-					"name": "hash_index"
-				}
-			]
-		},
-		"noauto_table": {
-			"column_vindexes": [
-				{
-					"column": "id",
-					"name": "idx_noauto"
-				}
-			]
-		},
-		"keyrange_table": {
-			"column_vindexes": [
-				{
-					"column": "krcol_unique",
-					"name": "krcol_unique_vdx"
-				},
-				{
-					"column": "krcol",
-					"name": "krcol_vdx"
-				}
-			]
-		},
-		"ksid_table": {
-			"column_vindexes": [
-				{
-					"column": "keyspace_id",
-					"name": "keyspace_id"
-				}
-			]
-		},
-		"t1": {
-      		"column_vindexes": [
-				{
-				  	"column": "id",
-				  	"name": "hash_index"
-				},
-				{
-				  	"column": "unq_col",
-				  	"name": "t1_lkp_vdx"
-				}
-            ]
-    	},
-		"t1_lkp_idx": {
-			"column_vindexes": [
-				{
-					"column": "unq_col",
-				  	"name": "hash_index"
-				}
-			]
-		},
-		"t2_wo_lookup": {
-      		"column_vindexes": [
-				{
-				  	"column": "id",
-				  	"name": "hash_index"
-				},
-				{
-				  	"column": "wo_lu_col",
-				  	"name": "t2_wo_lu_vdx"
-				},
-				{
-				  	"column": "lu_col",
-				  	"name": "t2_lu_vdx"
-				}
-            ]
-    	},
-		"user_region": {
-			"column_vindexes": [
-				{
-					"columns": ["cola","colb"],
-					"name": "regional_vdx"
-				}
-			]
-    	}
-	}
-}
-`
+//go:embed testdata/executorVSchema.json
+var executorVSchema string
+
+//go:embed testdata/unshardedVschema.json
+var unshardedVSchema string
 
 var badVSchema = `
 {
 	"sharded": false,
 	"tables": {
 		"sharded_table": {}
-	}
-}
-`
-
-var unshardedVSchema = `
-{
-	"sharded": false,
-	"tables": {
-		"user_seq": {
-			"type": "sequence"
-		},
-		"music_user_map": {},
-		"name_user_map": {},
-		"name_lastname_keyspace_id_map": {},
-		"user_msgs": {},
-		"ins_lookup": {},
-		"main1": {
-			"auto_increment": {
-				"column": "id",
-				"sequence": "user_seq"
-			}
-		},
-		"wo_lu_idx": {},
-		"lu_idx": {},
-		"simple": {}
 	}
 }
 `
@@ -377,10 +81,10 @@ func (v *keyRangeLookuper) String() string   { return "keyrange_lookuper" }
 func (*keyRangeLookuper) Cost() int          { return 0 }
 func (*keyRangeLookuper) IsUnique() bool     { return false }
 func (*keyRangeLookuper) NeedsVCursor() bool { return false }
-func (*keyRangeLookuper) Verify(vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
+func (*keyRangeLookuper) Verify(context.Context, vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
 	return []bool{}, nil
 }
-func (*keyRangeLookuper) Map(cursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+func (*keyRangeLookuper) Map(ctx context.Context, vcursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	return []key.Destination{
 		key.DestinationKeyRange{
 			KeyRange: &topodatapb.KeyRange{
@@ -402,10 +106,10 @@ func (v *keyRangeLookuperUnique) String() string   { return "keyrange_lookuper" 
 func (*keyRangeLookuperUnique) Cost() int          { return 0 }
 func (*keyRangeLookuperUnique) IsUnique() bool     { return true }
 func (*keyRangeLookuperUnique) NeedsVCursor() bool { return false }
-func (*keyRangeLookuperUnique) Verify(vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
+func (*keyRangeLookuperUnique) Verify(context.Context, vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
 	return []bool{}, nil
 }
-func (*keyRangeLookuperUnique) Map(cursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+func (*keyRangeLookuperUnique) Map(ctx context.Context, vcursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	return []key.Destination{
 		key.DestinationKeyRange{
 			KeyRange: &topodatapb.KeyRange{
@@ -430,6 +134,23 @@ func createExecutorEnv() (executor *Executor, sbc1, sbc2, sbclookup *sandboxconn
 	s := createSandbox(KsTestSharded)
 	s.VSchema = executorVSchema
 	serv := newSandboxForCells([]string{cell})
+	serv.topoServer.CreateKeyspace(context.Background(), "TestExecutor", &topodatapb.Keyspace{SidecarDbName: sidecardb.DefaultName})
+	// Force a new cache to use for lookups of the sidecar database identifier
+	// in use by each keyspace -- as we want to use a different load function
+	// than the one already created by the vtgate as it uses a different topo.
+	if sdbc, _ := sidecardb.GetIdentifierCache(); sdbc != nil {
+		sdbc.Destroy()
+	}
+	_, created := sidecardb.NewIdentifierCache(func(ctx context.Context, keyspace string) (string, error) {
+		ki, err := serv.topoServer.GetKeyspace(ctx, keyspace)
+		if err != nil {
+			return "", err
+		}
+		return ki.SidecarDbName, nil
+	})
+	if !created {
+		log.Fatal("Failed to [re]create a sidecar database identifier cache!")
+	}
 	resolver := newTestResolver(hc, serv, cell)
 	sbc1 = hc.AddTestTablet(cell, "-20", 1, "TestExecutor", "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
 	sbc2 = hc.AddTestTablet(cell, "40-60", 1, "TestExecutor", "40-60", topodatapb.TabletType_PRIMARY, true, 1, nil)
@@ -444,25 +165,9 @@ func createExecutorEnv() (executor *Executor, sbc1, sbc2, sbclookup *sandboxconn
 	_ = hc.AddTestTablet(cell, "random", 1, "TestXBadVSchema", "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
 
 	createSandbox(KsTestUnsharded)
-	_ = topo.NewShardInfo(KsTestUnsharded, "0", &topodatapb.Shard{}, nil)
-	if err := serv.topoServer.CreateKeyspace(ctx, KsTestUnsharded, &topodatapb.Keyspace{}); err != nil {
-		log.Errorf("CreateKeyspace() failed: %v", err)
-	}
-	if err := serv.topoServer.CreateShard(ctx, KsTestUnsharded, "0"); err != nil {
-		log.Errorf("CreateShard(0) failed: %v", err)
-	}
 	sbclookup = hc.AddTestTablet(cell, "0", 1, KsTestUnsharded, "0", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	tablet := topo.NewTablet(sbclookup.Tablet().Alias.Uid, cell, "0")
-	tablet.Type = topodatapb.TabletType_PRIMARY
-	tablet.Keyspace = KsTestUnsharded
-	tablet.Shard = "0"
-	serv.topoServer.UpdateShardFields(ctx, KsTestUnsharded, "0", func(si *topo.ShardInfo) error {
-		si.PrimaryAlias = tablet.Alias
-		return nil
-	})
-	if err := serv.topoServer.CreateTablet(ctx, tablet); err != nil {
-		log.Errorf("CreateShard(0) failed: %v", err)
-	}
+	_ = hc.AddTestTablet(cell, "2", 3, KsTestUnsharded, "0", topodatapb.TabletType_REPLICA, true, 1, nil)
+
 	// Ues the 'X' in the name to ensure it's not alphabetically first.
 	// Otherwise, it would become the default keyspace for the dual table.
 	bad := createSandbox("TestXBadSharding")
@@ -533,6 +238,7 @@ func createCustomExecutorSetValues(vschema string, values []*sqltypes.Result) (e
 func executorExecSession(executor *Executor, sql string, bv map[string]*querypb.BindVariable, session *vtgatepb.Session) (*sqltypes.Result, error) {
 	return executor.Execute(
 		context.Background(),
+		nil,
 		"TestExecute",
 		NewSafeSession(session),
 		sql,
@@ -556,6 +262,7 @@ func executorStream(executor *Executor, sql string) (qr *sqltypes.Result, err er
 	results := make(chan *sqltypes.Result, 100)
 	err = executor.StreamExecute(
 		context.Background(),
+		nil,
 		"TestExecuteStream",
 		NewSafeSession(nil),
 		sql,
@@ -590,11 +297,11 @@ func assertQueries(t *testing.T, sbc *sandboxconn.SandboxConn, wantQueries []*qu
 		if len(wantQueries) < idx {
 			t.Errorf("got more queries than expected")
 		}
-		require.Equal(t, wantQueries[idx].BindVariables, query.BindVariables)
 		got := query.Sql
 		expected := wantQueries[idx].Sql
-		idx++
 		assert.Equal(t, expected, got)
+		assert.Equal(t, wantQueries[idx].BindVariables, query.BindVariables)
+		idx++
 	}
 }
 
@@ -630,7 +337,7 @@ func assertQueriesWithSavepoint(t *testing.T, sbc *sandboxconn.SandboxConn, want
 
 func testCommitCount(t *testing.T, sbcName string, sbc *sandboxconn.SandboxConn, want int) {
 	t.Helper()
-	if got, want := sbc.CommitCount.Get(), int64(want); got != want {
+	if got, want := sbc.CommitCount.Load(), int64(want); got != want {
 		t.Errorf("%s.CommitCount: %d, want %d\n", sbcName, got, want)
 	}
 }
@@ -643,12 +350,10 @@ func testNonZeroDuration(t *testing.T, what, d string) {
 	}
 }
 
-func getQueryLog(logChan chan any) *LogStats {
-	var log any
-
+func getQueryLog(logChan chan *logstats.LogStats) *logstats.LogStats {
 	select {
-	case log = <-logChan:
-		return log.(*LogStats)
+	case log := <-logChan:
+		return log
 	default:
 		return nil
 	}
@@ -661,12 +366,10 @@ func getQueryLog(logChan chan any) *LogStats {
 // is a repeat query.
 var testPlannedQueries = map[string]bool{}
 
-func testQueryLog(t *testing.T, logChan chan any, method, stmtType, sql string, shardQueries int) *LogStats {
+func testQueryLog(t *testing.T, logChan chan *logstats.LogStats, method, stmtType, sql string, shardQueries int) *logstats.LogStats {
 	t.Helper()
 
-	var logStats *LogStats
-
-	logStats = getQueryLog(logChan)
+	logStats := getQueryLog(logChan)
 	require.NotNil(t, logStats)
 
 	var log bytes.Buffer

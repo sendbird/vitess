@@ -24,7 +24,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
@@ -54,13 +53,15 @@ const (
 )
 
 // when validateWalk returns true, then the child nodes are also visited
-func validateWalk(node sqlparser.SQLNode) (kontinue bool, err error) {
+func validateWalk(node sqlparser.SQLNode, allowForeignKeys bool) (kontinue bool, err error) {
 	switch node.(type) {
 	case *sqlparser.CreateTable, *sqlparser.AlterTable,
 		*sqlparser.TableSpec, *sqlparser.AddConstraintDefinition, *sqlparser.ConstraintDefinition:
 		return true, nil
 	case *sqlparser.ForeignKeyDefinition:
-		return false, ErrForeignKeyFound
+		if !allowForeignKeys {
+			return false, ErrForeignKeyFound
+		}
 	case *sqlparser.RenameTableName:
 		return false, ErrRenameTableFound
 	}
@@ -82,18 +83,20 @@ const (
 
 // OnlineDDL encapsulates the relevant information in an online schema change request
 type OnlineDDL struct {
-	Keyspace         string          `json:"keyspace,omitempty"`
-	Table            string          `json:"table,omitempty"`
-	Schema           string          `json:"schema,omitempty"`
-	SQL              string          `json:"sql,omitempty"`
-	UUID             string          `json:"uuid,omitempty"`
-	Strategy         DDLStrategy     `json:"strategy,omitempty"`
-	Options          string          `json:"options,omitempty"`
-	RequestTime      int64           `json:"time_created,omitempty"`
-	MigrationContext string          `json:"context,omitempty"`
-	Status           OnlineDDLStatus `json:"status,omitempty"`
-	TabletAlias      string          `json:"tablet,omitempty"`
-	Retries          int64           `json:"retries,omitempty"`
+	Keyspace string      `json:"keyspace,omitempty"`
+	Table    string      `json:"table,omitempty"`
+	Schema   string      `json:"schema,omitempty"`
+	SQL      string      `json:"sql,omitempty"`
+	UUID     string      `json:"uuid,omitempty"`
+	Strategy DDLStrategy `json:"strategy,omitempty"`
+	Options  string      `json:"options,omitempty"`
+	// Stateful fields:
+	MigrationContext   string          `json:"context,omitempty"`
+	Status             OnlineDDLStatus `json:"status,omitempty"`
+	TabletAlias        string          `json:"tablet,omitempty"`
+	Retries            int64           `json:"retries,omitempty"`
+	ReadyToComplete    int64           `json:"ready_to_complete,omitempty"`
+	WasReadyToComplete int64           `json:"was_ready_to_complete,omitempty"`
 }
 
 // FromJSON creates an OnlineDDL from json
@@ -117,7 +120,7 @@ func ParseOnlineDDLStatement(sql string) (ddlStmt sqlparser.DDLStatement, action
 	return ddlStmt, action, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unsupported query type: %s", sql)
 }
 
-func onlineDDLStatementSanity(sql string, ddlStmt sqlparser.DDLStatement) error {
+func onlineDDLStatementSanity(sql string, ddlStmt sqlparser.DDLStatement, ddlStrategySetting *DDLStrategySetting) error {
 	// SQL statement sanity checks:
 	if !ddlStmt.IsFullyParsed() {
 		if _, err := sqlparser.ParseStrictDDL(sql); err != nil {
@@ -127,7 +130,10 @@ func onlineDDLStatementSanity(sql string, ddlStmt sqlparser.DDLStatement) error 
 		return vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.SyntaxError, "cannot parse statement: %v", sql)
 	}
 
-	if err := sqlparser.Walk(validateWalk, ddlStmt); err != nil {
+	walkFunc := func(node sqlparser.SQLNode) (kontinue bool, err error) {
+		return validateWalk(node, ddlStrategySetting.IsAllowForeignKeysFlag())
+	}
+	if err := sqlparser.Walk(walkFunc, ddlStmt); err != nil {
 		switch err {
 		case ErrForeignKeyFound:
 			return vterrors.Errorf(vtrpcpb.Code_ABORTED, "foreign key constraints are not supported in online DDL, see https://vitess.io/blog/2021-06-15-online-ddl-why-no-fk/")
@@ -141,7 +147,7 @@ func onlineDDLStatementSanity(sql string, ddlStmt sqlparser.DDLStatement) error 
 // NewOnlineDDLs takes a single DDL statement, normalizes it (potentially break down into multiple statements), and generates one or more OnlineDDL instances, one for each normalized statement
 func NewOnlineDDLs(keyspace string, sql string, ddlStmt sqlparser.DDLStatement, ddlStrategySetting *DDLStrategySetting, migrationContext string, providedUUID string) (onlineDDLs [](*OnlineDDL), err error) {
 	appendOnlineDDL := func(tableName string, ddlStmt sqlparser.DDLStatement) error {
-		if err := onlineDDLStatementSanity(sql, ddlStmt); err != nil {
+		if err := onlineDDLStatementSanity(sql, ddlStmt, ddlStrategySetting); err != nil {
 			return err
 		}
 		onlineDDL, err := NewOnlineDDL(keyspace, tableName, sqlparser.String(ddlStmt), ddlStrategySetting, migrationContext, providedUUID)
@@ -243,7 +249,6 @@ func NewOnlineDDL(keyspace string, table string, sql string, ddlStrategySetting 
 		UUID:             onlineDDLUUID,
 		Strategy:         ddlStrategySetting.Strategy,
 		Options:          ddlStrategySetting.Options,
-		RequestTime:      time.Now().UnixNano(),
 		MigrationContext: migrationContext,
 		Status:           OnlineDDLStatusRequested,
 	}, nil
@@ -275,15 +280,11 @@ func OnlineDDLFromCommentedStatement(stmt sqlparser.Statement) (onlineDDL *Onlin
 
 	directives := comments.Directives()
 	decodeDirective := func(name string) (string, error) {
-		value, ok := directives[name]
+		value, ok := directives.GetString(name, "")
 		if !ok {
 			return "", vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "no value found for comment directive %s", name)
 		}
-		unquoted, err := strconv.Unquote(value)
-		if err != nil {
-			return "", err
-		}
-		b, err := hex.DecodeString(unquoted)
+		b, err := hex.DecodeString(value)
 		if err != nil {
 			return "", err
 		}
@@ -324,11 +325,6 @@ func OnlineDDLFromCommentedStatement(stmt sqlparser.Statement) (onlineDDL *Onlin
 // StrategySetting returns the ddl strategy setting associated with this online DDL
 func (onlineDDL *OnlineDDL) StrategySetting() *DDLStrategySetting {
 	return NewDDLStrategySetting(onlineDDL.Strategy, onlineDDL.Options)
-}
-
-// RequestTimeSeconds converts request time to seconds (losing nano precision)
-func (onlineDDL *OnlineDDL) RequestTimeSeconds() int64 {
-	return onlineDDL.RequestTime / int64(time.Second)
 }
 
 // ToJSON exports this onlineDDL to JSON

@@ -17,11 +17,10 @@ limitations under the License.
 package vstreamer
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
-
-	"context"
 
 	"github.com/stretchr/testify/require"
 
@@ -30,6 +29,7 @@ import (
 	"vitess.io/vitess/go/vt/dbconfigs"
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 )
 
 var (
@@ -87,14 +87,14 @@ func TestUpdateVSchema(t *testing.T) {
 
 	// We have to start at least one stream to start the vschema watcher.
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
 	filter := &binlogdatapb.Filter{
 		Rules: []*binlogdatapb.Rule{{
 			Match: "/.*/",
 		}},
 	}
-	// Stream should terminate immediately due to canceled context.
-	_ = engine.Stream(ctx, "current", nil, filter, func(_ []*binlogdatapb.VEvent) error {
+	// Stream should terminate immediately due to invalid pos.
+	_ = engine.Stream(ctx, "invalid", nil, filter, throttlerapp.VStreamerName, func(_ []*binlogdatapb.VEvent) error {
 		return nil
 	})
 
@@ -111,10 +111,6 @@ func TestUpdateVSchema(t *testing.T) {
     "vttest": {
       "sharded": true,
       "tables": {
-        "dual": {
-          "type": "reference",
-          "name": "dual"
-        },
         "t1": {
           "name": "t1",
           "column_vindexes": [
@@ -143,16 +139,15 @@ func TestUpdateVSchema(t *testing.T) {
         "hash": {}
       }
     }
-  }
+  },
+  "shard_routing_rules": null
 }`
-
 	b, err := json.MarshalIndent(engine.vschema(), "", "  ")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(b); got != want {
-		t.Errorf("vschema:\n%s, want:\n%s", got, want)
-	}
+	got := string(b)
+	require.Equal(t, want, got)
 }
 
 func expectUpdateCount(t *testing.T, wantCount int64) int64 {
@@ -169,52 +164,14 @@ func expectUpdateCount(t *testing.T, wantCount int64) int64 {
 	panic("unreachable")
 }
 
+// TestVStreamerWaitForMySQL tests the wait for MySQL to catch-up
+// logic that is used by vstreamer when starting a copy phase cycle.
+// This logic today supports waiting for MySQL replication lag
+// and/or InnoDB MVCC history to be below a certain threshold before
+// starting the next copy phase.
 func TestVStreamerWaitForMySQL(t *testing.T) {
 	tableName := "test"
-	type fields struct {
-		vse                   *Engine
-		cp                    dbconfigs.Connector
-		se                    *schema.Engine
-		ReplicationLagSeconds int64
-		maxInnoDBTrxHistLen   int64
-		maxMySQLReplLagSecs   int64
-	}
-	tests := []struct {
-		name    string
-		fields  fields
-		wantErr bool
-	}{
-		{
-			name: "Small InnoDB MVCC impact limit",
-			fields: fields{
-				vse:                 engine,
-				se:                  engine.se,
-				maxInnoDBTrxHistLen: 100,
-				maxMySQLReplLagSecs: 5000,
-			},
-			wantErr: true,
-		},
-		{
-			name: "Small Repl Lag impact limit",
-			fields: fields{
-				vse:                 engine,
-				se:                  engine.se,
-				maxInnoDBTrxHistLen: 10000,
-				maxMySQLReplLagSecs: 5,
-			},
-			wantErr: true,
-		},
-		{
-			name: "Large impact limits",
-			fields: fields{
-				vse:                 engine,
-				se:                  engine.se,
-				maxInnoDBTrxHistLen: 10000,
-				maxMySQLReplLagSecs: 200,
-			},
-			wantErr: false,
-		},
-	}
+	expectedWaits := int64(0)
 	testDB := fakesqldb.New(t)
 	hostres := sqltypes.MakeTestResult(sqltypes.MakeTestFields(
 		"hostname|port",
@@ -231,9 +188,58 @@ func TestVStreamerWaitForMySQL(t *testing.T) {
 		"int64"),
 		"10",
 	)
+	type fields struct {
+		vse                   *Engine
+		cp                    dbconfigs.Connector
+		se                    *schema.Engine
+		ReplicationLagSeconds int64
+		maxInnoDBTrxHistLen   int64
+		maxMySQLReplLagSecs   int64
+	}
+	tests := []struct {
+		name       string
+		fields     fields
+		shouldWait bool
+		wantErr    bool
+	}{
+		{
+			name: "Small InnoDB MVCC impact limit",
+			fields: fields{
+				vse:                 engine,
+				se:                  engine.se,
+				maxInnoDBTrxHistLen: 100, // Should wait on this
+				maxMySQLReplLagSecs: 5000,
+			},
+			shouldWait: true,
+			wantErr:    true,
+		},
+		{
+			name: "Small Repl Lag impact limit",
+			fields: fields{
+				vse:                 engine,
+				se:                  engine.se,
+				maxInnoDBTrxHistLen: 10000,
+				maxMySQLReplLagSecs: 5, // Should wait on this
+			},
+			shouldWait: true,
+			wantErr:    true,
+		},
+		{
+			name: "Large impact limits",
+			fields: fields{
+				vse:                 engine,
+				se:                  engine.se,
+				maxInnoDBTrxHistLen: 10000,
+				maxMySQLReplLagSecs: 200,
+			},
+			wantErr: false,
+		},
+	}
+
 	testDB.AddQuery(hostQuery, hostres)
 	testDB.AddQuery(trxHistoryLenQuery, thlres)
 	testDB.AddQuery(replicaLagQuery, sbmres)
+
 	for _, tt := range tests {
 		tt.fields.cp = testDB.ConnParams()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -252,9 +258,12 @@ func TestVStreamerWaitForMySQL(t *testing.T) {
 			if err := uvs.vse.waitForMySQL(ctx, uvs.cp, tableName); (err != nil) != tt.wantErr {
 				t.Errorf("vstreamer.waitForMySQL() error = %v, wantErr %v", err, tt.wantErr)
 			}
+			if tt.shouldWait {
+				expectedWaits++
+			}
 		})
 	}
 
-	require.Equal(t, engine.rowStreamerWaits.Counts()["VStreamerTest.waitForMySQL"], int64(2))
-	require.Equal(t, engine.vstreamerPhaseTimings.Counts()["VStreamerTest."+tableName+":waitForMySQL"], int64(2))
+	require.Equal(t, engine.rowStreamerWaits.Counts()["VStreamerTest.waitForMySQL"], expectedWaits)
+	require.Equal(t, engine.vstreamerPhaseTimings.Counts()["VStreamerTest."+tableName+":waitForMySQL"], expectedWaits)
 }

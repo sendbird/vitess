@@ -16,6 +16,8 @@ limitations under the License.
 
 package vterrors
 
+import vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+
 // State is error state
 type State int
 
@@ -43,6 +45,8 @@ const (
 	MixOfGroupFuncAndFields
 	DupFieldName
 	WrongValueCountOnRow
+	WrongValue
+	WrongArguments
 
 	// failed precondition
 	NoDB
@@ -51,6 +55,7 @@ const (
 	CantDoThisInTransaction
 	RequiresPrimaryKey
 	OperandColumns
+	UnknownStmtHandler
 
 	// not found
 	BadDb
@@ -76,10 +81,49 @@ const (
 
 	// permission denied
 	AccessDeniedError
+	KillDeniedError
 
 	// server not available
 	ServerNotAvailable
 
+	// unknown timezone
+	UnknownTimeZone
+
+	// regexp errors
+	RegexpStringNotTerminated
+	RegexpBufferOverflow
+	RegexpIllegalArgument
+	RegexpIndexOutOfBounds
+	RegexpInternal
+	RegexpRuleSyntax
+	RegexpBadEscapeSequence
+	RegexpUnimplemented
+	RegexpMismatchParen
+	RegexpBadInterval
+	RegexpMaxLtMin
+	RegexpInvalidBackRef
+	RegexpLookBehindLimit
+	RegexpMissingCloseBracket
+	RegexpInvalidRange
+	RegexpStackOverflow
+	RegexpTimeOut
+	RegexpPatternTooBig
+	RegexpInvalidCaptureGroup
+	RegexpInvalidFlag
+
+	CharacterSetMismatch
+	WrongParametersToNativeFct
+
 	// No state should be added below NumOfStates
 	NumOfStates
 )
+
+// ErrorWithState is used to return the error State is such can be found
+type ErrorWithState interface {
+	ErrorState() State
+}
+
+// ErrorWithCode returns the grpc code
+type ErrorWithCode interface {
+	ErrorCode() vtrpcpb.Code
+}

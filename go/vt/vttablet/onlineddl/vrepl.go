@@ -25,6 +25,7 @@ package onlineddl
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -46,12 +47,14 @@ import (
 
 // VReplStream represents a row in _vt.vreplication table
 type VReplStream struct {
-	id                   int64
+	id                   int32
 	workflow             string
 	source               string
 	pos                  string
 	timeUpdated          int64
 	timeHeartbeat        int64
+	timeThrottled        int64
+	componentThrottled   string
 	transactionTimestamp int64
 	state                string
 	message              string
@@ -60,17 +63,16 @@ type VReplStream struct {
 }
 
 // livenessTimeIndicator returns a time indicator for last known healthy state.
-// vreplication uses two indicators: time_updates and time_heartbeat. Either one making progress is good news. The greater of the two indicates the
-// latest progress. Note that both indicate timestamp of events in the binary log stream, rather than time "now".
-// A vreplication stream health is determined by "is there any progress in either of the two counters in the past X minutes"
+// vreplication uses three indicators:
+// - transaction_timestamp
+// - time_heartbeat
+// - time_throttled.
+// Updating any of them, also updates time_updated, indicating liveness.
 func (v *VReplStream) livenessTimeIndicator() int64 {
-	if v.timeHeartbeat > v.timeUpdated {
-		return v.timeHeartbeat
-	}
 	return v.timeUpdated
 }
 
-// isFailed() returns true when the workflow is actively running
+// isRunning() returns true when the workflow is actively running
 func (v *VReplStream) isRunning() bool {
 	switch v.state {
 	case binlogplayer.VReplicationInit, binlogplayer.VReplicationCopying, binlogplayer.BlpRunning:
@@ -79,15 +81,15 @@ func (v *VReplStream) isRunning() bool {
 	return false
 }
 
-// isFailed() returns true when the workflow has failed and will not retry
-func (v *VReplStream) isFailed() bool {
+// hasError() returns true when the workflow has failed and will not retry
+func (v *VReplStream) hasError() (isTerminal bool, vreplError error) {
 	switch {
 	case v.state == binlogplayer.BlpError:
-		return true
+		return true, errors.New(v.message)
 	case strings.Contains(strings.ToLower(v.message), "error"):
-		return true
+		return false, errors.New(v.message)
 	}
-	return false
+	return false, nil
 }
 
 // VRepl is an online DDL helper for VReplication based migrations (ddl_strategy="online")
@@ -119,6 +121,7 @@ type VRepl struct {
 	revertibleNotes string
 	filterQuery     string
 	enumToTextMap   map[string]string
+	intToEnumMap    map[string]bool
 	bls             *binlogdatapb.BinlogSource
 
 	parser *vrepl.AlterTableParser
@@ -138,6 +141,7 @@ func NewVRepl(workflow, keyspace, shard, dbName, sourceTable, targetTable, alter
 		alterQuery:     alterQuery,
 		parser:         vrepl.NewAlterTableParser(),
 		enumToTextMap:  map[string]string{},
+		intToEnumMap:   map[string]bool{},
 		convertCharset: map[string](*binlogdatapb.CharsetConversion){},
 	}
 }
@@ -213,6 +217,7 @@ func (v *VRepl) readTableUniqueKeys(ctx context.Context, conn *dbconnpool.DBConn
 			Name:            row.AsString("index_name", ""),
 			Columns:         *vrepl.ParseColumnList(row.AsString("column_names", "")),
 			HasNullable:     row.AsBool("has_nullable", false),
+			HasSubpart:      row.AsBool("has_subpart", false),
 			HasFloat:        row.AsBool("is_float", false),
 			IsAutoIncrement: row.AsBool("is_auto_increment", false),
 		}
@@ -417,6 +422,9 @@ func (v *VRepl) analyzeTables(ctx context.Context, conn *dbconnpool.DBConnection
 			v.targetSharedColumns.SetEnumToTextConversion(mappedColumn.Name, sourceColumn.EnumValues)
 			v.enumToTextMap[sourceColumn.Name] = sourceColumn.EnumValues
 		}
+		if sourceColumn.IsIntegralType() && mappedColumn.Type == vrepl.EnumColumnType {
+			v.intToEnumMap[sourceColumn.Name] = true
+		}
 	}
 
 	v.droppedNoDefaultColumnNames = vrepl.GetNoDefaultColumnNames(v.droppedSourceNonGeneratedColumns)
@@ -466,6 +474,8 @@ func (v *VRepl) generateFilterQuery(ctx context.Context) error {
 		}
 		switch {
 		case sourceCol.EnumToTextConversion:
+			sb.WriteString(fmt.Sprintf("CONCAT(%s)", escapeName(name)))
+		case v.intToEnumMap[name]:
 			sb.WriteString(fmt.Sprintf("CONCAT(%s)", escapeName(name)))
 		case sourceCol.Type == vrepl.JSONColumnType:
 			sb.WriteString(fmt.Sprintf("convert(%s using utf8mb4)", escapeName(name)))
@@ -532,6 +542,9 @@ func (v *VRepl) analyzeBinlogSource(ctx context.Context) {
 	if len(v.enumToTextMap) > 0 {
 		rule.ConvertEnumToText = v.enumToTextMap
 	}
+	if len(v.intToEnumMap) > 0 {
+		rule.ConvertIntToEnum = v.intToEnumMap
+	}
 
 	bls.Filter.Rules = append(bls.Filter.Rules, rule)
 	v.bls = bls
@@ -554,7 +567,8 @@ func (v *VRepl) analyze(ctx context.Context, conn *dbconnpool.DBConnection) erro
 // generateInsertStatement generates the INSERT INTO _vt.replication stataement that creates the vreplication workflow
 func (v *VRepl) generateInsertStatement(ctx context.Context) (string, error) {
 	ig := vreplication.NewInsertGenerator(binlogplayer.BlpStopped, v.dbName)
-	ig.AddRow(v.workflow, v.bls, v.pos, "", "in_order:REPLICA,PRIMARY")
+	ig.AddRow(v.workflow, v.bls, v.pos, "", "in_order:REPLICA,PRIMARY",
+		binlogdatapb.VReplicationWorkflowType_OnlineDDL, binlogdatapb.VReplicationWorkflowSubType_None, false)
 
 	return ig.String(), nil
 }
