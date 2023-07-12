@@ -28,9 +28,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"k8s.io/apimachinery/pkg/util/sets"
-
 	"vitess.io/vitess/go/netutil"
+	"vitess.io/vitess/go/sets"
 	"vitess.io/vitess/go/vt/vterrors"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -108,8 +107,8 @@ func ParseTabletAlias(aliasStr string) (*topodatapb.TabletAlias, error) {
 }
 
 // ParseTabletSet returns a set of tablets based on a provided comma separated list of tablets.
-func ParseTabletSet(tabletListStr string) sets.String {
-	set := sets.NewString()
+func ParseTabletSet(tabletListStr string) sets.Set[string] {
+	set := sets.New[string]()
 	if tabletListStr == "" {
 		return set
 	}
@@ -223,6 +222,25 @@ func MakeStringTypeList(types []topodatapb.TabletType) []string {
 	strs := make([]string, len(types))
 	for i, t := range types {
 		strs[i] = strings.ToLower(t.String())
+	}
+	sort.Strings(strs)
+	return strs
+}
+
+// MakeUniqueStringTypeList returns a unique list of strings that match
+// the input list -- with duplicate types removed.
+// This is needed as some types are aliases for others, like BATCH and
+// RDONLY, so e.g. rdonly shows up twice in the list when using
+// AllTabletTypes.
+func MakeUniqueStringTypeList(types []topodatapb.TabletType) []string {
+	strs := make([]string, 0, len(types))
+	seen := make(map[string]struct{})
+	for _, t := range types {
+		if _, exists := seen[t.String()]; exists {
+			continue
+		}
+		strs = append(strs, strings.ToLower(t.String()))
+		seen[t.String()] = struct{}{}
 	}
 	sort.Strings(strs)
 	return strs

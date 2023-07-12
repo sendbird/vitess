@@ -17,6 +17,7 @@ limitations under the License.
 package engine
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -49,18 +50,18 @@ type Join struct {
 }
 
 // TryExecute performs a non-streaming exec.
-func (jn *Join) TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
+func (jn *Join) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
 	joinVars := make(map[string]*querypb.BindVariable)
-	lresult, err := vcursor.ExecutePrimitive(jn.Left, bindVars, wantfields)
+	lresult, err := vcursor.ExecutePrimitive(ctx, jn.Left, bindVars, wantfields)
 	if err != nil {
 		return nil, err
 	}
 	result := &sqltypes.Result{}
 	if len(lresult.Rows) == 0 && wantfields {
-		for k := range jn.Vars {
-			joinVars[k] = sqltypes.NullBindVariable
+		for k, col := range jn.Vars {
+			joinVars[k] = bindvarForType(lresult.Fields[col].Type)
 		}
-		rresult, err := jn.Right.GetFields(vcursor, combineVars(bindVars, joinVars))
+		rresult, err := jn.Right.GetFields(ctx, vcursor, combineVars(bindVars, joinVars))
 		if err != nil {
 			return nil, err
 		}
@@ -71,7 +72,7 @@ func (jn *Join) TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVar
 		for k, col := range jn.Vars {
 			joinVars[k] = sqltypes.ValueBindVariable(lrow[col])
 		}
-		rresult, err := vcursor.ExecutePrimitive(jn.Right, combineVars(bindVars, joinVars), wantfields)
+		rresult, err := vcursor.ExecutePrimitive(ctx, jn.Right, combineVars(bindVars, joinVars), wantfields)
 		if err != nil {
 			return nil, err
 		}
@@ -92,16 +93,35 @@ func (jn *Join) TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVar
 	return result, nil
 }
 
+func bindvarForType(t querypb.Type) *querypb.BindVariable {
+	bv := &querypb.BindVariable{
+		Type:  t,
+		Value: nil,
+	}
+	switch t {
+	case querypb.Type_INT8, querypb.Type_UINT8, querypb.Type_INT16, querypb.Type_UINT16,
+		querypb.Type_INT32, querypb.Type_UINT32, querypb.Type_INT64, querypb.Type_UINT64:
+		bv.Value = []byte("0")
+	case querypb.Type_FLOAT32, querypb.Type_FLOAT64:
+		bv.Value = []byte("0e0")
+	case querypb.Type_DECIMAL:
+		bv.Value = []byte("0.0")
+	default:
+		return sqltypes.NullBindVariable
+	}
+	return bv
+}
+
 // TryStreamExecute performs a streaming exec.
-func (jn *Join) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+func (jn *Join) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
 	joinVars := make(map[string]*querypb.BindVariable)
-	err := vcursor.StreamExecutePrimitive(jn.Left, bindVars, wantfields, func(lresult *sqltypes.Result) error {
+	err := vcursor.StreamExecutePrimitive(ctx, jn.Left, bindVars, wantfields, func(lresult *sqltypes.Result) error {
 		for _, lrow := range lresult.Rows {
 			for k, col := range jn.Vars {
 				joinVars[k] = sqltypes.ValueBindVariable(lrow[col])
 			}
 			rowSent := false
-			err := vcursor.StreamExecutePrimitive(jn.Right, combineVars(bindVars, joinVars), wantfields, func(rresult *sqltypes.Result) error {
+			err := vcursor.StreamExecutePrimitive(ctx, jn.Right, combineVars(bindVars, joinVars), wantfields, func(rresult *sqltypes.Result) error {
 				result := &sqltypes.Result{}
 				if wantfields {
 					// This code is currently unreachable because the first result
@@ -137,7 +157,7 @@ func (jn *Join) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.B
 				joinVars[k] = sqltypes.NullBindVariable
 			}
 			result := &sqltypes.Result{}
-			rresult, err := jn.Right.GetFields(vcursor, combineVars(bindVars, joinVars))
+			rresult, err := jn.Right.GetFields(ctx, vcursor, combineVars(bindVars, joinVars))
 			if err != nil {
 				return err
 			}
@@ -150,9 +170,9 @@ func (jn *Join) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.B
 }
 
 // GetFields fetches the field info.
-func (jn *Join) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+func (jn *Join) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
 	joinVars := make(map[string]*querypb.BindVariable)
-	lresult, err := jn.Left.GetFields(vcursor, bindVars)
+	lresult, err := jn.Left.GetFields(ctx, vcursor, bindVars)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +180,7 @@ func (jn *Join) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVari
 	for k := range jn.Vars {
 		joinVars[k] = sqltypes.NullBindVariable
 	}
-	rresult, err := jn.Right.GetFields(vcursor, combineVars(bindVars, joinVars))
+	rresult, err := jn.Right.GetFields(ctx, vcursor, combineVars(bindVars, joinVars))
 	if err != nil {
 		return nil, err
 	}

@@ -34,6 +34,7 @@ import (
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/test/endtoend/onlineddl"
+	"vitess.io/vitess/go/test/endtoend/throttler"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -78,16 +79,14 @@ func TestMain(m *testing.M) {
 		clusterInstance.VtctldExtraArgs = []string{
 			"--schema_change_dir", schemaChangeDirectory,
 			"--schema_change_controller", "local",
-			"--schema_change_check_interval", "1",
+			"--schema_change_check_interval", "1s",
 		}
 
 		clusterInstance.VtTabletExtraArgs = []string{
-			"--enable-lag-throttler",
-			"--throttle_threshold", "1s",
-			"--heartbeat_enable",
 			"--heartbeat_interval", "250ms",
 			"--heartbeat_on_demand_duration", "5s",
 			"--migration_check_interval", "5s",
+			"--watch_replication_stream",
 		}
 
 		if err := clusterInstance.StartTopo(); err != nil {
@@ -132,6 +131,8 @@ func TestSchemaChange(t *testing.T) {
 
 	shards := clusterInstance.Keyspaces[0].Shards
 	require.Equal(t, 1, len(shards))
+
+	throttler.EnableLagThrottlerAndWaitForStatus(t, clusterInstance, time.Second)
 
 	files, err := os.ReadDir(testDataPath)
 	require.NoError(t, err)
@@ -249,7 +250,7 @@ func testSingle(t *testing.T, testName string) {
 
 	if expectedErrorMessage, exists := readTestFile(t, testName, "expect_failure"); exists {
 		// Failure is expected!
-		assert.Equal(t, string(schema.OnlineDDLStatusFailed), migrationStatus)
+		assert.Contains(t, []string{string(schema.OnlineDDLStatusFailed), string(schema.OnlineDDLStatusCancelled)}, migrationStatus)
 		require.Contains(t, migrationMessage, expectedErrorMessage, "expected error message (%s) to contain (%s)", migrationMessage, expectedErrorMessage)
 		// no need to proceed to checksum or anything further
 		return
@@ -259,7 +260,7 @@ func testSingle(t *testing.T, testName string) {
 
 	if content, exists := readTestFile(t, testName, "expect_table_structure"); exists {
 		createStatement := getCreateTableStatement(t, afterTableName)
-		assert.Contains(t, createStatement, content, "expected SHOW CREATE TABLE to contain text in 'expect_table_structure' file")
+		assert.Regexpf(t, content, createStatement, "expected SHOW CREATE TABLE to match text in 'expect_table_structure' file")
 	}
 
 	{
@@ -318,7 +319,7 @@ func waitForMigration(t *testing.T, uuid string, timeout time.Duration) sqltypes
 		row := readMigration(t, uuid)
 		status = row["migration_status"].ToString()
 		switch status {
-		case string(schema.OnlineDDLStatusComplete), string(schema.OnlineDDLStatusFailed):
+		case string(schema.OnlineDDLStatusComplete), string(schema.OnlineDDLStatusFailed), string(schema.OnlineDDLStatusCancelled):
 			// migration is complete, either successful or not
 			return row
 		}

@@ -57,7 +57,6 @@ var (
 		"--enable_replication_reporter",
 		"--serving_state_grace_period", "1s",
 		"--binlog_player_protocol", "grpc",
-		"--enable-autocommit",
 	}
 	vSchema = `
 		{
@@ -90,7 +89,9 @@ var (
 	shard2 cluster.Shard
 )
 
-/* This end-to-end test validates the cache fix in topo/server.go inside ConnForCell.
+/*
+	This end-to-end test validates the cache fix in topo/server.go inside ConnForCell.
+
 The issue was, if we delete and add back a cell with same name but at different path, the map of cells
 in server.go returned the connection object of the previous cell instead of newly-created one
 with the same name.
@@ -123,6 +124,12 @@ func TestMain(m *testing.M) {
 			return 1, err
 		}
 
+		vtctldClientProcess := cluster.VtctldClientProcessInstance("localhost", clusterInstance.VtctldProcess.GrpcPort, clusterInstance.TmpDirectory)
+		_, err = vtctldClientProcess.ExecuteCommandWithOutput("CreateKeyspace", keyspaceName, "--durability-policy=semi_sync")
+		if err != nil {
+			return 1, err
+		}
+
 		shard1Primary = clusterInstance.NewVttabletInstance("primary", 0, cell1)
 		shard1Replica = clusterInstance.NewVttabletInstance("replica", 0, cell2)
 		shard1Rdonly = clusterInstance.NewVttabletInstance("rdonly", 0, cell2)
@@ -133,7 +140,11 @@ func TestMain(m *testing.M) {
 
 		var mysqlProcs []*exec.Cmd
 		for _, tablet := range []*cluster.Vttablet{shard1Primary, shard1Replica, shard1Rdonly, shard2Primary, shard2Replica, shard2Rdonly} {
-			tablet.MysqlctlProcess = *cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, clusterInstance.TmpDirectory)
+			mysqlctlProcess, err := cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, clusterInstance.TmpDirectory)
+			if err != nil {
+				return 1, err
+			}
+			tablet.MysqlctlProcess = *mysqlctlProcess
 			tablet.VttabletProcess = cluster.VttabletProcessInstance(tablet.HTTPPort,
 				tablet.GrpcPort,
 				tablet.TabletUID,
@@ -146,7 +157,6 @@ func TestMain(m *testing.M) {
 				hostname,
 				clusterInstance.TmpDirectory,
 				commonTabletArg,
-				true,
 				clusterInstance.DefaultCharset,
 			)
 			tablet.VttabletProcess.SupportsBackup = true
@@ -160,10 +170,6 @@ func TestMain(m *testing.M) {
 			if err := proc.Wait(); err != nil {
 				return 1, err
 			}
-		}
-
-		if err := clusterInstance.VtctlProcess.CreateKeyspace(keyspaceName); err != nil {
-			return 1, err
 		}
 
 		shard1 = cluster.Shard{
@@ -211,6 +217,10 @@ func TestMain(m *testing.M) {
 			return 1, err
 		}
 
+		if err := clusterInstance.StartVTOrc(keyspaceName); err != nil {
+			return 1, err
+		}
+
 		if err := clusterInstance.VtctlclientProcess.ApplySchema(keyspaceName, fmt.Sprintf(sqlSchema, tableName)); err != nil {
 			return 1, err
 		}
@@ -239,9 +249,10 @@ func testURL(t *testing.T, url string, testCaseName string) {
 
 // getStatusForUrl returns the status code for the URL
 func getStatusForURL(url string) int {
-	resp, _ := http.Get(url)
-	if resp != nil {
-		return resp.StatusCode
+	resp, err := http.Get(url)
+	if err != nil {
+		return 0
 	}
-	return 0
+	defer resp.Body.Close()
+	return resp.StatusCode
 }

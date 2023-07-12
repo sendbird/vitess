@@ -18,6 +18,7 @@ package tabletmanager
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -25,13 +26,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/mysql/fakesqldb"
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/logutil"
-	"vitess.io/vitess/go/vt/mysqlctl/fakemysqldaemon"
+	"vitess.io/vitess/go/vt/mysqlctl"
 	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
@@ -49,14 +50,13 @@ func TestStartBuildTabletFromInput(t *testing.T) {
 	}
 	port := int32(12)
 	grpcport := int32(34)
-	dbServerVersion := "5.7.0"
 
 	// Hostname should be used as is.
-	*tabletHostname = "foo"
-	*initKeyspace = "test_keyspace"
-	*initShard = "0"
-	*initTabletType = "replica"
-	*initDbNameOverride = "aa"
+	tabletHostname = "foo"
+	initKeyspace = "test_keyspace"
+	initShard = "0"
+	initTabletType = "replica"
+	initDbNameOverride = "aa"
 	wantTablet := &topodatapb.Tablet{
 		Alias:    alias,
 		Hostname: "foo",
@@ -70,29 +70,28 @@ func TestStartBuildTabletFromInput(t *testing.T) {
 		Type:                 topodatapb.TabletType_REPLICA,
 		Tags:                 map[string]string{},
 		DbNameOverride:       "aa",
-		DbServerVersion:      dbServerVersion,
-		DefaultConnCollation: 255,
+		DefaultConnCollation: uint32(collations.Default()),
 	}
 
-	gotTablet, err := BuildTabletFromInput(alias, port, grpcport, dbServerVersion, nil)
+	gotTablet, err := BuildTabletFromInput(alias, port, grpcport, nil)
 	require.NoError(t, err)
 
 	// Hostname should be resolved.
 	assert.Equal(t, wantTablet, gotTablet)
-	*tabletHostname = ""
-	gotTablet, err = BuildTabletFromInput(alias, port, grpcport, dbServerVersion, nil)
+	tabletHostname = ""
+	gotTablet, err = BuildTabletFromInput(alias, port, grpcport, nil)
 	require.NoError(t, err)
 	assert.NotEqual(t, "", gotTablet.Hostname)
 
 	// Canonicalize shard name and compute keyrange.
-	*tabletHostname = "foo"
-	*initShard = "-C0"
+	tabletHostname = "foo"
+	initShard = "-C0"
 	wantTablet.Shard = "-c0"
 	wantTablet.KeyRange = &topodatapb.KeyRange{
 		Start: []byte(""),
 		End:   []byte("\xc0"),
 	}
-	gotTablet, err = BuildTabletFromInput(alias, port, grpcport, dbServerVersion, nil)
+	gotTablet, err = BuildTabletFromInput(alias, port, grpcport, nil)
 	require.NoError(t, err)
 	// KeyRange check is explicit because the next comparison doesn't
 	// show the diff well enough.
@@ -100,27 +99,27 @@ func TestStartBuildTabletFromInput(t *testing.T) {
 	assert.Equal(t, wantTablet, gotTablet)
 
 	// Invalid inputs.
-	*initKeyspace = ""
-	*initShard = "0"
-	_, err = BuildTabletFromInput(alias, port, grpcport, dbServerVersion, nil)
+	initKeyspace = ""
+	initShard = "0"
+	_, err = BuildTabletFromInput(alias, port, grpcport, nil)
 	assert.Contains(t, err.Error(), "init_keyspace and init_shard must be specified")
 
-	*initKeyspace = "test_keyspace"
-	*initShard = ""
-	_, err = BuildTabletFromInput(alias, port, grpcport, dbServerVersion, nil)
+	initKeyspace = "test_keyspace"
+	initShard = ""
+	_, err = BuildTabletFromInput(alias, port, grpcport, nil)
 	assert.Contains(t, err.Error(), "init_keyspace and init_shard must be specified")
 
-	*initShard = "x-y"
-	_, err = BuildTabletFromInput(alias, port, grpcport, dbServerVersion, nil)
+	initShard = "x-y"
+	_, err = BuildTabletFromInput(alias, port, grpcport, nil)
 	assert.Contains(t, err.Error(), "cannot validate shard name")
 
-	*initShard = "0"
-	*initTabletType = "bad"
-	_, err = BuildTabletFromInput(alias, port, grpcport, dbServerVersion, nil)
+	initShard = "0"
+	initTabletType = "bad"
+	_, err = BuildTabletFromInput(alias, port, grpcport, nil)
 	assert.Contains(t, err.Error(), "unknown TabletType bad")
 
-	*initTabletType = "primary"
-	_, err = BuildTabletFromInput(alias, port, grpcport, dbServerVersion, nil)
+	initTabletType = "primary"
+	_, err = BuildTabletFromInput(alias, port, grpcport, nil)
 	assert.Contains(t, err.Error(), "invalid init_tablet_type PRIMARY")
 }
 
@@ -131,16 +130,15 @@ func TestBuildTabletFromInputWithBuildTags(t *testing.T) {
 	}
 	port := int32(12)
 	grpcport := int32(34)
-	dbServerVersion := "5.7.0"
 
 	// Hostname should be used as is.
-	*tabletHostname = "foo"
-	*initKeyspace = "test_keyspace"
-	*initShard = "0"
-	*initTabletType = "replica"
-	*initDbNameOverride = "aa"
-	*skipBuildInfoTags = ""
-	defer func() { *skipBuildInfoTags = "/.*/" }()
+	tabletHostname = "foo"
+	initKeyspace = "test_keyspace"
+	initShard = "0"
+	initTabletType = "replica"
+	initDbNameOverride = "aa"
+	skipBuildInfoTags = ""
+	defer func() { skipBuildInfoTags = "/.*/" }()
 	wantTablet := &topodatapb.Tablet{
 		Alias:    alias,
 		Hostname: "foo",
@@ -154,11 +152,10 @@ func TestBuildTabletFromInputWithBuildTags(t *testing.T) {
 		Type:                 topodatapb.TabletType_REPLICA,
 		Tags:                 servenv.AppVersion.ToStringMap(),
 		DbNameOverride:       "aa",
-		DbServerVersion:      "5.7.0",
-		DefaultConnCollation: 255,
+		DefaultConnCollation: uint32(collations.Default()),
 	}
 
-	gotTablet, err := BuildTabletFromInput(alias, port, grpcport, dbServerVersion, nil)
+	gotTablet, err := BuildTabletFromInput(alias, port, grpcport, nil)
 	require.NoError(t, err)
 	assert.Equal(t, wantTablet, gotTablet)
 }
@@ -336,6 +333,17 @@ func TestCheckPrimaryShip(t *testing.T) {
 		Cell: "cell1",
 		Uid:  2,
 	}
+	otherTablet := &topodatapb.Tablet{
+		Alias:         otherAlias,
+		Keyspace:      "ks",
+		Shard:         "0",
+		Type:          topodatapb.TabletType_PRIMARY,
+		MysqlHostname: "localhost",
+		MysqlPort:     1234,
+	}
+	// Create the tablet record for the primary
+	err = ts.CreateTablet(ctx, otherTablet)
+	require.NoError(t, err)
 	_, err = ts.UpdateShardFields(ctx, "ks", "0", func(si *topo.ShardInfo) error {
 		si.PrimaryAlias = otherAlias
 		si.PrimaryTermStartTime = logutil.TimeToProto(ter1.Add(-10 * time.Second))
@@ -361,6 +369,14 @@ func TestCheckPrimaryShip(t *testing.T) {
 	require.NoError(t, err)
 	tablet.Type = topodatapb.TabletType_REPLICA
 	tablet.PrimaryTermStartTime = nil
+	// Get the fakeMySQL and set it up to expect a set replication source command
+	fakeMysql := tm.MysqlDaemon.(*mysqlctl.FakeMysqlDaemon)
+	fakeMysql.SetReplicationSourceInputs = append(fakeMysql.SetReplicationSourceInputs, fmt.Sprintf("%v:%v", otherTablet.MysqlHostname, otherTablet.MysqlPort))
+	fakeMysql.ExpectedExecuteSuperQueryList = []string{
+		"STOP SLAVE",
+		"FAKE SET MASTER",
+		"START SLAVE",
+	}
 	err = tm.Start(tablet, 0)
 	require.NoError(t, err)
 	ti, err = ts.GetTablet(ctx, alias)
@@ -397,9 +413,10 @@ func TestStartCheckMysql(t *testing.T) {
 	assert.Equal(t, "foo", ti.MysqlHostname)
 }
 
+// TestStartFindMysqlPort tests the functionality of findMySQLPort on tablet startup
 func TestStartFindMysqlPort(t *testing.T) {
 	defer func(saved time.Duration) { mysqlPortRetryInterval = saved }(mysqlPortRetryInterval)
-	mysqlPortRetryInterval = 1 * time.Millisecond
+	mysqlPortRetryInterval = 50 * time.Millisecond
 
 	ctx := context.Background()
 	cell := "cell1"
@@ -421,16 +438,24 @@ func TestStartFindMysqlPort(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int32(0), ti.MysqlPort)
 
-	fmd.MysqlPort.Set(3306)
+	go func() {
+		// We want to simulate the mysql daemon returning 0 for the port
+		// for some time before returning the correct value.
+		// We expect the vttablet to ignore the 0 value and eventually find the 3306 value.
+		time.Sleep(200 * time.Millisecond)
+		fmd.MysqlPort.Store(0)
+		time.Sleep(200 * time.Millisecond)
+		fmd.MysqlPort.Store(3306)
+	}()
 	for i := 0; i < 10; i++ {
 		ti, err := ts.GetTablet(ctx, tm.tabletAlias)
 		require.NoError(t, err)
 		if ti.MysqlPort == 3306 {
 			return
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
-	assert.Fail(t, "mysql port was not updated")
+	assert.Fail(t, "mysql port was not updated.", "Final value - %v", ti.MysqlPort)
 }
 
 // Init tablet fixes replication data when safe
@@ -613,7 +638,7 @@ func TestGetBuildTags(t *testing.T) {
 	}
 }
 
-func newTestMysqlDaemon(t *testing.T, port int32) *fakemysqldaemon.FakeMysqlDaemon {
+func newTestMysqlDaemon(t *testing.T, port int32) *mysqlctl.FakeMysqlDaemon {
 	t.Helper()
 
 	db := fakesqldb.New(t)
@@ -621,21 +646,8 @@ func newTestMysqlDaemon(t *testing.T, port int32) *fakemysqldaemon.FakeMysqlDaem
 	db.AddQueryPattern("BEGIN", &sqltypes.Result{})
 	db.AddQueryPattern("COMMIT", &sqltypes.Result{})
 
-	db.AddQueryPattern("CREATE DATABASE IF NOT EXISTS _vt", &sqltypes.Result{})
-	db.AddQueryPattern("CREATE TABLE IF NOT EXISTS _vt\\.(local|shard)_metadata.*", &sqltypes.Result{})
-
-	db.AddQueryPattern("ALTER TABLE _vt\\.local_metadata ADD COLUMN (db_name).*", &sqltypes.Result{})
-	db.AddQueryPattern("ALTER TABLE _vt\\.local_metadata DROP PRIMARY KEY, ADD PRIMARY KEY\\(name, db_name\\)", &sqltypes.Result{})
-	db.AddQueryPattern("ALTER TABLE _vt\\.local_metadata CHANGE value.*", &sqltypes.Result{})
-
-	db.AddQueryPattern("ALTER TABLE _vt\\.shard_metadata ADD COLUMN (db_name).*", &sqltypes.Result{})
-	db.AddQueryPattern("ALTER TABLE _vt\\.shard_metadata DROP PRIMARY KEY, ADD PRIMARY KEY\\(name, db_name\\)", &sqltypes.Result{})
-
-	db.AddQueryPattern("UPDATE _vt\\.(local|shard)_metadata SET db_name='.+' WHERE db_name=''", &sqltypes.Result{})
-	db.AddQueryPattern("INSERT INTO _vt\\.local_metadata \\(.+\\) VALUES \\(.+\\) ON DUPLICATE KEY UPDATE value ?= ?'.+'.*", &sqltypes.Result{})
-
-	mysqld := fakemysqldaemon.NewFakeMysqlDaemon(db)
-	mysqld.MysqlPort = sync2.NewAtomicInt32(port)
+	mysqld := mysqlctl.NewFakeMysqlDaemon(db)
+	mysqld.MysqlPort.Store(port)
 
 	return mysqld
 }

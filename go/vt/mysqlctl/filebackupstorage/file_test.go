@@ -20,6 +20,8 @@ import (
 	"context"
 	"io"
 	"testing"
+
+	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
 )
 
 // This file tests the file BackupStorage engine.
@@ -31,9 +33,9 @@ import (
 
 // setupFileBackupStorage creates a temporary directory, and
 // returns a FileBackupStorage based on it
-func setupFileBackupStorage(t *testing.T) *FileBackupStorage {
-	*FileBackupStorageRoot = t.TempDir()
-	return &FileBackupStorage{}
+func setupFileBackupStorage(t *testing.T) backupstorage.BackupStorage {
+	FileBackupStorageRoot = t.TempDir()
+	return newFileBackupStorage(backupstorage.NoParams())
 }
 
 func TestListBackups(t *testing.T) {

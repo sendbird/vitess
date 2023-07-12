@@ -1,3 +1,5 @@
+//go:build !race
+
 /*
 Copyright 2021 The Vitess Authors.
 
@@ -17,8 +19,9 @@ limitations under the License.
 package integration
 
 import (
+	"context"
 	"encoding/json"
-	"flag"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -27,10 +30,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/pflag"
+
 	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/sqltypes"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
+	"vitess.io/vitess/go/vt/vtgate/evalengine/testcases"
 	"vitess.io/vitess/go/vt/vtgate/simplifier"
 )
 
@@ -78,16 +85,31 @@ func (g *gencase) expr() string {
 	return fmt.Sprintf("%s %s %s", g.arg(false), op, rhs)
 }
 
-var fuzzMaxTime = flag.Duration("fuzz-duration", 30*time.Second, "maximum time to fuzz for")
-var fuzzMaxFailures = flag.Int("fuzz-total", 0, "maximum number of failures to fuzz for")
-var fuzzSeed = flag.Int64("fuzz-seed", time.Now().Unix(), "RNG seed when generating fuzz expressions")
-var extractError = regexp.MustCompile(`(.*?) \(errno (\d+)\) \(sqlstate (\w+)\) during query: (.*?)`)
+var (
+	fuzzMaxTime     = 30 * time.Second
+	fuzzMaxFailures = 0
+	fuzzSeed        = time.Now().Unix()
+	extractError    = regexp.MustCompile(`(.*?) \(errno (\d+)\) \(sqlstate (\w+)\) during query: (.*?)`)
+	knownErrors     = []*regexp.Regexp{
+		regexp.MustCompile(`value is out of range in '(.*?)'`),
+		regexp.MustCompile(`Operand should contain (\d+) column\(s\)`),
+		regexp.MustCompile(`You have an error in your SQL syntax; (.*?)`),
+		regexp.MustCompile(`Cannot convert string '(.*?)' from \w+ to \w+`),
+		regexp.MustCompile(`Invalid JSON text in argument (\d+) to function (\w+): (.*?)`),
+		regexp.MustCompile(`Illegal mix of collations`),
+		regexp.MustCompile(`Incorrect (DATE|DATETIME) value`),
+		regexp.MustCompile(`Syntax error in regular expression`),
+		regexp.MustCompile(`The regular expression contains an unclosed bracket expression`),
+		regexp.MustCompile(`Illegal argument to a regular expression`),
+		regexp.MustCompile(`Incorrect arguments to regexp_substr`),
+		regexp.MustCompile(`Incorrect arguments to regexp_replace`),
+	}
+)
 
-var knownErrors = []*regexp.Regexp{
-	regexp.MustCompile(`value is out of range in '(.*?)'`),
-	regexp.MustCompile(`Operand should contain (\d+) column\(s\)`),
-	regexp.MustCompile(`You have an error in your SQL syntax; (.*?)`),
-	regexp.MustCompile(`Cannot convert string '(.*?)' from \w+ to \w+`),
+func init() {
+	pflag.DurationVar(&fuzzMaxTime, "fuzz-duration", fuzzMaxTime, "Maximum time to fuzz for")
+	pflag.IntVar(&fuzzMaxFailures, "fuzz-total", fuzzMaxFailures, "Maximum number of failures to fuzz for")
+	pflag.Int64Var(&fuzzSeed, "fuzz-seed", fuzzSeed, "RNG seed when generating fuzz expressions")
 }
 
 func errorsMatch(remote, local error) bool {
@@ -110,7 +132,7 @@ func errorsMatch(remote, local error) bool {
 	return false
 }
 
-func safeEvaluate(query string) (evalengine.EvalResult, sqltypes.Type, error) {
+func evaluateLocalEvalengine(env *evalengine.ExpressionEnv, query string, fields []*querypb.Field) (evalengine.EvalResult, sqltypes.Type, error) {
 	stmt, err := sqlparser.Parse(query)
 	if err != nil {
 		return evalengine.EvalResult{}, 0, err
@@ -123,39 +145,55 @@ func safeEvaluate(query string) (evalengine.EvalResult, sqltypes.Type, error) {
 				err = fmt.Errorf("PANIC during translate: %v", r)
 			}
 		}()
-		expr, err = evalengine.TranslateEx(astExpr, evalengine.LookupDefaultCollation(collations.CollationUtf8mb4ID), *debugSimplify)
+		cfg := &evalengine.Config{
+			ResolveColumn: evalengine.FieldResolver(fields).Column,
+			Collation:     collations.CollationUtf8mb4ID,
+			Optimization:  evalengine.OptimizationLevelNone,
+		}
+		if debugSimplify {
+			cfg.Optimization = evalengine.OptimizationLevelSimplify
+		}
+		expr, err = evalengine.Translate(astExpr, cfg)
 		return
 	}()
 
-	var eval evalengine.EvalResult
-	var tt sqltypes.Type
-	if err == nil {
-		eval, err = func() (eval evalengine.EvalResult, err error) {
-			defer func() {
-				if r := recover(); r != nil {
-					err = fmt.Errorf("PANIC: %v", r)
-				}
-			}()
-			env := evalengine.EnvWithBindVars(nil, 255)
-			eval, err = env.Evaluate(local)
-			if err == nil && *debugCheckTypes {
-				tt, err = env.TypeOf(local)
-			}
-			return
-		}()
+	if err != nil {
+		return evalengine.EvalResult{}, 0, err
 	}
-	return eval, tt, err
+
+	return func() (eval evalengine.EvalResult, tt sqltypes.Type, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("PANIC: %v", r)
+			}
+		}()
+		eval, err = env.Evaluate(local)
+		if err == nil && debugCheckTypes {
+			tt, err = env.TypeOf(local, fields)
+			if errors.Is(err, evalengine.ErrAmbiguousType) {
+				tt = -1
+				err = nil
+			}
+		}
+		return
+	}()
 }
 
 const syntaxErr = `You have an error in your SQL syntax; (errno 1064) (sqlstate 42000) during query: SQL`
 const localSyntaxErr = `You have an error in your SQL syntax;`
 
+type GoldenTest struct {
+	Query string
+	Value string `json:",omitempty"`
+	Error string `json:",omitempty"`
+}
+
 func TestGenerateFuzzCases(t *testing.T) {
-	if *fuzzMaxFailures <= 0 {
+	if fuzzMaxFailures <= 0 {
 		t.Skipf("skipping fuzz test generation")
 	}
 	var gen = gencase{
-		rand:         rand.New(rand.NewSource(*fuzzSeed)),
+		rand:         rand.New(rand.NewSource(fuzzSeed)),
 		ratioTuple:   8,
 		ratioSubexpr: 8,
 		tupleLen:     4,
@@ -173,7 +211,8 @@ func TestGenerateFuzzCases(t *testing.T) {
 	compareWithMySQL := func(expr sqlparser.Expr) *mismatch {
 		query := "SELECT " + sqlparser.String(expr)
 
-		eval, _, localErr := safeEvaluate(query)
+		env := evalengine.NewExpressionEnv(context.Background(), nil, nil)
+		eval, _, localErr := evaluateLocalEvalengine(env, query, nil)
 		remote, remoteErr := conn.ExecuteFetch(query, 1, false)
 
 		if localErr != nil && strings.Contains(localErr.Error(), "syntax error at position") {
@@ -190,10 +229,10 @@ func TestGenerateFuzzCases(t *testing.T) {
 			remoteErr: remoteErr,
 		}
 		if localErr == nil {
-			res.localVal = eval.Value().String()
+			res.localVal = eval.Value()
 		}
 		if remoteErr == nil {
-			res.remoteVal = remote.Rows[0][0].String()
+			res.remoteVal = remote.Rows[0][0]
 		}
 		if res.Error() != "" {
 			return &res
@@ -203,7 +242,7 @@ func TestGenerateFuzzCases(t *testing.T) {
 
 	var failures []*mismatch
 	var start = time.Now()
-	for len(failures) < *fuzzMaxFailures {
+	for len(failures) < fuzzMaxFailures {
 		query := "SELECT " + gen.expr()
 		stmt, err := sqlparser.Parse(query)
 		if err != nil {
@@ -217,7 +256,7 @@ func TestGenerateFuzzCases(t *testing.T) {
 			t.Errorf("mismatch: %v", fail.Error())
 		}
 
-		if time.Since(start) > *fuzzMaxTime {
+		if time.Since(start) > fuzzMaxTime {
 			break
 		}
 	}
@@ -226,12 +265,7 @@ func TestGenerateFuzzCases(t *testing.T) {
 		return
 	}
 
-	type evaltest struct {
-		Query string
-		Value string `json:",omitempty"`
-		Error string `json:",omitempty"`
-	}
-	var golden []evaltest
+	var golden []GoldenTest
 
 	for _, fail := range failures {
 		failErr := fail.Error()
@@ -248,18 +282,22 @@ func TestGenerateFuzzCases(t *testing.T) {
 
 		query := "SELECT " + sqlparser.String(simplified)
 		if fail.remoteErr != nil {
-			golden = append(golden, evaltest{
+			golden = append(golden, GoldenTest{
 				Query: query,
 				Error: fail.remoteErr.Error(),
 			})
 		} else {
-			golden = append(golden, evaltest{
+			golden = append(golden, GoldenTest{
 				Query: query,
-				Value: fail.remoteVal,
+				Value: fail.remoteVal.String(),
 			})
 		}
 	}
 
+	writeGolden(t, golden)
+}
+
+func writeGolden(t *testing.T, golden []GoldenTest) {
 	out, err := os.Create(fmt.Sprintf("testdata/mysql_golden_%d.json", time.Now().Unix()))
 	if err != nil {
 		t.Fatal(err)
@@ -275,52 +313,70 @@ func TestGenerateFuzzCases(t *testing.T) {
 type mismatch struct {
 	expr                sqlparser.Expr
 	localErr, remoteErr error
-	localVal, remoteVal string
+	localVal, remoteVal sqltypes.Value
 }
 
-func compareResult(localErr, remoteErr error, localVal, remoteVal string, localCollation, remoteCollation collations.ID) string {
-	if localErr != nil {
-		if remoteErr == nil {
-			return fmt.Sprintf("%v; mysql response: %s", localErr, remoteVal)
+type Result struct {
+	Error     error
+	Value     sqltypes.Value
+	Collation collations.ID
+}
+
+func compareResult(local, remote Result, cmp *testcases.Comparison) error {
+	if local.Error != nil {
+		if remote.Error == nil {
+			return fmt.Errorf("%w: mysql response: %s", local.Error, remote.Value)
 		}
-		if !errorsMatch(remoteErr, localErr) {
-			return fmt.Sprintf("mismatch in errors: eval=%s; mysql response: %s", localErr.Error(), remoteErr.Error())
+		if !errorsMatch(remote.Error, local.Error) {
+			return fmt.Errorf("mismatch in errors: eval=%w; mysql response: %w", local.Error, remote.Error)
 		}
-		return ""
+		return nil
 	}
 
-	if remoteErr != nil {
+	if remote.Error != nil {
 		for _, ke := range knownErrors {
-			if ke.MatchString(remoteErr.Error()) {
-				return ""
+			if ke.MatchString(remote.Error.Error()) {
+				return nil
 			}
 		}
-		return fmt.Sprintf("%v; mysql failed with: %s", localVal, remoteErr.Error())
+		return fmt.Errorf("%v; mysql failed with: %w", local.Value, remote.Error)
 	}
 
 	var localCollationName string
 	var remoteCollationName string
-	env := collations.Local()
-	if coll := env.LookupByID(localCollation); coll != nil {
+	if coll := local.Collation.Get(); coll != nil {
 		localCollationName = coll.Name()
 	}
-	if coll := env.LookupByID(remoteCollation); coll != nil {
+	if coll := remote.Collation.Get(); coll != nil {
 		remoteCollationName = coll.Name()
 	}
 
-	if localVal != remoteVal {
-		return fmt.Sprintf("different results: %s; mysql response: %s (local collation: %s; mysql collation: %s)",
-			localVal, remoteVal, localCollationName, remoteCollationName)
+	equals, err := cmp.Equals(local.Value, remote.Value)
+	if err != nil {
+		return err
 	}
-	if localCollation != remoteCollation {
-		return fmt.Sprintf("different collations: %s; mysql response: %s (local result: %s; mysql result: %s)",
-			localCollationName, remoteCollationName, localVal, remoteVal,
+	if !equals {
+		return fmt.Errorf("different results: %s; mysql response: %s (local collation: %s; mysql collation: %s)",
+			local.Value.String(), remote.Value.String(), localCollationName, remoteCollationName)
+	}
+	if local.Collation != remote.Collation {
+		return fmt.Errorf("different collations: %s; mysql response: %s (local result: %s; mysql result: %s)",
+			localCollationName, remoteCollationName, local.Value.String(), remote.Value.String(),
 		)
 	}
-
-	return ""
+	return nil
 }
 
 func (cr *mismatch) Error() string {
-	return compareResult(cr.localErr, cr.remoteErr, cr.localVal, cr.remoteVal, collations.Unknown, collations.Unknown)
+	return compareResult(
+		Result{
+			Error: cr.localErr,
+			Value: cr.localVal,
+		},
+		Result{
+			Error: cr.remoteErr,
+			Value: cr.remoteVal,
+		},
+		&testcases.Comparison{},
+	).Error()
 }

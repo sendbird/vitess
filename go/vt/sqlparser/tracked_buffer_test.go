@@ -90,7 +90,7 @@ func TestCanonicalOutput(t *testing.T) {
 		},
 		{
 			"create table a (id int not null primary key, dt datetime default current_timestamp)",
-			"CREATE TABLE `a` (\n\t`id` int NOT NULL PRIMARY KEY,\n\t`dt` datetime DEFAULT CURRENT_TIMESTAMP()\n)",
+			"CREATE TABLE `a` (\n\t`id` int NOT NULL PRIMARY KEY,\n\t`dt` datetime DEFAULT current_timestamp()\n)",
 		},
 		{
 			"create table `insert`(`update` int, primary key(`delete`))",
@@ -105,8 +105,12 @@ func TestCanonicalOutput(t *testing.T) {
 			"CREATE TABLE `a` (\n\t`v` varchar(32)\n) ENGINE InnoDB",
 		},
 		{
-			"create table a (id int not null primary key) engine InnoDB, charset utf8mb4, collate utf8mb4_0900_ai_ci partition by range (`id`) (partition `p10` values less than(10) engine InnoDB)",
-			"CREATE TABLE `a` (\n\t`id` int NOT NULL PRIMARY KEY\n) ENGINE InnoDB,\n  CHARSET utf8mb4,\n  COLLATE utf8mb4_0900_ai_ci\nPARTITION BY RANGE (`id`)\n(PARTITION `p10` VALUES LESS THAN (10) ENGINE InnoDB)",
+			"create table a (id int not null primary key) engine InnoDB, charset utf8mb4, collate utf8mb4_0900_ai_ci partition by range (`id`) (partition `p10` values less than(10) engine InnoDB tablespace foo)",
+			"CREATE TABLE `a` (\n\t`id` int NOT NULL PRIMARY KEY\n) ENGINE InnoDB,\n  CHARSET utf8mb4,\n  COLLATE utf8mb4_0900_ai_ci\nPARTITION BY RANGE (`id`)\n(PARTITION `p10` VALUES LESS THAN (10) ENGINE InnoDB TABLESPACE foo)",
+		},
+		{
+			"create table a (id int not null primary key) engine InnoDB, charset utf8mb4, collate utf8mb4_0900_ai_ci partition by range (`id`) (partition `p10` values less than maxvalue)",
+			"CREATE TABLE `a` (\n\t`id` int NOT NULL PRIMARY KEY\n) ENGINE InnoDB,\n  CHARSET utf8mb4,\n  COLLATE utf8mb4_0900_ai_ci\nPARTITION BY RANGE (`id`)\n(PARTITION `p10` VALUES LESS THAN MAXVALUE)",
 		},
 		{
 			"alter table a comment='a b c'",
@@ -199,6 +203,74 @@ func TestCanonicalOutput(t *testing.T) {
 		{
 			"select not regexp_replace('abc def ghi', '[a-z]+', 'X', 1, 3, 'c'), not regexp_like('dog cat dog', 'dog'), not regexp_substr('abc def ghi', '[a-z]+', 1), not regexp_instr('aa aaa aaaa aaaa aaaa aaaa', 'a{4}',1), 'Michael!' not rlike '.*' from dual",
 			"SELECT NOT REGEXP_REPLACE('abc def ghi', '[a-z]+', 'X', 1, 3, 'c'), NOT REGEXP_LIKE('dog cat dog', 'dog'), NOT REGEXP_SUBSTR('abc def ghi', '[a-z]+', 1), NOT REGEXP_INSTR('aa aaa aaaa aaaa aaaa aaaa', 'a{4}', 1), 'Michael!' NOT REGEXP '.*' FROM `dual`",
+		},
+		{
+			"revert /* vt+ foo */ vitess_migration '9aecb3b4_b8a9_11ec_929a_0a43f95f28a3'",
+			"REVERT /* vt+ foo */ VITESS_MIGRATION '9aecb3b4_b8a9_11ec_929a_0a43f95f28a3'",
+		},
+		{
+			"alter vitess_migration '9aecb3b4_b8a9_11ec_929a_0a43f95f28a3' throttle",
+			"ALTER VITESS_MIGRATION '9aecb3b4_b8a9_11ec_929a_0a43f95f28a3' throttle",
+		},
+		{
+			"select count(a) from t",
+			"SELECT COUNT(`a`) FROM `t`",
+		},
+		{
+			"select var_pop(a) from products",
+			"SELECT VAR_POP(`a`) FROM `products`",
+		},
+		{
+			"select /* function with distinct */ count(distinct a) from t",
+			"SELECT /* function with distinct */ COUNT(DISTINCT `a`) FROM `t`",
+		},
+		{
+			"select char(77, 121, 83, 81, '76' using utf8mb4) from dual",
+			"SELECT CHAR(77, 121, 83, 81, '76' USING utf8mb4) FROM `dual`",
+		},
+		{
+			"create table t1 (id int primary key, name tinytext not null, fulltext key name_ft(name) with parser ngram)",
+			"CREATE TABLE `t1` (\n\t`id` int PRIMARY KEY,\n\t`name` tinytext NOT NULL,\n\tFULLTEXT KEY `name_ft` (`name`) WITH PARSER ngram\n)",
+		},
+		{
+			"select convert('abc' using utf8mb4)",
+			"SELECT CONVERT('abc' USING utf8mb4) FROM `dual`",
+		},
+		{
+			"select point(4, 5)",
+			"SELECT POINT(4, 5) FROM `dual`",
+		},
+		{
+			"create table x(location geometry default (point(7.0, 3.0)))",
+			"CREATE TABLE `x` (\n\t`location` geometry DEFAULT (POINT(7.0, 3.0))\n)",
+		},
+		{
+			"create table x(location geometry default (linestring(point(7.0, 3.0), point(7.0, 3.0))))",
+			"CREATE TABLE `x` (\n\t`location` geometry DEFAULT (LINESTRING(POINT(7.0, 3.0), POINT(7.0, 3.0)))\n)",
+		},
+		{
+			"create table x(a geometry default (polygon(linestring(point(7.0, 3.0), point(7.0, 3.0)))))",
+			"CREATE TABLE `x` (\n\t`a` geometry DEFAULT (POLYGON(LINESTRING(POINT(7.0, 3.0), POINT(7.0, 3.0))))\n)",
+		},
+		{
+			"alter vschema create vindex lookup_vdx using lookup with owner=user, table=name_user_idx, from=name, to=user_id",
+			"ALTER VSCHEMA CREATE VINDEX `lookup_vdx` USING `lookup` WITH owner=user, table=name_user_idx, from=name, to=user_id",
+		},
+		{
+			"create table tb (id varbinary(100) default X'4d7953514c')",
+			"CREATE TABLE `tb` (\n\t`id` varbinary(100) DEFAULT X'4d7953514c'\n)",
+		},
+		{
+			"select grp, group_concat(c order by c asc separator 'foo') from t1 group by grp",
+			"SELECT `grp`, GROUP_CONCAT(`c` ORDER BY `c` ASC SEPARATOR 'foo') FROM `t1` GROUP BY `grp`",
+		},
+		{
+			"create table t (id int, info JSON, INDEX zips((CAST(info->'$.field' AS unsigned array))))",
+			"CREATE TABLE `t` (\n\t`id` int,\n\t`info` JSON,\n\tINDEX `zips` ((CAST(`info` -> '$.field' AS unsigned array)))\n)",
+		},
+		{
+			"select 1 from t1 into outfile 'test/t1.txt'",
+			"SELECT 1 FROM `t1` INTO OUTFILE 'test/t1.txt'",
 		},
 	}
 

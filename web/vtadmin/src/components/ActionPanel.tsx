@@ -35,8 +35,8 @@ export interface ActionPanelProps {
     mutation: UseMutationResult;
     title: string;
     warnings?: React.ReactNodeArray;
+    body?: React.ReactNode;
 }
-
 /**
  * ActionPanel is a panel used for initiating mutations on entity pages.
  * When rendering multiple ActionPanel components, ensure they are in
@@ -53,6 +53,7 @@ const ActionPanel: React.FC<ActionPanelProps> = ({
     loadingText,
     loadedText,
     warnings = [],
+    body,
 }) => {
     const [typedConfirmation, setTypedConfirmation] = useState('');
 
@@ -60,7 +61,6 @@ const ActionPanel: React.FC<ActionPanelProps> = ({
 
     const isDisabled =
         !!disabled || mutation.isLoading || (requiresConfirmation && typedConfirmation !== confirmationValue);
-
     return (
         <div
             className={`p-9 pb-12 last:border-b border ${
@@ -103,7 +103,7 @@ const ActionPanel: React.FC<ActionPanelProps> = ({
                     </div>
                 </>
             )}
-
+            {body}
             <button
                 className={`btn btn-secondary ${danger && 'btn-danger'} mt-4`}
                 disabled={isDisabled}

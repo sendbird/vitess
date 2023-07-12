@@ -17,11 +17,10 @@ limitations under the License.
 package mysqlctl
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
-
-	"context"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
@@ -94,7 +93,6 @@ func (mysqld *Mysqld) FetchSuperQuery(ctx context.Context, query string) (*sqlty
 		return nil, connErr
 	}
 	defer conn.Recycle()
-	log.V(6).Infof("fetch %v", query)
 	qr, err := mysqld.executeFetchContext(ctx, conn, query, 10000, true)
 	if err != nil {
 		return nil, err
@@ -136,7 +134,7 @@ func (mysqld *Mysqld) executeFetchContext(ctx context.Context, conn *dbconnpool.
 		default:
 		}
 
-		// The context expired or was cancelled.
+		// The context expired or was canceled.
 		// Try to kill the connection to effectively cancel the ExecuteFetch().
 		connID := conn.ID()
 		log.Infof("Mysqld.executeFetchContext(): killing connID %v due to timeout of query: %v", connID, query)
@@ -149,7 +147,7 @@ func (mysqld *Mysqld) executeFetchContext(ctx context.Context, conn *dbconnpool.
 		// Close the connection. Upon Recycle() it will be thrown out.
 		conn.Close()
 		// ExecuteFetch() may have succeeded before we tried to kill it.
-		// If ExecuteFetch() had returned because we cancelled it,
+		// If ExecuteFetch() had returned because we canceled it,
 		// then executeErr would be an error like "MySQL has gone away".
 		if executeErr == nil {
 			return qr, executeErr
@@ -196,6 +194,24 @@ func (mysqld *Mysqld) killConnection(connID int64) error {
 // for variables that match the given pattern.
 func (mysqld *Mysqld) fetchVariables(ctx context.Context, pattern string) (map[string]string, error) {
 	query := fmt.Sprintf("SHOW VARIABLES LIKE '%s'", pattern)
+	qr, err := mysqld.FetchSuperQuery(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if len(qr.Fields) != 2 {
+		return nil, fmt.Errorf("query %#v returned %d columns, expected 2", query, len(qr.Fields))
+	}
+	varMap := make(map[string]string, len(qr.Rows))
+	for _, row := range qr.Rows {
+		varMap[row[0].ToString()] = row[1].ToString()
+	}
+	return varMap, nil
+}
+
+// fetchStatuses returns a map from MySQL status names to status value
+// for variables that match the given pattern.
+func (mysqld *Mysqld) fetchStatuses(ctx context.Context, pattern string) (map[string]string, error) {
+	query := fmt.Sprintf("SHOW STATUS LIKE '%s'", pattern)
 	qr, err := mysqld.FetchSuperQuery(ctx, query)
 	if err != nil {
 		return nil, err

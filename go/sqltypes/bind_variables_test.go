@@ -22,6 +22,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
@@ -116,6 +118,24 @@ func TestBuildBindVariable(t *testing.T) {
 			Value: []byte("1"),
 		},
 	}, {
+		in: uint(1),
+		out: &querypb.BindVariable{
+			Type:  querypb.Type_UINT64,
+			Value: []byte("1"),
+		},
+	}, {
+		in: int32(1),
+		out: &querypb.BindVariable{
+			Type:  querypb.Type_INT32,
+			Value: []byte("1"),
+		},
+	}, {
+		in: uint32(1),
+		out: &querypb.BindVariable{
+			Type:  querypb.Type_UINT32,
+			Value: []byte("1"),
+		},
+	}, {
 		in: int64(1),
 		out: &querypb.BindVariable{
 			Type:  querypb.Type_INT64,
@@ -196,6 +216,42 @@ func TestBuildBindVariable(t *testing.T) {
 				Value: []byte("1"),
 			}, {
 				Type:  querypb.Type_INT64,
+				Value: []byte("2"),
+			}},
+		},
+	}, {
+		in: []uint{1, 2},
+		out: &querypb.BindVariable{
+			Type: querypb.Type_TUPLE,
+			Values: []*querypb.Value{{
+				Type:  querypb.Type_UINT64,
+				Value: []byte("1"),
+			}, {
+				Type:  querypb.Type_UINT64,
+				Value: []byte("2"),
+			}},
+		},
+	}, {
+		in: []int32{1, 2},
+		out: &querypb.BindVariable{
+			Type: querypb.Type_TUPLE,
+			Values: []*querypb.Value{{
+				Type:  querypb.Type_INT32,
+				Value: []byte("1"),
+			}, {
+				Type:  querypb.Type_INT32,
+				Value: []byte("2"),
+			}},
+		},
+	}, {
+		in: []uint32{1, 2},
+		out: &querypb.BindVariable{
+			Type: querypb.Type_TUPLE,
+			Values: []*querypb.Value{{
+				Type:  querypb.Type_UINT32,
+				Value: []byte("1"),
+			}, {
+				Type:  querypb.Type_UINT32,
 				Value: []byte("2"),
 			}},
 		},
@@ -521,16 +577,15 @@ func TestValidateBindVariable(t *testing.T) {
 func TestBindVariableToValue(t *testing.T) {
 	v, err := BindVariableToValue(Int64BindVariable(1))
 	require.NoError(t, err)
-	want := MakeTrusted(querypb.Type_INT64, []byte("1"))
-	if !reflect.DeepEqual(v, want) {
-		t.Errorf("BindVarToValue(1): %v, want %v", v, want)
-	}
+	assert.Equal(t, MakeTrusted(querypb.Type_INT64, []byte("1")), v)
 
-	v, err = BindVariableToValue(&querypb.BindVariable{Type: querypb.Type_TUPLE})
-	wantErr := "cannot convert a TUPLE bind var into a value"
-	if err == nil || err.Error() != wantErr {
-		t.Errorf(" BindVarToValue(TUPLE): (%v, %v), want %s", v, err, wantErr)
-	}
+	_, err = BindVariableToValue(&querypb.BindVariable{Type: querypb.Type_TUPLE})
+	require.EqualError(t, err, "cannot convert a TUPLE bind var into a value")
+
+	v, err = BindVariableToValue(BitNumBindVariable([]byte("0b101")))
+	require.NoError(t, err)
+	assert.Equal(t, MakeTrusted(querypb.Type_BITNUM, []byte("0b101")), v)
+
 }
 
 func TestBindVariablesEqual(t *testing.T) {

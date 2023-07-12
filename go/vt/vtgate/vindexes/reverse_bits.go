@@ -18,6 +18,7 @@ package vindexes
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -38,12 +39,16 @@ var (
 // ReverseBits defines vindex that reverses the bits of a number.
 // It's Unique, Reversible and Functional.
 type ReverseBits struct {
-	name string
+	name          string
+	unknownParams []string
 }
 
-// NewReverseBits creates a new ReverseBits.
-func NewReverseBits(name string, m map[string]string) (Vindex, error) {
-	return &ReverseBits{name: name}, nil
+// newReverseBits creates a new ReverseBits.
+func newReverseBits(name string, m map[string]string) (Vindex, error) {
+	return &ReverseBits{
+		name:          name,
+		unknownParams: FindUnknownParams(m, nil),
+	}, nil
 }
 
 // String returns the name of the vindex.
@@ -67,7 +72,7 @@ func (vind *ReverseBits) NeedsVCursor() bool {
 }
 
 // Map returns the corresponding KeyspaceId values for the given ids.
-func (vind *ReverseBits) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+func (vind *ReverseBits) Map(ctx context.Context, vcursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	out := make([]key.Destination, 0, len(ids))
 	for _, id := range ids {
 		num, err := vind.Hash(id)
@@ -81,7 +86,7 @@ func (vind *ReverseBits) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destin
 }
 
 // Verify returns true if ids maps to ksids.
-func (vind *ReverseBits) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
+func (vind *ReverseBits) Verify(ctx context.Context, vcursor VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
 	out := make([]bool, 0, len(ids))
 	for i, id := range ids {
 		num, err := vind.Hash(id)
@@ -106,6 +111,11 @@ func (vind *ReverseBits) ReverseMap(_ VCursor, ksids [][]byte) ([]sqltypes.Value
 	return reverseIds, nil
 }
 
+// UnknownParams implements the ParamValidating interface.
+func (vind *ReverseBits) UnknownParams() []string {
+	return vind.unknownParams
+}
+
 func (vind *ReverseBits) Hash(id sqltypes.Value) ([]byte, error) {
 	num, err := evalengine.ToUint64(id)
 	if err != nil {
@@ -115,7 +125,7 @@ func (vind *ReverseBits) Hash(id sqltypes.Value) ([]byte, error) {
 }
 
 func init() {
-	Register("reverse_bits", NewReverseBits)
+	Register("reverse_bits", newReverseBits)
 }
 
 func reverse(shardKey uint64) []byte {

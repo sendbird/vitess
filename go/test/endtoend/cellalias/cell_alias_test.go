@@ -22,19 +22,18 @@ Then we add an alias, and these tablets should be routable
 package binlog
 
 import (
-	"encoding/json"
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/test/endtoend/cluster"
-	"vitess.io/vitess/go/test/endtoend/sharding"
 	"vitess.io/vitess/go/vt/proto/topodata"
 )
 
@@ -63,7 +62,6 @@ var (
 		"--enable_replication_reporter",
 		"--serving_state_grace_period", "1s",
 		"--binlog_player_protocol", "grpc",
-		"--enable-autocommit",
 	}
 	vSchema = `
 		{
@@ -119,6 +117,12 @@ func TestMain(m *testing.M) {
 			return 1, err
 		}
 
+		vtctldClientProcess := cluster.VtctldClientProcessInstance("localhost", localCluster.VtctldProcess.GrpcPort, localCluster.TmpDirectory)
+		_, err = vtctldClientProcess.ExecuteCommandWithOutput("CreateKeyspace", keyspaceName, "--durability-policy=semi_sync")
+		if err != nil {
+			return 1, err
+		}
+
 		shard1Primary = localCluster.NewVttabletInstance("primary", 0, cell1)
 		shard1Replica = localCluster.NewVttabletInstance("replica", 0, cell2)
 		shard1Rdonly = localCluster.NewVttabletInstance("rdonly", 0, cell2)
@@ -129,7 +133,11 @@ func TestMain(m *testing.M) {
 
 		var mysqlProcs []*exec.Cmd
 		for _, tablet := range []*cluster.Vttablet{shard1Primary, shard1Replica, shard1Rdonly, shard2Primary, shard2Replica, shard2Rdonly} {
-			tablet.MysqlctlProcess = *cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, localCluster.TmpDirectory)
+			mysqlctlProcess, err := cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, localCluster.TmpDirectory)
+			if err != nil {
+				return 1, err
+			}
+			tablet.MysqlctlProcess = *mysqlctlProcess
 			tablet.VttabletProcess = cluster.VttabletProcessInstance(tablet.HTTPPort,
 				tablet.GrpcPort,
 				tablet.TabletUID,
@@ -142,7 +150,6 @@ func TestMain(m *testing.M) {
 				hostname,
 				localCluster.TmpDirectory,
 				commonTabletArg,
-				true,
 				localCluster.DefaultCharset,
 			)
 			tablet.VttabletProcess.SupportsBackup = true
@@ -156,10 +163,6 @@ func TestMain(m *testing.M) {
 			if err := proc.Wait(); err != nil {
 				return 1, err
 			}
-		}
-
-		if err := localCluster.VtctlProcess.CreateKeyspace(keyspaceName); err != nil {
-			return 1, err
 		}
 
 		shard1 := cluster.Shard{
@@ -207,6 +210,10 @@ func TestMain(m *testing.M) {
 			return 1, err
 		}
 
+		if err := localCluster.StartVTOrc(keyspaceName); err != nil {
+			return 1, err
+		}
+
 		if err := localCluster.VtctlclientProcess.ApplySchema(keyspaceName, fmt.Sprintf(sqlSchema, tableName)); err != nil {
 			return 1, err
 		}
@@ -242,8 +249,8 @@ func TestAlias(t *testing.T) {
 	expectedPartitions[topodata.TabletType_PRIMARY] = []string{shard1.Name, shard2.Name}
 	expectedPartitions[topodata.TabletType_REPLICA] = []string{shard1.Name, shard2.Name}
 	expectedPartitions[topodata.TabletType_RDONLY] = []string{shard1.Name, shard2.Name}
-	sharding.CheckSrvKeyspace(t, cell1, keyspaceName, "", 0, expectedPartitions, *localCluster)
-	sharding.CheckSrvKeyspace(t, cell2, keyspaceName, "", 0, expectedPartitions, *localCluster)
+	cluster.CheckSrvKeyspace(t, cell1, keyspaceName, expectedPartitions, *localCluster)
+	cluster.CheckSrvKeyspace(t, cell2, keyspaceName, expectedPartitions, *localCluster)
 
 	// Adds alias so vtgate can route to replica/rdonly tablets that are not in the same cell, but same alias
 	err = localCluster.VtctlclientProcess.ExecuteCommand("AddCellsAlias", "--",
@@ -306,8 +313,8 @@ func TestAddAliasWhileVtgateUp(t *testing.T) {
 	expectedPartitions[topodata.TabletType_PRIMARY] = []string{shard1.Name, shard2.Name}
 	expectedPartitions[topodata.TabletType_REPLICA] = []string{shard1.Name, shard2.Name}
 	expectedPartitions[topodata.TabletType_RDONLY] = []string{shard1.Name, shard2.Name}
-	sharding.CheckSrvKeyspace(t, cell1, keyspaceName, "", 0, expectedPartitions, *localCluster)
-	sharding.CheckSrvKeyspace(t, cell2, keyspaceName, "", 0, expectedPartitions, *localCluster)
+	cluster.CheckSrvKeyspace(t, cell1, keyspaceName, expectedPartitions, *localCluster)
+	cluster.CheckSrvKeyspace(t, cell2, keyspaceName, expectedPartitions, *localCluster)
 
 	vtgateInstance := localCluster.NewVtgateInstance()
 	vtgateInstance.CellsToWatch = allCells
@@ -337,66 +344,59 @@ func TestAddAliasWhileVtgateUp(t *testing.T) {
 
 func waitTillAllTabletsAreHealthyInVtgate(t *testing.T, vtgateInstance cluster.VtgateProcess, shards ...string) {
 	for _, shard := range shards {
-		err := vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.primary", keyspaceName, shard), 1)
-		require.Nil(t, err)
-		err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.replica", keyspaceName, shard), 1)
-		require.Nil(t, err)
-		err = vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.rdonly", keyspaceName, shard), 1)
-		require.Nil(t, err)
+		require.NoError(t, vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.primary", keyspaceName, shard), 1, 30*time.Second))
+		require.NoError(t, vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.replica", keyspaceName, shard), 1, 30*time.Second))
+		require.NoError(t, vtgateInstance.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.rdonly", keyspaceName, shard), 1, 30*time.Second))
 	}
 }
 
 func testQueriesOnTabletType(t *testing.T, tabletType string, vtgateGrpcPort int, shouldFail bool) {
-	output, err := localCluster.VtctlProcess.ExecuteCommandWithOutput("VtGateExecute", "--", "--json",
-		"--server", fmt.Sprintf("%s:%d", localCluster.Hostname, vtgateGrpcPort),
-		"--target", "@"+tabletType,
-		fmt.Sprintf(`select * from %s`, tableName))
+	qr, err := localCluster.ExecOnVTGate(context.Background(),
+		fmt.Sprintf("%s:%d", localCluster.Hostname, vtgateGrpcPort),
+		"@"+tabletType,
+		fmt.Sprintf(`select * from %s`, tableName), nil, nil,
+	)
 	if shouldFail {
 		require.Error(t, err)
 		return
 	}
-	require.NoError(t, err)
-	var result sqltypes.Result
-
-	err = json.Unmarshal([]byte(output), &result)
-	require.NoError(t, err)
-	assert.Equal(t, len(result.Rows), 3)
+	assert.Equal(t, len(qr.Rows), 3)
 }
 
 func insertInitialValues(t *testing.T) {
-	sharding.ExecuteOnTablet(t,
-		fmt.Sprintf(sharding.InsertTabletTemplateKsID, tableName, 1, "msg1", 1),
+	cluster.ExecuteOnTablet(t,
+		fmt.Sprintf(cluster.InsertTabletTemplateKsID, tableName, 1, "msg1", 1),
 		*shard1Primary,
 		keyspaceName,
 		false)
 
-	sharding.ExecuteOnTablet(t,
-		fmt.Sprintf(sharding.InsertTabletTemplateKsID, tableName, 2, "msg2", 2),
+	cluster.ExecuteOnTablet(t,
+		fmt.Sprintf(cluster.InsertTabletTemplateKsID, tableName, 2, "msg2", 2),
 		*shard1Primary,
 		keyspaceName,
 		false)
 
-	sharding.ExecuteOnTablet(t,
-		fmt.Sprintf(sharding.InsertTabletTemplateKsID, tableName, 4, "msg4", 4),
+	cluster.ExecuteOnTablet(t,
+		fmt.Sprintf(cluster.InsertTabletTemplateKsID, tableName, 4, "msg4", 4),
 		*shard2Primary,
 		keyspaceName,
 		false)
 }
 
 func deleteInitialValues(t *testing.T) {
-	sharding.ExecuteOnTablet(t,
+	cluster.ExecuteOnTablet(t,
 		fmt.Sprintf("delete from %s where id = %v", tableName, 1),
 		*shard1Primary,
 		keyspaceName,
 		false)
 
-	sharding.ExecuteOnTablet(t,
+	cluster.ExecuteOnTablet(t,
 		fmt.Sprintf("delete from %s where id = %v", tableName, 2),
 		*shard1Primary,
 		keyspaceName,
 		false)
 
-	sharding.ExecuteOnTablet(t,
+	cluster.ExecuteOnTablet(t,
 		fmt.Sprintf("delete from %s where id = %v", tableName, 4),
 		*shard2Primary,
 		keyspaceName,

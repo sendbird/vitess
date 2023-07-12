@@ -20,13 +20,15 @@ import (
 	"expvar"
 	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func clear() {
 	defaultVarGroup.vars = make(map[string]expvar.Var)
 	defaultVarGroup.newVarHook = nil
-	*combineDimensions = ""
-	*dropVariables = ""
+	combineDimensions = ""
+	dropVariables = ""
 	combinedDimensions = nil
 	droppedVars = nil
 }
@@ -124,7 +126,7 @@ func TestPublishFunc(t *testing.T) {
 
 func TestDropVariable(t *testing.T) {
 	clear()
-	*dropVariables = "dropTest"
+	dropVariables = "dropTest"
 
 	// This should not panic.
 	_ = NewGaugesWithSingleLabel("dropTest", "help", "label")
@@ -142,18 +144,48 @@ func TestStringMapToString(t *testing.T) {
 }
 
 func TestParseCommonTags(t *testing.T) {
-	res := ParseCommonTags("")
+	res := ParseCommonTags([]string{""})
 	if len(res) != 0 {
 		t.Errorf("expected empty result, got %v", res)
 	}
-	res = ParseCommonTags("s,a:b ")
+	res = ParseCommonTags([]string{"s", "a:b"})
 	expected1 := map[string]string{"a": "b"}
 	if !reflect.DeepEqual(expected1, res) {
 		t.Errorf("expected %v, got %v", expected1, res)
 	}
-	res = ParseCommonTags("a:b,  c:d")
+	res = ParseCommonTags([]string{"a:b", "c:d"})
 	expected2 := map[string]string{"a": "b", "c": "d"}
 	if !reflect.DeepEqual(expected2, res) {
 		t.Errorf("expected %v, got %v", expected2, res)
 	}
+}
+
+func TestStringMapWithMultiLabels(t *testing.T) {
+	clear()
+	c := NewStringMapFuncWithMultiLabels("stringMap1", "help", []string{"aaa", "bbb"}, "ccc", func() map[string]string {
+		m := make(map[string]string)
+		m["c1a.c1b"] = "1"
+		m["c2a.c2b"] = "1"
+		return m
+	})
+
+	want1 := `{"c1a.c1b": "1", "c2a.c2b": "1"}`
+	want2 := `{"c2a.c2b": "1", "c1a.c1b": "1"}`
+	if s := c.String(); s != want1 && s != want2 {
+		t.Errorf("want %s or %s, got %s", want1, want2, s)
+	}
+
+	m := c.StringMapFunc()
+	require.Len(t, m, 2)
+	require.Contains(t, m, "c1a.c1b")
+	require.Equal(t, m["c1a.c1b"], "1")
+	require.Contains(t, m, "c2a.c2b")
+	require.Equal(t, m["c2a.c2b"], "1")
+
+	keyLabels := c.KeyLabels()
+	require.Len(t, keyLabels, 2)
+	require.Equal(t, keyLabels[0], "aaa")
+	require.Equal(t, keyLabels[1], "bbb")
+
+	require.Equal(t, c.ValueLabel(), "ccc")
 }

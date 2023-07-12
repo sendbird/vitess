@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"unsafe"
 
-	"vitess.io/vitess/go/mysql/collations/internal/charset"
+	"vitess.io/vitess/go/mysql/collations/charset"
 )
 
 func init() {
@@ -37,13 +37,13 @@ func init() {
 //
 // The rules for assigning a Coercibility value to an expression are as follows:
 //
-//	- An explicit COLLATE clause has a coercibility of 0 (not coercible at all).
-//  - The concatenation of two strings with different collations has a coercibility of 1.
-//  - The collation of a column or a stored routine parameter or local variable has a coercibility of 2.
-// 	- A “system constant” (the string returned by functions such as USER() or VERSION()) has a coercibility of 3.
-// 	- The collation of a literal has a coercibility of 4.
-// 	- The collation of a numeric or temporal value has a coercibility of 5.
-//  - NULL or an expression that is derived from NULL has a coercibility of 6.
+//   - An explicit COLLATE clause has a coercibility of 0 (not coercible at all).
+//   - The concatenation of two strings with different collations has a coercibility of 1.
+//   - The collation of a column or a stored routine parameter or local variable has a coercibility of 2.
+//   - A “system constant” (the string returned by functions such as USER() or VERSION()) has a coercibility of 3.
+//   - The collation of a literal has a coercibility of 4.
+//   - The collation of a numeric or temporal value has a coercibility of 5.
+//   - NULL or an expression that is derived from NULL has a coercibility of 6.
 //
 // According to the MySQL documentation, Coercibility is an actual word of the English
 // language, although the Vitess maintainers disagree with this assessment.
@@ -203,13 +203,20 @@ type CoercionOptions struct {
 // If the collations for both sides of the expression are not compatible, an error
 // will be returned and the returned TypedCollation and Coercion will be nil.
 func (env *Environment) MergeCollations(left, right TypedCollation, opt CoercionOptions) (TypedCollation, Coercion, Coercion, error) {
-	leftColl := env.LookupByID(left.Collation)
-	rightColl := env.LookupByID(right.Collation)
+	leftColl := left.Collation.Get()
+	rightColl := right.Collation.Get()
 	if leftColl == nil || rightColl == nil {
 		return TypedCollation{}, nil, nil, fmt.Errorf("unsupported TypeCollationID: %v / %v", left.Collation, right.Collation)
 	}
+
 	leftCS := leftColl.Charset()
 	rightCS := rightColl.Charset()
+
+	if left.Coercibility == CoerceExplicit && right.Coercibility == CoerceExplicit {
+		if left.Collation != right.Collation {
+			goto cannotCoerce
+		}
+	}
 
 	if leftCS.Name() == rightCS.Name() {
 		switch {
@@ -303,8 +310,8 @@ coerceToRight:
 
 func (env *Environment) EnsureCollate(fromID, toID ID) error {
 	// these two lookups should never fail
-	from := env.LookupByID(fromID)
-	to := env.LookupByID(toID)
+	from := fromID.Get()
+	to := toID.Get()
 	if from.Charset().Name() != to.Charset().Name() {
 		return fmt.Errorf("COLLATION '%s' is not valid for CHARACTER SET '%s'", to.Name(), from.Charset().Name())
 	}

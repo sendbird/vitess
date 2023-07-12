@@ -19,11 +19,8 @@ package semantics
 import (
 	"strings"
 
-	"vitess.io/vitess/go/vt/vtgate/engine"
-
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vtgate/engine/opcode"
 )
 
 // binder is responsible for finding all the column references in
@@ -64,6 +61,10 @@ func (b *binder) up(cursor *sqlparser.Cursor) error {
 	switch node := cursor.Node().(type) {
 	case *sqlparser.Subquery:
 		currScope := b.scoper.currentScope()
+		// do not extract subquery in insert statement.
+		if _, isInsert := currScope.stmt.(*sqlparser.Insert); isInsert {
+			return nil
+		}
 		sq, err := b.createExtractedSubquery(cursor, currScope, node)
 		if err != nil {
 			return err
@@ -94,7 +95,7 @@ func (b *binder) up(cursor *sqlparser.Cursor) error {
 		currentScope := b.scoper.currentScope()
 		deps, err := b.resolveColumn(node, currentScope, false)
 		if err != nil {
-			if deps.direct.NumberOfTables() == 0 ||
+			if deps.direct.IsEmpty() ||
 				!strings.HasSuffix(err.Error(), "is ambiguous") ||
 				!b.canRewriteUsingJoin(deps, node) {
 				return err
@@ -113,39 +114,46 @@ func (b *binder) up(cursor *sqlparser.Cursor) error {
 		if deps.typ != nil {
 			b.typer.setTypeFor(node, *deps.typ)
 		}
-	case *sqlparser.FuncExpr:
-		// need special handling so that any lingering `*` expressions are bound to all local tables
-		if len(node.Exprs) != 1 {
-			break
-		}
-		if _, isStar := node.Exprs[0].(*sqlparser.StarExpr); !isStar {
-			break
-		}
-		scope := b.scoper.currentScope()
-		var ts TableSet
-		for _, table := range scope.tables {
-			expr := table.getExpr()
-			if expr != nil {
-				ts.MergeInPlace(b.tc.tableSetFor(expr))
-			}
-		}
-		b.recursive[node] = ts
-		b.direct[node] = ts
+	case *sqlparser.CountStar:
+		b.bindCountStar(node)
 	}
 	return nil
+}
+
+func (b *binder) bindCountStar(node *sqlparser.CountStar) {
+	scope := b.scoper.currentScope()
+	var ts TableSet
+	for _, tbl := range scope.tables {
+		switch tbl := tbl.(type) {
+		case *vTableInfo:
+			for _, col := range tbl.cols {
+				if sqlparser.Equals.Expr(node, col) {
+					ts = ts.Merge(b.recursive[col])
+				}
+			}
+		default:
+			expr := tbl.GetExpr()
+			if expr != nil {
+				setFor := b.tc.tableSetFor(expr)
+				ts = ts.Merge(setFor)
+			}
+		}
+	}
+	b.recursive[node] = ts
+	b.direct[node] = ts
 }
 
 func (b *binder) rewriteJoinUsingColName(deps dependency, node *sqlparser.ColName, currentScope *scope) (dependency, error) {
 	constituents := deps.recursive.Constituents()
 	if len(constituents) < 1 {
-		return dependency{}, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "not expected - we should not a colname that depends on nothing")
+		return dependency{}, &BuggyError{Msg: "we should not have a *ColName that depends on nothing"}
 	}
 	newTbl := constituents[0]
 	infoFor, err := b.tc.tableInfoFor(newTbl)
 	if err != nil {
 		return dependency{}, err
 	}
-	alias := infoFor.getExpr().As
+	alias := infoFor.GetExpr().As
 	if alias.IsEmpty() {
 		name, err := infoFor.Name()
 		if err != nil {
@@ -154,7 +162,7 @@ func (b *binder) rewriteJoinUsingColName(deps dependency, node *sqlparser.ColNam
 		node.Qualifier = name
 	} else {
 		node.Qualifier = sqlparser.TableName{
-			Name: sqlparser.NewTableIdent(alias.String()),
+			Name: sqlparser.NewIdentifierCS(alias.String()),
 		}
 	}
 	deps, err = b.resolveColumn(node, currentScope, false)
@@ -189,35 +197,33 @@ func (b *binder) setSubQueryDependencies(subq *sqlparser.Subquery, currScope *sc
 	sco := currScope
 	for sco != nil {
 		for _, table := range sco.tables {
-			tablesToKeep.MergeInPlace(table.getTableSet(b.org))
+			tablesToKeep = tablesToKeep.Merge(table.getTableSet(b.org))
 		}
 		sco = sco.parent
 	}
 
-	subqDirectDeps.KeepOnly(tablesToKeep)
-	subqRecursiveDeps.KeepOnly(tablesToKeep)
-	b.recursive[subq] = subqRecursiveDeps
-	b.direct[subq] = subqDirectDeps
+	b.recursive[subq] = subqRecursiveDeps.KeepOnly(tablesToKeep)
+	b.direct[subq] = subqDirectDeps.KeepOnly(tablesToKeep)
 }
 
 func (b *binder) createExtractedSubquery(cursor *sqlparser.Cursor, currScope *scope, subq *sqlparser.Subquery) (*sqlparser.ExtractedSubquery, error) {
 	if currScope.stmt == nil {
-		return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] unable to bind subquery to select statement")
+		return nil, &BuggyError{Msg: "unable to bind subquery to select statement"}
 	}
 
 	sq := &sqlparser.ExtractedSubquery{
 		Subquery: subq,
 		Original: subq,
-		OpCode:   int(engine.PulloutValue),
+		OpCode:   int(opcode.PulloutValue),
 	}
 
 	switch par := cursor.Parent().(type) {
 	case *sqlparser.ComparisonExpr:
 		switch par.Operator {
 		case sqlparser.InOp:
-			sq.OpCode = int(engine.PulloutIn)
+			sq.OpCode = int(opcode.PulloutIn)
 		case sqlparser.NotInOp:
-			sq.OpCode = int(engine.PulloutNotIn)
+			sq.OpCode = int(opcode.PulloutNotIn)
 		}
 		subq, exp := GetSubqueryAndOtherSide(par)
 		sq.Original = &sqlparser.ComparisonExpr{
@@ -227,7 +233,7 @@ func (b *binder) createExtractedSubquery(cursor *sqlparser.Cursor, currScope *sc
 		}
 		sq.OtherSide = exp
 	case *sqlparser.ExistsExpr:
-		sq.OpCode = int(engine.PulloutExists)
+		sq.OpCode = int(opcode.PulloutExists)
 		sq.Original = par
 	}
 	return sq, nil
@@ -235,6 +241,8 @@ func (b *binder) createExtractedSubquery(cursor *sqlparser.Cursor, currScope *sc
 
 func (b *binder) resolveColumn(colName *sqlparser.ColName, current *scope, allowMulti bool) (dependency, error) {
 	var thisDeps dependencies
+	first := true
+	var tableName *sqlparser.TableName
 	for current != nil {
 		var err error
 		thisDeps, err = b.resolveColumnInScope(current, colName, allowMulti)
@@ -253,9 +261,22 @@ func (b *binder) resolveColumn(colName *sqlparser.ColName, current *scope, allow
 		} else if err != nil {
 			return dependency{}, err
 		}
+		if current.parent == nil && len(current.tables) == 1 && first && colName.Qualifier.IsEmpty() {
+			// if this is the top scope, and we still haven't been able to find a match, we know we are about to fail
+			// we can check this last scope and see if there is a single table. if there is just one table in the scope
+			// we assume that the column is meant to come from this table.
+			// we also check that this is the first scope we are looking in.
+			// If there are more scopes the column could come from, we can't assume anything
+			// This is just used for a clearer error message
+			name, err := current.tables[0].Name()
+			if err == nil {
+				tableName = &name
+			}
+		}
+		first = false
 		current = current.parent
 	}
-	return dependency{}, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.BadFieldError, "symbol %s not found", sqlparser.String(colName))
+	return dependency{}, ShardedError{&ColumnNotFoundError{Column: colName, Table: tableName}}
 }
 
 func (b *binder) resolveColumnInScope(current *scope, expr *sqlparser.ColName, allowMulti bool) (dependencies, error) {
@@ -272,16 +293,14 @@ func (b *binder) resolveColumnInScope(current *scope, expr *sqlparser.ColName, a
 	}
 	if deps, isUncertain := deps.(*uncertain); isUncertain && deps.fail {
 		// if we have a failure from uncertain, we matched the column to multiple non-authoritative tables
-		return nil, ProjError{
-			Inner: vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "Column '%s' in field list is ambiguous", sqlparser.String(expr)),
-		}
+		return nil, ProjError{Inner: &AmbiguousColumnError{Column: sqlparser.String(expr)}}
 	}
 	return deps, nil
 }
 
 func makeAmbiguousError(colName *sqlparser.ColName, err error) error {
 	if err == ambigousErr {
-		err = vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "Column '%s' in field list is ambiguous", sqlparser.String(colName))
+		err = &AmbiguousColumnError{Column: sqlparser.String(colName)}
 	}
 	return err
 }

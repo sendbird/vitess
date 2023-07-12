@@ -52,6 +52,7 @@ import (
 	"time"
 
 	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/proto/query"
@@ -182,6 +183,7 @@ func TestVStreamCopyCompleteFlow(t *testing.T) {
 	uvstreamerTestMode = true
 	defer func() { uvstreamerTestMode = false }()
 	initialize(t)
+
 	if err := engine.se.Reload(context.Background()); err != nil {
 		t.Fatal("Error reloading schema")
 	}
@@ -190,6 +192,12 @@ func TestVStreamCopyCompleteFlow(t *testing.T) {
 	var tablePKs []*binlogdatapb.TableLastPK
 	for i, table := range testState.tables {
 		rules = append(rules, getRule(table))
+
+		// for table t2, let tablepk be nil, so that we don't send events for the insert in initTables()
+		if table == "t2" {
+			continue
+		}
+
 		tablePKs = append(tablePKs, getTablePK(table, i+1))
 	}
 	filter := &binlogdatapb.Filter{
@@ -226,7 +234,7 @@ func TestVStreamCopyCompleteFlow(t *testing.T) {
 
 	}
 
-	callbacks["OTHER.*Copy Done"] = func() {
+	callbacks["COPY_COMPLETED"] = func() {
 		log.Info("Copy done, inserting events to stream")
 		insertRow(t, "t1", 1, numInitialRows+4)
 		insertRow(t, "t2", 2, numInitialRows+3)
@@ -245,8 +253,8 @@ commit;"
 	}
 
 	numCopyEvents := 3 /*t1,t2,t3*/ * (numInitialRows + 1 /*FieldEvent*/ + 1 /*LastPKEvent*/ + 1 /*TestEvent: Copy Start*/ + 2 /*begin,commit*/ + 3 /* LastPK Completed*/)
-	numCopyEvents += 2                                    /* GTID + Test event after all copy is done */
-	numCatchupEvents := 3 * 5                             /*2 t1, 1 t2 : BEGIN+FIELD+ROW+GTID+COMMIT*/
+	numCopyEvents += 2                                    /* GTID + Event after all copy is done */
+	numCatchupEvents := 3 * 5                             /* 2 t1, 1 t2 : BEGIN+FIELD+ROW+GTID+COMMIT */
 	numFastForwardEvents := 5                             /*t1:FIELD+ROW*/
 	numMisc := 1                                          /* t2 insert during t1 catchup that comes in t2 copy */
 	numReplicateEvents := 2*5 /* insert into t1/t2 */ + 6 /* begin/field/2 inserts/gtid/commit */
@@ -313,6 +321,7 @@ func validateReceivedEvents(t *testing.T) {
 
 func resetMetrics(t *testing.T) {
 	engine.vstreamerEventsStreamed.Reset()
+	engine.vstreamerCompressedTransactionsDecoded.Reset()
 	engine.resultStreamerNumRows.Reset()
 	engine.rowStreamerNumRows.Reset()
 	engine.vstreamerPhaseTimings.Reset()
@@ -432,12 +441,15 @@ func getEventCallback(event *binlogdatapb.VEvent) func() {
 func startVStreamCopy(ctx context.Context, t *testing.T, filter *binlogdatapb.Filter, tablePKs []*binlogdatapb.TableLastPK) {
 	pos := ""
 	go func() {
-		err := engine.Stream(ctx, pos, tablePKs, filter, func(evs []*binlogdatapb.VEvent) error {
+		err := engine.Stream(ctx, pos, tablePKs, filter, throttlerapp.VStreamerName, func(evs []*binlogdatapb.VEvent) error {
 			//t.Logf("Received events: %v", evs)
 			muAllEvents.Lock()
 			defer muAllEvents.Unlock()
 			for _, ev := range evs {
 				if ev.Type == binlogdatapb.VEventType_HEARTBEAT {
+					continue
+				}
+				if ev.Throttled {
 					continue
 				}
 				cb := getEventCallback(ev)
@@ -467,7 +479,7 @@ var expectedEvents = []string{
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:1 lengths:2 values:\"880\"}}}",
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:1 lengths:2 values:\"990\"}}}",
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:2 lengths:3 values:\"10100\"}}}",
-	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t1\" lastpk:{rows:{lengths:2 values:\"10\"}}}}",
+	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t1\" lastpk:{fields:{name:\"id11\" type:INT32} rows:{lengths:2 values:\"10\"}}}}",
 	"type:COMMIT",
 	"type:BEGIN",
 	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t1\"} completed:true}",
@@ -496,7 +508,7 @@ var expectedEvents = []string{
 	"type:ROW row_event:{table_name:\"t2\" row_changes:{after:{lengths:1 lengths:3 values:\"9180\"}}}",
 	"type:ROW row_event:{table_name:\"t2\" row_changes:{after:{lengths:2 lengths:3 values:\"10200\"}}}",
 	"type:ROW row_event:{table_name:\"t2\" row_changes:{after:{lengths:2 lengths:3 values:\"11220\"}}}",
-	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t2\" lastpk:{rows:{lengths:2 values:\"11\"}}}}",
+	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t2\" lastpk:{fields:{name:\"id21\" type:INT32} rows:{lengths:2 values:\"11\"}}}}",
 	"type:COMMIT",
 	"type:BEGIN",
 	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t2\"} completed:true}",
@@ -524,12 +536,12 @@ var expectedEvents = []string{
 	"type:ROW row_event:{table_name:\"t3\" row_changes:{after:{lengths:1 lengths:3 values:\"8240\"}}}",
 	"type:ROW row_event:{table_name:\"t3\" row_changes:{after:{lengths:1 lengths:3 values:\"9270\"}}}",
 	"type:ROW row_event:{table_name:\"t3\" row_changes:{after:{lengths:2 lengths:3 values:\"10300\"}}}",
-	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t3\" lastpk:{rows:{lengths:2 values:\"10\"}}}}",
+	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t3\" lastpk:{fields:{name:\"id31\" type:INT32} rows:{lengths:2 values:\"10\"}}}}",
 	"type:COMMIT",
 	"type:BEGIN",
 	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t3\"} completed:true}",
 	"type:COMMIT",
-	"type:OTHER gtid:\"Copy Done\"",
+	"type:COPY_COMPLETED",
 	"type:BEGIN",
 	"type:FIELD field_event:{table_name:\"t1\" fields:{name:\"id11\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id11\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id12\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id12\" column_length:11 charset:63 column_type:\"int(11)\"}}",
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:2 lengths:3 values:\"14140\"}}}",

@@ -19,15 +19,18 @@ package vreplication
 import (
 	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 type testControllerPlan struct {
-	query        string
-	opcode       int
-	numInserts   int
-	selector     string
-	applier      string
-	delCopyState string
+	query             string
+	opcode            int
+	numInserts        int
+	selector          string
+	applier           string
+	delCopyState      string
+	delPostCopyAction string
 }
 
 func TestControllerPlan(t *testing.T) {
@@ -78,7 +81,7 @@ func TestControllerPlan(t *testing.T) {
 		err: "unsupported construct: insert ignore into _vt.vreplication values (null)",
 	}, {
 		in:  "insert into other values(null)",
-		err: "invalid table name: other",
+		err: "invalid database name: ",
 	}, {
 		in:  "insert into _vt.vreplication partition(a) values(null)",
 		err: "unsupported construct: insert into _vt.vreplication partition (a) values (null)",
@@ -130,7 +133,7 @@ func TestControllerPlan(t *testing.T) {
 			opcode: reshardingJournalQuery,
 		},
 	}, {
-		in:  "update a set state='Running' where id = 1",
+		in:  "update _vt.a set state='Running' where id = 1",
 		err: "invalid table name: a",
 	}, {
 		in:  "update _vt.vreplication set state='Running' where id = 1 order by id",
@@ -146,29 +149,32 @@ func TestControllerPlan(t *testing.T) {
 	}, {
 		in: "delete from _vt.vreplication where id = 1",
 		plan: &testControllerPlan{
-			query:        "delete from _vt.vreplication where id = 1",
-			opcode:       deleteQuery,
-			selector:     "select id from _vt.vreplication where id = 1",
-			applier:      "delete from _vt.vreplication where id in ::ids",
-			delCopyState: "delete from _vt.copy_state where vrepl_id in ::ids",
+			query:             "delete from _vt.vreplication where id = 1",
+			opcode:            deleteQuery,
+			selector:          "select id from _vt.vreplication where id = 1",
+			applier:           "delete from _vt.vreplication where id in ::ids",
+			delCopyState:      "delete from _vt.copy_state where vrepl_id in ::ids",
+			delPostCopyAction: "delete from _vt.post_copy_action where vrepl_id in ::ids",
 		},
 	}, {
 		in: "delete from _vt.vreplication",
 		plan: &testControllerPlan{
-			query:        "delete from _vt.vreplication",
-			opcode:       deleteQuery,
-			selector:     "select id from _vt.vreplication",
-			applier:      "delete from _vt.vreplication where id in ::ids",
-			delCopyState: "delete from _vt.copy_state where vrepl_id in ::ids",
+			query:             "delete from _vt.vreplication",
+			opcode:            deleteQuery,
+			selector:          "select id from _vt.vreplication",
+			applier:           "delete from _vt.vreplication where id in ::ids",
+			delCopyState:      "delete from _vt.copy_state where vrepl_id in ::ids",
+			delPostCopyAction: "delete from _vt.post_copy_action where vrepl_id in ::ids",
 		},
 	}, {
 		in: "delete from _vt.vreplication where a = 1",
 		plan: &testControllerPlan{
-			query:        "delete from _vt.vreplication where a = 1",
-			opcode:       deleteQuery,
-			selector:     "select id from _vt.vreplication where a = 1",
-			applier:      "delete from _vt.vreplication where id in ::ids",
-			delCopyState: "delete from _vt.copy_state where vrepl_id in ::ids",
+			query:             "delete from _vt.vreplication where a = 1",
+			opcode:            deleteQuery,
+			selector:          "select id from _vt.vreplication where a = 1",
+			applier:           "delete from _vt.vreplication where id in ::ids",
+			delCopyState:      "delete from _vt.copy_state where vrepl_id in ::ids",
+			delPostCopyAction: "delete from _vt.post_copy_action where vrepl_id in ::ids",
 		},
 	}, {
 		in: "delete from _vt.resharding_journal where id = 1",
@@ -177,7 +183,7 @@ func TestControllerPlan(t *testing.T) {
 			opcode: reshardingJournalQuery,
 		},
 	}, {
-		in:  "delete from a where id = 1",
+		in:  "delete from _vt.a where id = 1",
 		err: "invalid table name: a",
 	}, {
 		in:  "delete a, b from _vt.vreplication where id = 1",
@@ -212,8 +218,17 @@ func TestControllerPlan(t *testing.T) {
 			query:  "select * from _vt.copy_state",
 		},
 	}, {
-		in:  "select * from a",
+		in: "select * from _vt.vreplication_log",
+		plan: &testControllerPlan{
+			opcode: selectQuery,
+			query:  "select * from _vt.vreplication_log",
+		},
+	}, {
+		in:  "select * from _vt.a",
 		err: "invalid table name: a",
+	}, {
+		in:  "select * from nope.a",
+		err: "invalid database name: nope",
 
 		// Parser
 	}, {
@@ -221,34 +236,35 @@ func TestControllerPlan(t *testing.T) {
 		err: "syntax error at position 4 near 'bad'",
 	}, {
 		in:  "set a = 1",
-		err: "unsupported construct: set a = 1",
+		err: "unsupported construct: set @@a = 1",
 	}}
 	for _, tcase := range tcases {
-		pl, err := buildControllerPlan(tcase.in)
-		if err != nil {
-			if err.Error() != tcase.err {
-				t.Errorf("getPlan(%v) error:\n%v, want\n%v", tcase.in, err, tcase.err)
+		t.Run(tcase.in, func(t *testing.T) {
+			pl, err := buildControllerPlan(tcase.in)
+			if tcase.err != "" {
+				require.EqualError(t, err, tcase.err)
+				return
 			}
-			continue
-		}
-		if tcase.err != "" {
-			t.Errorf("getPlan(%v) error:\n%v, want\n%v", tcase.in, err, tcase.err)
-			continue
-		}
-		gotPlan := &testControllerPlan{
-			query:      pl.query,
-			opcode:     pl.opcode,
-			numInserts: pl.numInserts,
-			selector:   pl.selector,
-		}
-		if pl.applier != nil {
-			gotPlan.applier = pl.applier.Query
-		}
-		if pl.delCopyState != nil {
-			gotPlan.delCopyState = pl.delCopyState.Query
-		}
-		if !reflect.DeepEqual(gotPlan, tcase.plan) {
-			t.Errorf("getPlan(%v):\n%+v, want\n%+v", tcase.in, gotPlan, tcase.plan)
-		}
+			require.NoError(t, err)
+
+			gotPlan := &testControllerPlan{
+				query:      pl.query,
+				opcode:     pl.opcode,
+				numInserts: pl.numInserts,
+				selector:   pl.selector,
+			}
+			if pl.applier != nil {
+				gotPlan.applier = pl.applier.Query
+			}
+			if pl.delCopyState != nil {
+				gotPlan.delCopyState = pl.delCopyState.Query
+			}
+			if pl.delPostCopyAction != nil {
+				gotPlan.delPostCopyAction = pl.delPostCopyAction.Query
+			}
+			if !reflect.DeepEqual(gotPlan, tcase.plan) {
+				t.Errorf("getPlan(%v):\n%+v, want\n%+v", tcase.in, gotPlan, tcase.plan)
+			}
+		})
 	}
 }

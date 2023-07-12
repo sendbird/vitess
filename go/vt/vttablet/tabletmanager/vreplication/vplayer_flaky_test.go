@@ -18,7 +18,6 @@ package vreplication
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"math"
 	"os"
@@ -28,15 +27,107 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spyzhov/ajson"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/vstreamer/testenv"
+
+	"vitess.io/vitess/go/vt/vttablet"
+
+	"github.com/nsf/jsondiff"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 	"vitess.io/vitess/go/vt/log"
+
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	qh "vitess.io/vitess/go/vt/vttablet/tabletmanager/vreplication/queryhistory"
 )
+
+// TestPlayerGeneratedInvisiblePrimaryKey confirms that the gipk column is replicated by vplayer, both for target
+// tables that have a gipk column and those that make it visible.
+func TestPlayerGeneratedInvisiblePrimaryKey(t *testing.T) {
+	if !env.HasCapability(testenv.ServerCapabilityGeneratedInvisiblePrimaryKey) {
+		t.Skip("skipping test as server does not support generated invisible primary keys")
+	}
+	defer deleteTablet(addTablet(100))
+
+	execStatements(t, []string{
+		"SET @@session.sql_generate_invisible_primary_key=ON;",
+		"create table t1(val varbinary(128))",
+		fmt.Sprintf("create table %s.t1(val varbinary(128))", vrepldb),
+		"create table t2(val varbinary(128))",
+		"SET @@session.sql_generate_invisible_primary_key=OFF;",
+		fmt.Sprintf("create table %s.t2(my_row_id int, val varbinary(128), primary key(my_row_id))", vrepldb),
+	})
+	defer execStatements(t, []string{
+		"drop table t1",
+		fmt.Sprintf("drop table %s.t1", vrepldb),
+		"drop table t2",
+		fmt.Sprintf("drop table %s.t2", vrepldb),
+	})
+	env.SchemaEngine.Reload(context.Background())
+
+	filter := &binlogdatapb.Filter{
+		Rules: []*binlogdatapb.Rule{{
+			Match:  "t1",
+			Filter: "select * from t1",
+		}, {
+			Match:  "t2",
+			Filter: "select * from t2",
+		}},
+	}
+	bls := &binlogdatapb.BinlogSource{
+		Keyspace: env.KeyspaceName,
+		Shard:    env.ShardName,
+		Filter:   filter,
+		OnDdl:    binlogdatapb.OnDDLAction_IGNORE,
+	}
+	cancel, _ := startVReplication(t, bls, "")
+	defer cancel()
+
+	testcases := []struct {
+		input       string
+		output      string
+		table       string
+		data        [][]string
+		query       string
+		queryResult [][]string
+	}{{
+		input:  "insert into t1(val) values ('aaa')",
+		output: "insert into t1(my_row_id,val) values (1,'aaa')",
+		table:  "t1",
+		data: [][]string{
+			{"aaa"},
+		},
+		query: "select my_row_id, val from t1",
+		queryResult: [][]string{
+			{"1", "aaa"},
+		},
+	}, {
+		input:  "insert into t2(val) values ('bbb')",
+		output: "insert into t2(my_row_id,val) values (1,'bbb')",
+		table:  "t2",
+		data: [][]string{
+			{"1", "bbb"},
+		},
+		query: "select my_row_id, val from t2",
+		queryResult: [][]string{
+			{"1", "bbb"},
+		},
+	}}
+
+	for _, tcases := range testcases {
+		execStatements(t, []string{tcases.input})
+		output := qh.Expect(tcases.output)
+		expectNontxQueries(t, output)
+		if tcases.table != "" {
+			expectData(t, tcases.table, tcases.data)
+		}
+		if tcases.query != "" {
+			expectQueryResult(t, tcases.query, tcases.queryResult)
+		}
+	}
+}
 
 func TestPlayerInvisibleColumns(t *testing.T) {
 	if !supportsInvisibleColumns() {
@@ -91,9 +182,7 @@ func TestPlayerInvisibleColumns(t *testing.T) {
 
 	for _, tcases := range testcases {
 		execStatements(t, []string{tcases.input})
-		output := []string{
-			tcases.output,
-		}
+		output := qh.Expect(tcases.output)
 		expectNontxQueries(t, output)
 		time.Sleep(1 * time.Second)
 		log.Flush()
@@ -104,13 +193,12 @@ func TestPlayerInvisibleColumns(t *testing.T) {
 			expectQueryResult(t, tcases.query, tcases.queryResult)
 		}
 	}
-
 }
 
 func TestHeartbeatFrequencyFlag(t *testing.T) {
-	origVReplicationHeartbeatUpdateInterval := *vreplicationHeartbeatUpdateInterval
+	origVReplicationHeartbeatUpdateInterval := vreplicationHeartbeatUpdateInterval
 	defer func() {
-		*vreplicationHeartbeatUpdateInterval = origVReplicationHeartbeatUpdateInterval
+		vreplicationHeartbeatUpdateInterval = origVReplicationHeartbeatUpdateInterval
 	}()
 
 	stats := binlogplayer.NewStats()
@@ -132,7 +220,7 @@ func TestHeartbeatFrequencyFlag(t *testing.T) {
 	}
 	for _, tcase := range testcases {
 		t.Run(tcase.name, func(t *testing.T) {
-			*vreplicationHeartbeatUpdateInterval = tcase.interval
+			vreplicationHeartbeatUpdateInterval = tcase.interval
 			for _, tcount := range tcase.counts {
 				vp.numAccumulatedHeartbeats = tcount.count
 				require.Equal(t, tcount.mustUpdate, vp.mustUpdateHeartbeat())
@@ -144,7 +232,6 @@ func TestHeartbeatFrequencyFlag(t *testing.T) {
 func TestVReplicationTimeUpdated(t *testing.T) {
 	ctx := context.Background()
 	defer deleteTablet(addTablet(100))
-
 	execStatements(t, []string{
 		"create table t1(id int, val varbinary(128), primary key(id))",
 		fmt.Sprintf("create table %s.t1(id int, val varbinary(128), primary key(id))", vrepldb),
@@ -187,9 +274,7 @@ func TestVReplicationTimeUpdated(t *testing.T) {
 		require.NoError(t, err)
 		return timeUpdated, transactionTimestamp, timeHeartbeat
 	}
-	expectNontxQueries(t, []string{
-		"insert into t1(id,val) values (1,'aaa')",
-	})
+	expectNontxQueries(t, qh.Expect("insert into t1(id,val) values (1,'aaa')"))
 	time.Sleep(1 * time.Second)
 	timeUpdated1, transactionTimestamp1, timeHeartbeat1 := getTimestamps()
 	time.Sleep(2 * time.Second)
@@ -197,12 +282,6 @@ func TestVReplicationTimeUpdated(t *testing.T) {
 	require.Greater(t, timeUpdated2, timeUpdated1, "time_updated not updated")
 	require.Greater(t, timeUpdated2, transactionTimestamp1, "transaction_timestamp should not be < time_updated")
 	require.Greater(t, timeHeartbeat2, timeHeartbeat1, "time_heartbeat not updated")
-
-	// drop time_heartbeat column to test that heartbeat is updated using WithDDL and can self-heal by creating the column again
-	env.Mysqld.ExecuteSuperQuery(ctx, "alter table _vt.vreplication drop column time_heartbeat")
-	time.Sleep(2 * time.Second)
-	_, _, timeHeartbeat3 := getTimestamps()
-	require.Greater(t, timeHeartbeat3, timeHeartbeat2, "time_heartbeat not updated")
 }
 
 func TestCharPK(t *testing.T) {
@@ -319,12 +398,12 @@ func TestCharPK(t *testing.T) {
 
 	for _, tcases := range testcases {
 		execStatements(t, []string{tcases.input})
-		output := []string{
+		output := qh.Expect(
 			"begin",
 			tcases.output,
 			"/update _vt.vreplication set pos",
 			"commit",
-		}
+		)
 		expectDBClientQueries(t, output)
 		if tcases.table != "" {
 			expectData(t, tcases.table, tcases.data)
@@ -377,12 +456,12 @@ func TestRollup(t *testing.T) {
 
 	for _, tcases := range testcases {
 		execStatements(t, []string{tcases.input})
-		output := []string{
+		output := qh.Expect(
 			"begin",
 			tcases.output,
 			"/update _vt.vreplication set pos",
 			"commit",
-		}
+		)
 		expectDBClientQueries(t, output)
 		if tcases.table != "" {
 			expectData(t, tcases.table, tcases.data)
@@ -419,12 +498,12 @@ func TestPlayerSavepoint(t *testing.T) {
 	// Root cause seems to be with MySQL where t1 shows up in information_schema before
 	// the actual table is created.
 	execStatements(t, []string{"insert into t1 values(1)"})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		"insert into t1(id) values (1)",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	})
+	))
 
 	execStatements(t, []string{
 		"begin",
@@ -438,13 +517,13 @@ func TestPlayerSavepoint(t *testing.T) {
 		"rollback work to savepoint vrepl_a",
 		"commit",
 	})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		"/insert into t1.*2.*",
 		"/insert into t1.*3.*",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	})
+	))
 	cancel()
 }
 
@@ -481,11 +560,11 @@ func TestPlayerStatementModeWithFilter(t *testing.T) {
 	}
 
 	// It does not work when filter is enabled
-	output := []string{
+	output := qh.Expect(
 		"begin",
 		"rollback",
 		"/update _vt.vreplication set message='filter rules are not supported for SBR",
-	}
+	)
 
 	execStatements(t, input)
 	expectDBClientQueries(t, output)
@@ -525,12 +604,12 @@ func TestPlayerStatementMode(t *testing.T) {
 		"set @@session.binlog_format='ROW'",
 	}
 
-	output := []string{
+	output := qh.Expect(
 		"begin",
 		"insert into src1 values(1, 'aaa')",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	}
+	)
 
 	execStatements(t, input)
 	expectDBClientQueries(t, output)
@@ -616,19 +695,19 @@ func TestPlayerFilters(t *testing.T) {
 
 	testcases := []struct {
 		input  string
-		output []string
+		output qh.ExpectationSequence
 		table  string
 		data   [][]string
 		logs   []LogExpectation // logs are defined for a few testcases since they are enough to test all log events
 	}{{
 		// insert with insertNormal
 		input: "insert into src1 values(1, 'aaa')",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"insert into dst1(id,val) values (1,'aaa')",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "dst1",
 		data: [][]string{
 			{"1", "aaa"},
@@ -641,12 +720,12 @@ func TestPlayerFilters(t *testing.T) {
 	}, {
 		// update with insertNormal
 		input: "update src1 set val='bbb'",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"update dst1 set val='bbb' where id=1",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "dst1",
 		data: [][]string{
 			{"1", "bbb"},
@@ -658,12 +737,12 @@ func TestPlayerFilters(t *testing.T) {
 	}, {
 		// delete with insertNormal
 		input: "delete from src1 where id=1",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"delete from dst1 where id=1",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "dst1",
 		data:  [][]string{},
 		logs: []LogExpectation{
@@ -673,12 +752,12 @@ func TestPlayerFilters(t *testing.T) {
 	}, {
 		// insert with insertOnDup
 		input: "insert into src2 values(1, 2, 3)",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"insert into dst2(id,val1,sval2,rcount) values (1,2,ifnull(3, 0),1) on duplicate key update val1=values(val1), sval2=sval2+ifnull(values(sval2), 0), rcount=rcount+1",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "dst2",
 		data: [][]string{
 			{"1", "2", "3", "1"},
@@ -690,12 +769,12 @@ func TestPlayerFilters(t *testing.T) {
 	}, {
 		// update with insertOnDup
 		input: "update src2 set val1=5, val2=1 where id=1",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"update dst2 set val1=5, sval2=sval2-ifnull(3, 0)+ifnull(1, 0), rcount=rcount where id=1",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "dst2",
 		data: [][]string{
 			{"1", "5", "1", "1"},
@@ -707,12 +786,12 @@ func TestPlayerFilters(t *testing.T) {
 	}, {
 		// delete with insertOnDup
 		input: "delete from src2 where id=1",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"update dst2 set val1=null, sval2=sval2-ifnull(1, 0), rcount=rcount-1 where id=1",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "dst2",
 		data: [][]string{
 			{"1", "", "0", "0"},
@@ -720,12 +799,12 @@ func TestPlayerFilters(t *testing.T) {
 	}, {
 		// insert with insertIgnore
 		input: "insert into src3 values(1, 'aaa')",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"insert ignore into dst3(id,val) values (1,'aaa')",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "dst3",
 		data: [][]string{
 			{"1", "aaa"},
@@ -733,12 +812,12 @@ func TestPlayerFilters(t *testing.T) {
 	}, {
 		// update with insertIgnore
 		input: "update src3 set val='bbb'",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"insert ignore into dst3(id,val) values (1,'bbb')",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "dst3",
 		data: [][]string{
 			{"1", "aaa"},
@@ -746,11 +825,11 @@ func TestPlayerFilters(t *testing.T) {
 	}, {
 		// delete with insertIgnore
 		input: "delete from src3 where id=1",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "dst3",
 		data: [][]string{
 			{"1", "aaa"},
@@ -758,12 +837,12 @@ func TestPlayerFilters(t *testing.T) {
 	}, {
 		// insert: regular expression filter
 		input: "insert into yes values(1, 'aaa')",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"insert into yes(id,val) values (1,'aaa')",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "yes",
 		data: [][]string{
 			{"1", "aaa"},
@@ -771,12 +850,12 @@ func TestPlayerFilters(t *testing.T) {
 	}, {
 		// update: regular expression filter
 		input: "update yes set val='bbb'",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"update yes set val='bbb' where id=1",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "yes",
 		data: [][]string{
 			{"1", "bbb"},
@@ -784,16 +863,16 @@ func TestPlayerFilters(t *testing.T) {
 	}, {
 		// table should not match a rule
 		input:  "insert into no values(1, 'aaa')",
-		output: []string{},
+		output: qh.ExpectNone(),
 	}, {
 		// nopk: insert
 		input: "insert into nopk values(1, 'aaa')",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"insert into nopk(id,val) values (1,'aaa')",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "nopk",
 		data: [][]string{
 			{"1", "aaa"},
@@ -801,13 +880,13 @@ func TestPlayerFilters(t *testing.T) {
 	}, {
 		// nopk: update
 		input: "update nopk set val='bbb' where id=1",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"delete from nopk where id=1 and val='aaa'",
 			"insert into nopk(id,val) values (1,'bbb')",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "nopk",
 		data: [][]string{
 			{"1", "bbb"},
@@ -815,61 +894,63 @@ func TestPlayerFilters(t *testing.T) {
 	}, {
 		// nopk: delete
 		input: "delete from nopk where id=1",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"delete from nopk where id=1 and val='bbb'",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "nopk",
 		data:  [][]string{},
 	}, {
 		// filter by int
 		input: "insert into src4 values (1,100,'aaa'),(2,200,'bbb'),(3,100,'ccc')",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"insert into dst4(id1,val) values (1,'aaa')",
 			"insert into dst4(id1,val) values (3,'ccc')",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "dst4",
 		data:  [][]string{{"1", "aaa"}, {"3", "ccc"}},
 	}, {
 		// filter by int
 		input: "insert into src5 values (1,100,'abc'),(2,200,'xyz'),(3,100,'xyz'),(4,300,'abc'),(5,200,'xyz')",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"insert into dst5(id1,val) values (1,'abc')",
 			"insert into dst5(id1,val) values (4,'abc')",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "dst5",
 		data:  [][]string{{"1", "abc"}, {"4", "abc"}},
 	}, {
 		// test collation + filter
 		input: "insert into srcCharset values (1,'木元')",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"insert into dstCharset(id1,val,val2) values (1,concat(substr(_utf8mb4 '木元' collate utf8mb4_bin, 1, 1), 'abcxyz'),concat(substr(_utf8mb4 '木元' collate utf8mb4_bin, 1, 1), 'abcxyz'))",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "dstCharset",
 		data:  [][]string{{"1", "木abcxyz", "木abcxyz"}},
 	}}
 
 	for _, tcase := range testcases {
-		if tcase.logs != nil {
-			logch := vrLogStatsLogger.Subscribe("vrlogstats")
-			defer expectLogsAndUnsubscribe(t, tcase.logs, logch)
-		}
-		execStatements(t, []string{tcase.input})
-		expectDBClientQueries(t, tcase.output)
-		if tcase.table != "" {
-			expectData(t, tcase.table, tcase.data)
-		}
+		t.Run(tcase.input, func(t *testing.T) {
+			if tcase.logs != nil {
+				logch := vrLogStatsLogger.Subscribe("vrlogstats")
+				defer expectLogsAndUnsubscribe(t, tcase.logs, logch)
+			}
+			execStatements(t, []string{tcase.input})
+			expectDBClientQueries(t, tcase.output)
+			if tcase.table != "" {
+				expectData(t, tcase.table, tcase.data)
+			}
+		})
 	}
 }
 
@@ -919,122 +1000,122 @@ func TestPlayerKeywordNames(t *testing.T) {
 
 	testcases := []struct {
 		input  string
-		output []string
+		output qh.ExpectationSequence
 		table  string
 		data   [][]string
 	}{{
 		input: "insert into `begin` values(1, 'aaa')",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"insert into `begin`(`primary`,`column`) values (1,'aaa')",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "begin",
 		data: [][]string{
 			{"1", "aaa"},
 		},
 	}, {
 		input: "update `begin` set `column`='bbb'",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"update `begin` set `column`='bbb' where `primary`=1",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "begin",
 		data: [][]string{
 			{"1", "bbb"},
 		},
 	}, {
 		input: "delete from `begin` where `primary`=1",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"delete from `begin` where `primary`=1",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "begin",
 		data:  [][]string{},
 	}, {
 		input: "insert into `rollback` values(1, 'aaa')",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"insert into `rollback`(`primary`,`column`) values (1,'aaa')",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "rollback",
 		data: [][]string{
 			{"1", "aaa"},
 		},
 	}, {
 		input: "update `rollback` set `column`='bbb'",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"update `rollback` set `column`='bbb' where `primary`=1",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "rollback",
 		data: [][]string{
 			{"1", "bbb"},
 		},
 	}, {
 		input: "delete from `rollback` where `primary`=1",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"delete from `rollback` where `primary`=1",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "rollback",
 		data:  [][]string{},
 	}, {
 		input: "insert into `commit` values(1, 'aaa')",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"insert into `commit`(`primary`,`column`) values (1 + 1,concat('aaa', 'a'))",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "commit",
 		data: [][]string{
 			{"2", "aaaa"},
 		},
 	}, {
 		input: "update `commit` set `column`='bbb' where `primary`=1",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"update `commit` set `column`=concat('bbb', 'a') where `primary`=(1 + 1)",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "commit",
 		data: [][]string{
 			{"2", "bbba"},
 		},
 	}, {
 		input: "update `commit` set `primary`=2 where `primary`=1",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"delete from `commit` where `primary`=(1 + 1)",
 			"insert into `commit`(`primary`,`column`) values (2 + 1,concat('bbb', 'a'))",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "commit",
 		data: [][]string{
 			{"3", "bbba"},
 		},
 	}, {
 		input: "delete from `commit` where `primary`=2",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"delete from `commit` where `primary`=(2 + 1)",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "commit",
 		data:  [][]string{},
 	}}
@@ -1102,18 +1183,18 @@ func TestPlayerKeyspaceID(t *testing.T) {
 
 	testcases := []struct {
 		input  string
-		output []string
+		output qh.ExpectationSequence
 		table  string
 		data   [][]string
 	}{{
 		// insert with insertNormal
 		input: "insert into src1 values(1, 'aaa')",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			"insert into dst1(id,val) values (1,'\x16k@\xb4J\xbaK\xd6')",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "dst1",
 		data: [][]string{
 			{"1", "\x16k@\xb4J\xbaK\xd6"},
@@ -1159,19 +1240,19 @@ func TestUnicode(t *testing.T) {
 
 	testcases := []struct {
 		input  string
-		output []string
+		output qh.ExpectationSequence
 		table  string
 		data   [][]string
 	}{{
 		// insert with insertNormal
 		input: "insert into src1 values(1, '👍')",
-		output: []string{
+		output: qh.Expect(
 			"begin",
 			// We should expect the "Mojibaked" version.
 			"insert into dst1(id,val) values (1,'ðŸ‘\u008d')",
 			"/update _vt.vreplication set pos=",
 			"commit",
-		},
+		),
 		table: "dst1",
 		data: [][]string{
 			{"1", "👍"},
@@ -1297,18 +1378,18 @@ func TestPlayerUpdates(t *testing.T) {
 
 	for _, tcases := range testcases {
 		execStatements(t, []string{tcases.input})
-		output := []string{
+		output := qh.Expect(
 			"begin",
 			tcases.output,
 			"/update _vt.vreplication set pos=",
 			"commit",
-		}
+		)
 		if tcases.output == "" {
-			output = []string{
+			output = qh.Expect(
 				"begin",
 				"/update _vt.vreplication set pos=",
 				"commit",
-			}
+			)
 		}
 		expectDBClientQueries(t, output)
 		if tcases.table != "" {
@@ -1349,14 +1430,14 @@ func TestPlayerRowMove(t *testing.T) {
 	execStatements(t, []string{
 		"insert into src values(1, 1, 1), (2, 2, 2), (3, 2, 3)",
 	})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		"insert into dst(val1,sval2,rcount) values (1,ifnull(1, 0),1) on duplicate key update sval2=sval2+ifnull(values(sval2), 0), rcount=rcount+1",
 		"insert into dst(val1,sval2,rcount) values (2,ifnull(2, 0),1) on duplicate key update sval2=sval2+ifnull(values(sval2), 0), rcount=rcount+1",
 		"insert into dst(val1,sval2,rcount) values (2,ifnull(3, 0),1) on duplicate key update sval2=sval2+ifnull(values(sval2), 0), rcount=rcount+1",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	})
+	))
 	expectData(t, "dst", [][]string{
 		{"1", "1", "1"},
 		{"2", "5", "2"},
@@ -1366,13 +1447,13 @@ func TestPlayerRowMove(t *testing.T) {
 	execStatements(t, []string{
 		"update src set val1=1, val2=4 where id=3",
 	})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		"update dst set sval2=sval2-ifnull(3, 0), rcount=rcount-1 where val1=2",
 		"insert into dst(val1,sval2,rcount) values (1,ifnull(4, 0),1) on duplicate key update sval2=sval2+ifnull(values(sval2), 0), rcount=rcount+1",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	})
+	))
 	expectData(t, "dst", [][]string{
 		{"1", "5", "2"},
 		{"2", "2", "1"},
@@ -1381,19 +1462,7 @@ func TestPlayerRowMove(t *testing.T) {
 }
 
 func TestPlayerTypes(t *testing.T) {
-	log.Errorf("TestPlayerTypes: flavor is %s", env.Flavor)
-	enableJSONColumnTesting := false
-	flavor := strings.ToLower(env.Flavor)
-	// Disable tests on percona and mariadb platforms in CI since they
-	// either don't support JSON or JSON support is not enabled by default
-	if strings.Contains(flavor, "mysql57") || strings.Contains(flavor, "mysql80") {
-		log.Infof("Running JSON column type tests on flavor %s", flavor)
-		enableJSONColumnTesting = true
-	} else {
-		log.Warningf("Not running JSON column type tests on flavor %s", flavor)
-	}
 	defer deleteTablet(addTablet(100))
-
 	execStatements(t, []string{
 		"create table vitess_ints(tiny tinyint, tinyu tinyint unsigned, small smallint, smallu smallint unsigned, medium mediumint, mediumu mediumint unsigned, normal int, normalu int unsigned, big bigint, bigu bigint unsigned, y year, primary key(tiny))",
 		fmt.Sprintf("create table %s.vitess_ints(tiny tinyint, tinyu tinyint unsigned, small smallint, smallu smallint unsigned, medium mediumint, mediumu mediumint unsigned, normal int, normalu int unsigned, big bigint, bigu bigint unsigned, y year, primary key(tiny))", vrepldb),
@@ -1409,6 +1478,10 @@ func TestPlayerTypes(t *testing.T) {
 		fmt.Sprintf("create table %s.src1(id int, val varbinary(128), primary key(id))", vrepldb),
 		"create table binary_pk(b binary(4), val varbinary(4), primary key(b))",
 		fmt.Sprintf("create table %s.binary_pk(b binary(4), val varbinary(4), primary key(b))", vrepldb),
+		"create table vitess_decimal(id int, d1 decimal(8,0) default null, d2 decimal(8,0) default null, d3 decimal(8,0) default null, d4 decimal(8, 1), d5 decimal(8, 1), d6 decimal(8, 1), primary key(id))",
+		fmt.Sprintf("create table %s.vitess_decimal(id int, d1 decimal(8,0) default null, d2 decimal(8,0) default null, d3 decimal(8,0) default null, d4 decimal(8, 1), d5 decimal(8, 1), d6 decimal(8, 1), primary key(id))", vrepldb),
+		"create table vitess_json(id int auto_increment, val1 json, val2 json, val3 json, val4 json, val5 json, primary key(id))",
+		fmt.Sprintf("create table %s.vitess_json(id int, val1 json, val2 json, val3 json, val4 json, val5 json, primary key(id))", vrepldb),
 	})
 	defer execStatements(t, []string{
 		"drop table vitess_ints",
@@ -1425,18 +1498,12 @@ func TestPlayerTypes(t *testing.T) {
 		fmt.Sprintf("drop table %s.src1", vrepldb),
 		"drop table binary_pk",
 		fmt.Sprintf("drop table %s.binary_pk", vrepldb),
+		"drop table vitess_decimal",
+		fmt.Sprintf("drop table %s.vitess_decimal", vrepldb),
+		"drop table vitess_json",
+		fmt.Sprintf("drop table %s.vitess_json", vrepldb),
 	})
-	if enableJSONColumnTesting {
-		execStatements(t, []string{
-			"create table vitess_json(id int auto_increment, val1 json, val2 json, val3 json, val4 json, val5 json, primary key(id))",
-			fmt.Sprintf("create table %s.vitess_json(id int, val1 json, val2 json, val3 json, val4 json, val5 json, primary key(id))", vrepldb),
-		})
-		defer execStatements(t, []string{
-			"drop table vitess_json",
-			fmt.Sprintf("drop table %s.vitess_json", vrepldb),
-		})
 
-	}
 	env.SchemaEngine.Reload(context.Background())
 
 	filter := &binlogdatapb.Filter{
@@ -1501,6 +1568,13 @@ func TestPlayerTypes(t *testing.T) {
 			{"a\000\000\000", "aaa"},
 		},
 	}, {
+		input:  "insert into vitess_decimal values(1, 0, 1, null, 0, 1.1, 1)",
+		output: "insert into vitess_decimal(id,d1,d2,d3,d4,d5,d6) values (1,0,1,null,.0,1.1,1.0)",
+		table:  "vitess_decimal",
+		data: [][]string{
+			{"1", "0", "1", "", "0.0", "1.1", "1.0"},
+		},
+	}, {
 		// Binary pk is a special case: https://github.com/vitessio/vitess/issues/3984
 		input:  "update binary_pk set val='bbb' where b='a\\0\\0\\0'",
 		output: "update binary_pk set val='bbb' where b='a\\0\\0\\0'",
@@ -1508,36 +1582,30 @@ func TestPlayerTypes(t *testing.T) {
 		data: [][]string{
 			{"a\000\000\000", "bbb"},
 		},
+	}, {
+		input:  "insert into vitess_json(val1,val2,val3,val4,val5) values (null,'{}','123','{\"a\":[42,100]}','{\"foo\": \"bar\"}')",
+		output: "insert into vitess_json(id,val1,val2,val3,val4,val5) values (1,CAST(null as JSON),JSON_OBJECT(),CAST(123 as JSON),JSON_OBJECT(_utf8mb4'a', JSON_ARRAY(42, 100)),JSON_OBJECT(_utf8mb4'foo', _utf8mb4'bar'))",
+		table:  "vitess_json",
+		data: [][]string{
+			{"1", "", "{}", "123", `{"a": [42, 100]}`, `{"foo": "bar"}`},
+		},
+	}, {
+		input:  "update vitess_json set val1 = '{\"bar\": \"foo\"}', val4 = '{\"a\": [98, 123]}', val5 = convert(x'7b7d' using utf8mb4)",
+		output: "update vitess_json set val1=JSON_OBJECT(_utf8mb4'bar', _utf8mb4'foo'), val2=JSON_OBJECT(), val3=CAST(123 as JSON), val4=JSON_OBJECT(_utf8mb4'a', JSON_ARRAY(98, 123)), val5=JSON_OBJECT() where id=1",
+		table:  "vitess_json",
+		data: [][]string{
+			{"1", `{"bar": "foo"}`, "{}", "123", `{"a": [98, 123]}`, `{}`},
+		},
 	}}
-	if enableJSONColumnTesting {
-		testcases = append(testcases, testcase{
-			input: "insert into vitess_json(val1,val2,val3,val4,val5) values (null,'{}','123','{\"a\":[42,100]}', '{\"foo\":\"bar\"}')",
-			output: "insert into vitess_json(id,val1,val2,val3,val4,val5) values (1," +
-				"convert(null using utf8mb4)," + "convert('{}' using utf8mb4)," + "convert('123' using utf8mb4)," +
-				"convert('{\\\"a\\\":[42,100]}' using utf8mb4)," + "convert('{\\\"foo\\\":\\\"bar\\\"}' using utf8mb4))",
-			table: "vitess_json",
-			data: [][]string{
-				{"1", "", "{}", "123", `{"a": [42, 100]}`, `{"foo": "bar"}`},
-			},
-		})
-		testcases = append(testcases, testcase{
-			input:  "update vitess_json set val4 = '{\"a\": [98, 123]}', val5 = convert(x'7b7d' using utf8mb4)",
-			output: "update vitess_json set val1=convert(null using utf8mb4), val2=convert('{}' using utf8mb4), val3=convert('123' using utf8mb4), val4=convert('{\\\"a\\\":[98,123]}' using utf8mb4), val5=convert('{}' using utf8mb4) where id=1",
-			table:  "vitess_json",
-			data: [][]string{
-				{"1", "", "{}", "123", `{"a": [98, 123]}`, `{}`},
-			},
-		})
-	}
 
 	for _, tcases := range testcases {
 		execStatements(t, []string{tcases.input})
-		want := []string{
+		want := qh.Expect(
 			"begin",
 			tcases.output,
 			"/update _vt.vreplication set pos=",
 			"commit",
-		}
+		)
 		expectDBClientQueries(t, want)
 		if tcases.table != "" {
 			expectData(t, tcases.table, tcases.data)
@@ -1574,19 +1642,19 @@ func TestPlayerDDL(t *testing.T) {
 	// Root cause seems to be with MySQL where t1 shows up in information_schema before
 	// the actual table is created.
 	execStatements(t, []string{"insert into t1 values(1)"})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		"insert into t1(id) values (1)",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	})
+	))
 
 	execStatements(t, []string{"alter table t1 add column val varchar(128)"})
 	execStatements(t, []string{"alter table t1 drop column val"})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"/update _vt.vreplication set pos=",
 		"/update _vt.vreplication set pos=",
-	})
+	))
 	cancel()
 	bls = &binlogdatapb.BinlogSource{
 		Keyspace: env.KeyspaceName,
@@ -1599,12 +1667,12 @@ func TestPlayerDDL(t *testing.T) {
 	execStatements(t, []string{"alter table t1 add column val varchar(128)"})
 	pos1 := primaryPosition(t)
 	// The stop position must be the GTID of the first DDL
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		fmt.Sprintf("/update _vt.vreplication set pos='%s'", pos1),
 		"/update _vt.vreplication set state='Stopped'",
 		"commit",
-	})
+	))
 	pos2b := primaryPosition(t)
 	execStatements(t, []string{"alter table t1 drop column val"})
 	pos2 := primaryPosition(t)
@@ -1615,7 +1683,7 @@ func TestPlayerDDL(t *testing.T) {
 		t.Fatal(err)
 	}
 	// It should stop at the next DDL
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"/update.*'Running'",
 		// Second update is from vreplicator.
 		"/update _vt.vreplication set message='Picked source tablet.*",
@@ -1624,7 +1692,7 @@ func TestPlayerDDL(t *testing.T) {
 		fmt.Sprintf("/update.*'%s'", pos2),
 		"/update _vt.vreplication set state='Stopped'",
 		"commit",
-	})
+	))
 	cancel()
 	bls = &binlogdatapb.BinlogSource{
 		Keyspace: env.KeyspaceName,
@@ -1635,17 +1703,18 @@ func TestPlayerDDL(t *testing.T) {
 	execStatements(t, []string{fmt.Sprintf("alter table %s.t1 add column val2 varchar(128)", vrepldb)})
 	cancel, _ = startVReplication(t, bls, "")
 	execStatements(t, []string{"alter table t1 add column val1 varchar(128)"})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"alter table t1 add column val1 varchar(128)",
 		"/update _vt.vreplication set pos=",
 		// The apply of the DDL on target generates an "other" event.
 		"/update _vt.vreplication set pos=",
-	})
+	))
 	execStatements(t, []string{"alter table t1 add column val2 varchar(128)"})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"alter table t1 add column val2 varchar(128)",
 		"/update _vt.vreplication set message='Duplicate",
-	})
+		"/update _vt.vreplication set state='Error', message='Duplicate",
+	))
 	cancel()
 
 	execStatements(t, []string{
@@ -1661,19 +1730,21 @@ func TestPlayerDDL(t *testing.T) {
 		OnDdl:    binlogdatapb.OnDDLAction_EXEC_IGNORE,
 	}
 	execStatements(t, []string{fmt.Sprintf("create table %s.t2(id int, primary key(id))", vrepldb)})
+	defer execStatements(t, []string{fmt.Sprintf("drop table %s.t2", vrepldb)})
+
 	cancel, _ = startVReplication(t, bls, "")
 	execStatements(t, []string{"alter table t1 add column val1 varchar(128)"})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"alter table t1 add column val1 varchar(128)",
 		"/update _vt.vreplication set pos=",
 		// The apply of the DDL on target generates an "other" event.
 		"/update _vt.vreplication set pos=",
-	})
+	))
 	execStatements(t, []string{"alter table t1 add column val2 varchar(128)"})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"alter table t1 add column val2 varchar(128)",
 		"/update _vt.vreplication set pos=",
-	})
+	))
 	cancel()
 }
 
@@ -1729,9 +1800,9 @@ func TestGTIDCompress(t *testing.T) {
 
 func TestPlayerStopPos(t *testing.T) {
 	defer deleteTablet(addTablet(100))
-	*vreplicationStoreCompressedGTID = true
+	vreplicationStoreCompressedGTID = true
 	defer func() {
-		*vreplicationStoreCompressedGTID = false
+		vreplicationStoreCompressedGTID = false
 	}()
 	execStatements(t, []string{
 		"create table yes(id int, val varbinary(128), primary key(id))",
@@ -1757,12 +1828,12 @@ func TestPlayerStopPos(t *testing.T) {
 		OnDdl:    binlogdatapb.OnDDLAction_IGNORE,
 	}
 	startPos := primaryPosition(t)
-	query := binlogplayer.CreateVReplicationState("test", bls, startPos, binlogplayer.BlpStopped, vrepldb)
+	query := binlogplayer.CreateVReplicationState("test", bls, startPos, binlogplayer.BlpStopped, vrepldb, 0, 0)
 	qr, err := playerEngine.Exec(query)
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := uint32(qr.InsertID)
+	id := int32(qr.InsertID)
 	for q := range globalDBQueries {
 		if strings.HasPrefix(q, "insert into _vt.vreplication") {
 			break
@@ -1778,7 +1849,7 @@ func TestPlayerStopPos(t *testing.T) {
 	if _, err := playerEngine.Exec(query); err != nil {
 		t.Fatal(err)
 	}
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"/update.*'Running'",
 		// Second update is from vreplicator.
 		"/update _vt.vreplication set message='Picked source tablet.*",
@@ -1788,7 +1859,7 @@ func TestPlayerStopPos(t *testing.T) {
 		fmt.Sprintf("/update.*compress.*'%s'", stopPos),
 		"/update.*'Stopped'",
 		"commit",
-	})
+	))
 
 	// Test stopping at empty transaction.
 	execStatements(t, []string{
@@ -1803,7 +1874,7 @@ func TestPlayerStopPos(t *testing.T) {
 	if _, err := playerEngine.Exec(query); err != nil {
 		t.Fatal(err)
 	}
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"/update.*'Running'",
 		// Second update is from vreplicator.
 		"/update _vt.vreplication set message='Picked source tablet.*",
@@ -1814,20 +1885,20 @@ func TestPlayerStopPos(t *testing.T) {
 		fmt.Sprintf("/update.*'%s'", stopPos),
 		"/update.*'Stopped'",
 		"commit",
-	})
+	))
 
 	// Test stopping when position is already reached.
 	query = binlogplayer.StartVReplicationUntil(id, stopPos)
 	if _, err := playerEngine.Exec(query); err != nil {
 		t.Fatal(err)
 	}
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"/update.*'Running'",
 		// Second update is from vreplicator.
 		"/update _vt.vreplication set message='Picked source tablet.*",
 		"/update.*'Running'",
 		"/update.*'Stopped'.*already reached",
-	})
+	))
 }
 
 func TestPlayerStopAtOther(t *testing.T) {
@@ -1861,12 +1932,12 @@ func TestPlayerStopAtOther(t *testing.T) {
 		Filter:   filter,
 		OnDdl:    binlogdatapb.OnDDLAction_IGNORE,
 	}
-	query := binlogplayer.CreateVReplicationState("test", bls, startPos, binlogplayer.BlpStopped, vrepldb)
+	query := binlogplayer.CreateVReplicationState("test", bls, startPos, binlogplayer.BlpStopped, vrepldb, 0, 0)
 	qr, err := playerEngine.Exec(query)
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := uint32(qr.InsertID)
+	id := int32(qr.InsertID)
 	for q := range globalDBQueries {
 		if strings.HasPrefix(q, "insert into _vt.vreplication") {
 			break
@@ -1913,19 +1984,19 @@ func TestPlayerStopAtOther(t *testing.T) {
 	}
 
 	// Wait for the begin. The update will be blocked.
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"/update.*'Running'",
 		// Second update is from vreplicator.
 		"/update.*'Running'",
 		"begin",
-	})
+	))
 
 	// Give time for the other two transactions to reach the relay log.
 	time.Sleep(100 * time.Millisecond)
 	_, _ = vconn.ExecuteFetch("rollback", 1)
 
 	// This is approximately the expected sequence of updates.
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"update t1 set val='ccc' where id=1",
 		"/update _vt.vreplication set pos=",
 		"commit",
@@ -1935,7 +2006,7 @@ func TestPlayerStopAtOther(t *testing.T) {
 		"commit",
 		fmt.Sprintf("/update _vt.vreplication set pos='%s'", stopPos),
 		"/update.*'Stopped'",
-	})
+	))
 }
 
 func TestPlayerIdleUpdate(t *testing.T) {
@@ -1973,12 +2044,12 @@ func TestPlayerIdleUpdate(t *testing.T) {
 		"insert into t1 values(1, 'aaa')",
 	})
 	start := time.Now()
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		"insert into t1(id,val) values (1,'aaa')",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	},
+	),
 		"/update _vt.vreplication set pos=",
 	)
 	// The above write will generate a new binlog event, and
@@ -1986,9 +2057,9 @@ func TestPlayerIdleUpdate(t *testing.T) {
 	// But it must not get saved until idleTimeout has passed.
 	// The exact positions are hard to verify because of this
 	// loopback mechanism.
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"/update _vt.vreplication set pos=",
-	})
+	))
 	if duration := time.Since(start); duration < idleTimeout {
 		t.Errorf("duration: %v, must be at least %v", duration, idleTimeout)
 	}
@@ -1996,8 +2067,8 @@ func TestPlayerIdleUpdate(t *testing.T) {
 
 func TestPlayerSplitTransaction(t *testing.T) {
 	defer deleteTablet(addTablet(100))
-	flag.Set("vstream_packet_size", "10")
-	defer flag.Set("vstream_packet_size", "10000")
+	setFlag("vstream_packet_size", "10")
+	defer setFlag("vstream_packet_size", "10000")
 
 	execStatements(t, []string{
 		"create table t1(id int, val varbinary(128), primary key(id))",
@@ -2031,13 +2102,13 @@ func TestPlayerSplitTransaction(t *testing.T) {
 	})
 	// Because the packet size is 10, this is received as two events,
 	// but still combined as one transaction.
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		"insert into t1(id,val) values (1,'123456')",
 		"insert into t1(id,val) values (2,'789012')",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	})
+	))
 }
 
 func TestPlayerLockErrors(t *testing.T) {
@@ -2073,13 +2144,13 @@ func TestPlayerLockErrors(t *testing.T) {
 		"insert into t1 values(2, 'bbb')",
 		"commit",
 	})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		"insert into t1(id,val) values (1,'aaa')",
 		"insert into t1(id,val) values (2,'bbb')",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	})
+	))
 
 	vconn := &realDBClient{nolog: true}
 	if err := vconn.Connect(); err != nil {
@@ -2102,22 +2173,22 @@ func TestPlayerLockErrors(t *testing.T) {
 		"commit",
 	})
 	// The innodb lock wait timeout is set to 1s.
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		"update t1 set val='ccc' where id=1",
 		"update t1 set val='ccc' where id=2",
 		"rollback",
-	})
+	))
 
 	// Release the lock, and watch the retry go through.
 	_, _ = vconn.ExecuteFetch("rollback", 1)
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		"update t1 set val='ccc' where id=1",
 		"update t1 set val='ccc' where id=2",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	})
+	))
 }
 
 func TestPlayerCancelOnLock(t *testing.T) {
@@ -2152,12 +2223,12 @@ func TestPlayerCancelOnLock(t *testing.T) {
 		"insert into t1 values(1, 'aaa')",
 		"commit",
 	})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		"insert into t1(id,val) values (1,'aaa')",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	})
+	))
 
 	vconn := &realDBClient{nolog: true}
 	if err := vconn.Connect(); err != nil {
@@ -2179,11 +2250,11 @@ func TestPlayerCancelOnLock(t *testing.T) {
 		"commit",
 	})
 	// The innodb lock wait timeout is set to 1s.
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		"update t1 set val='ccc' where id=1",
 		"rollback",
-	})
+	))
 
 	// VReplication should not get stuck if you cancel now.
 	done := make(chan bool)
@@ -2228,12 +2299,12 @@ func TestPlayerBatching(t *testing.T) {
 	execStatements(t, []string{
 		"insert into t1 values(1, 'aaa')",
 	})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		"insert into t1(id,val) values (1,'aaa')",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	})
+	))
 
 	vconn := &realDBClient{nolog: true}
 	if err := vconn.Connect(); err != nil {
@@ -2254,9 +2325,9 @@ func TestPlayerBatching(t *testing.T) {
 		"update t1 set val='ccc' where id=1",
 	})
 	// Wait for the begin. The update will be blocked.
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
-	})
+	))
 
 	// Create two more transactions. They will go and wait in the relayLog.
 	execStatements(t, []string{
@@ -2271,7 +2342,7 @@ func TestPlayerBatching(t *testing.T) {
 	// First transaction will complete. The other two
 	// transactions must be batched into one. But the
 	// DDLs should be on their own.
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"update t1 set val='ccc' where id=1",
 		"/update _vt.vreplication set pos=",
 		"commit",
@@ -2287,7 +2358,7 @@ func TestPlayerBatching(t *testing.T) {
 		// The apply of the DDLs on target generates two "other" event.
 		"/update _vt.vreplication set pos=",
 		"/update _vt.vreplication set pos=",
-	})
+	))
 }
 
 func TestPlayerRelayLogMaxSize(t *testing.T) {
@@ -2300,11 +2371,11 @@ func TestPlayerRelayLogMaxSize(t *testing.T) {
 			case 0:
 				savedSize := relayLogMaxSize
 				defer func() { relayLogMaxSize = savedSize }()
-				*relayLogMaxSize = 10
+				relayLogMaxSize = 10
 			case 1:
 				savedLen := relayLogMaxItems
 				defer func() { relayLogMaxItems = savedLen }()
-				*relayLogMaxItems = 2
+				relayLogMaxItems = 2
 			}
 
 			execStatements(t, []string{
@@ -2334,12 +2405,12 @@ func TestPlayerRelayLogMaxSize(t *testing.T) {
 			execStatements(t, []string{
 				"insert into t1 values(1, '123456')",
 			})
-			expectDBClientQueries(t, []string{
+			expectDBClientQueries(t, qh.Expect(
 				"begin",
 				"insert into t1(id,val) values (1,'123456')",
 				"/update _vt.vreplication set pos=",
 				"commit",
-			})
+			))
 
 			vconn := &realDBClient{nolog: true}
 			if err := vconn.Connect(); err != nil {
@@ -2360,9 +2431,9 @@ func TestPlayerRelayLogMaxSize(t *testing.T) {
 				"update t1 set val='ccc' where id=1",
 			})
 			// Wait for the begin. The update will be blocked.
-			expectDBClientQueries(t, []string{
+			expectDBClientQueries(t, qh.Expect(
 				"begin",
-			})
+			))
 
 			// Create two more transactions. They will go and wait in the relayLog.
 			execStatements(t, []string{
@@ -2377,7 +2448,7 @@ func TestPlayerRelayLogMaxSize(t *testing.T) {
 			// transactions must be batched into one. The last transaction
 			// will wait to be sent to the relay until the player fetches
 			// them.
-			expectDBClientQueries(t, []string{
+			expectDBClientQueries(t, qh.Expect(
 				"update t1 set val='ccc' where id=1",
 				"/update _vt.vreplication set pos=",
 				"commit",
@@ -2390,7 +2461,7 @@ func TestPlayerRelayLogMaxSize(t *testing.T) {
 				"insert into t1(id,val) values (4,'901234')",
 				"/update _vt.vreplication set pos=",
 				"commit",
-			})
+			))
 		}()
 	}
 }
@@ -2398,9 +2469,9 @@ func TestPlayerRelayLogMaxSize(t *testing.T) {
 func TestRestartOnVStreamEnd(t *testing.T) {
 	defer deleteTablet(addTablet(100))
 
-	savedDelay := *retryDelay
-	defer func() { *retryDelay = savedDelay }()
-	*retryDelay = 1 * time.Millisecond
+	savedDelay := retryDelay
+	defer func() { retryDelay = savedDelay }()
+	retryDelay = 1 * time.Millisecond
 
 	execStatements(t, []string{
 		"create table t1(id int, val varbinary(128), primary key(id))",
@@ -2429,30 +2500,29 @@ func TestRestartOnVStreamEnd(t *testing.T) {
 	execStatements(t, []string{
 		"insert into t1 values(1, 'aaa')",
 	})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		"insert into t1(id,val) values (1,'aaa')",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	})
+	))
 
 	streamerEngine.Close()
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"/update _vt.vreplication set message='vstream ended'",
-	})
+	))
 	streamerEngine.Open()
-
 	execStatements(t, []string{
 		"insert into t1 values(2, 'aaa')",
 	})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"/update _vt.vreplication set message='Picked source tablet.*",
 		"/update _vt.vreplication set state='Running'",
 		"begin",
 		"insert into t1(id,val) values (2,'aaa')",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	})
+	))
 }
 
 func TestTimestamp(t *testing.T) {
@@ -2493,40 +2563,21 @@ func TestTimestamp(t *testing.T) {
 	execStatements(t, []string{
 		fmt.Sprintf("insert into t1 values(1, '%s', '%s')", want, want),
 	})
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
 		// The insert value for ts will be in UTC.
 		// We'll check the row instead.
 		"/insert into t1",
 		"/update _vt.vreplication set pos=",
 		"commit",
-	})
+	))
 
 	expectData(t, "t1", [][]string{{"1", want, want}})
-}
-
-func shouldRunJSONTests(t *testing.T, name string) bool {
-	skipTest := true
-	flavors := []string{"mysql80", "mysql57"}
-	for _, flavor := range flavors {
-		if strings.EqualFold(env.Flavor, flavor) {
-			skipTest = false
-			break
-		}
-	}
-	if skipTest {
-		t.Logf("not running %s on %s", name, env.Flavor)
-		return false
-	}
-	return true
 }
 
 // TestPlayerJSONDocs validates more complex and 'large' json docs. It only validates that the data on target matches that on source.
 // TestPlayerTypes, above, also verifies the sql queries applied on the target.
 func TestPlayerJSONDocs(t *testing.T) {
-	if !shouldRunJSONTests(t, "TestPlayerJSONDocs") {
-		return
-	}
 	defer deleteTablet(addTablet(100))
 
 	execStatements(t, []string{
@@ -2589,12 +2640,12 @@ func TestPlayerJSONDocs(t *testing.T) {
 		t.Run(tcase.name, func(t *testing.T) {
 			id++
 			execStatements(t, []string{tcase.input})
-			want := []string{
+			want := qh.Expect(
 				"begin",
 				"/insert into vitess_json",
 				"/update _vt.vreplication set pos=",
 				"commit",
-			}
+			)
 			expectDBClientQueries(t, want)
 			expectJSON(t, "vitess_json", tcase.data, id, env.Mysqld.FetchSuperQuery)
 		})
@@ -2603,9 +2654,6 @@ func TestPlayerJSONDocs(t *testing.T) {
 
 // TestPlayerJSONTwoColumns tests for two json columns in a table
 func TestPlayerJSONTwoColumns(t *testing.T) {
-	if !shouldRunJSONTests(t, "TestPlayerJSONTwoColumns") {
-		return
-	}
 	defer deleteTablet(addTablet(100))
 	execStatements(t, []string{
 		"create table vitess_json2(id int auto_increment, val json, val2 json, primary key(id))",
@@ -2656,12 +2704,12 @@ func TestPlayerJSONTwoColumns(t *testing.T) {
 		t.Run(tcase.name, func(t *testing.T) {
 			id++
 			execStatements(t, []string{tcase.input})
-			want := []string{
+			want := qh.Expect(
 				"begin",
 				"/insert into vitess_json2",
 				"/update _vt.vreplication set pos=",
 				"commit",
-			}
+			)
 			expectDBClientQueries(t, want)
 			expectJSON(t, "vitess_json2", tcase.data, id, env.Mysqld.FetchSuperQuery)
 		})
@@ -2696,12 +2744,6 @@ func TestVReplicationLogs(t *testing.T) {
 }
 
 func TestGeneratedColumns(t *testing.T) {
-	flavor := strings.ToLower(env.Flavor)
-	// Disable tests on percona (which identifies as mysql56) and mariadb platforms in CI since they
-	// generated columns support was added in 5.7 and mariadb added mysql compatible generated columns in 10.2
-	if !strings.Contains(flavor, "mysql57") && !strings.Contains(flavor, "mysql80") {
-		return
-	}
 	defer deleteTablet(addTablet(100))
 
 	execStatements(t, []string{
@@ -2770,12 +2812,9 @@ func TestGeneratedColumns(t *testing.T) {
 			{"1", "bbb1", "bbb", "11"},
 		},
 	}}
-
 	for _, tcases := range testcases {
 		execStatements(t, []string{tcases.input})
-		output := []string{
-			tcases.output,
-		}
+		output := qh.Expect(tcases.output)
 		expectNontxQueries(t, output)
 		if tcases.table != "" {
 			expectData(t, tcases.table, tcases.data)
@@ -2846,18 +2885,162 @@ func TestPlayerInvalidDates(t *testing.T) {
 
 	for _, tcases := range testcases {
 		execStatements(t, []string{tcases.input})
-		output := []string{
-			tcases.output,
-		}
+		output := qh.Expect(tcases.output)
 		expectNontxQueries(t, output)
 
 		if tcases.table != "" {
-			// without the sleep there is a flakiness where row inserted by vreplication is not visible to vdbclient
-			time.Sleep(100 * time.Millisecond)
 			expectData(t, tcases.table, tcases.data)
 		}
 	}
 }
+
+// TestPlayerNoBlob sets up a new environment with mysql running with binlog_row_image as noblob. It creates DMLs for
+// tables with blob and text columns and executes DMLs with different combinations of columns with and without
+// blob/text columns. It confirms that we handle the partial images sent by vstreamer and generates the correct
+// dmls on the target.
+func TestPlayerNoBlob(t *testing.T) {
+	if !runNoBlobTest {
+		t.Skip()
+	}
+	oldVreplicationExperimentalFlags := vttablet.VReplicationExperimentalFlags
+	vttablet.VReplicationExperimentalFlags = vttablet.VReplicationExperimentalFlagAllowNoBlobBinlogRowImage
+	defer func() {
+		vttablet.VReplicationExperimentalFlags = oldVreplicationExperimentalFlags
+	}()
+
+	defer deleteTablet(addTablet(100))
+	execStatements(t, []string{
+		"create table t1(id int, val1 varchar(20), blb1 blob, id2 int, blb2 longblob, val2 varbinary(10), primary key(id))",
+		fmt.Sprintf("create table %s.t1(id int, val1 varchar(20), blb1 blob, id2 int, blb2 longblob, val2 varbinary(10), primary key(id))", vrepldb),
+		"create table t2(id int, val1 varchar(20), txt1 text, id2 int, val2 varbinary(10), unique key(id, val1))",
+		fmt.Sprintf("create table %s.t2(id int, val1 varchar(20), txt1 text, id2 int, val2 varbinary(10), primary key(id, val1))", vrepldb),
+	})
+	defer execStatements(t, []string{
+		"drop table t1",
+		fmt.Sprintf("drop table %s.t1", vrepldb),
+		"drop table t2",
+		fmt.Sprintf("drop table %s.t2", vrepldb),
+	})
+	env.SchemaEngine.Reload(context.Background())
+
+	filter := &binlogdatapb.Filter{
+		Rules: []*binlogdatapb.Rule{{
+			Match:  "t1",
+			Filter: "select * from t1",
+		}, {
+			Match:  "t2",
+			Filter: "select * from t2",
+		}},
+	}
+	bls := &binlogdatapb.BinlogSource{
+		Keyspace: env.KeyspaceName,
+		Shard:    env.ShardName,
+		Filter:   filter,
+		OnDdl:    binlogdatapb.OnDDLAction_IGNORE,
+	}
+	cancel, vrId := startVReplication(t, bls, "")
+	defer cancel()
+
+	testcases := []struct {
+		input  string
+		output string
+		table  string
+		data   [][]string
+	}{{ // 1. PartialQueryTemplate-Insert=1, PartialQueryCount-Insert=1 (blb1,blb2 are not inserted)
+		input:  "insert into t1(id,val1,blb1,id2,val2) values (1,'aaa','blb1',10,'AAA')",
+		output: "insert into t1(id,val1,blb1,id2,val2) values (1,'aaa','blb1',10,'AAA')",
+		table:  "t1",
+		data: [][]string{
+			{"1", "aaa", "blb1", "10", "", "AAA"},
+		},
+	}, { // 2. PartialQueryTemplate-Update=1, PartialQueryCount-Update=1 (blb1 is not updated)
+		input:  "update t1 set blb2 = 'blb22' where id = 1",
+		output: "update t1 set val1='aaa', id2=10, blb2='blb22', val2='AAA' where id=1",
+		table:  "t1",
+		data: [][]string{
+			{"1", "aaa", "blb1", "10", "blb22", "AAA"},
+		},
+	}, { // 3. PartialQueryTemplate-Update=2, PartialQueryCount-Update=2 (blb1 and blb2 are not updated)
+		input:  "update t1 set val1 = 'bbb' where id = 1",
+		output: "update t1 set val1='bbb', id2=10, val2='AAA' where id=1",
+		table:  "t1",
+		data: [][]string{
+			{"1", "bbb", "blb1", "10", "blb22", "AAA"},
+		},
+	}, { // 4. PartialQueryTemplate-Update=2, PartialQueryCount-Update=3 (blb1 and blb2 are not updated, same #3)
+		input:  "update t1 set val2 = 'CCC', id2=99 where id = 1",
+		output: "update t1 set val1='bbb', id2=99, val2='CCC' where id=1",
+		table:  "t1",
+		data: [][]string{
+			{"1", "bbb", "blb1", "99", "blb22", "CCC"},
+		},
+	}, { // 5. PartialQueryTemplate-Update=2, PartialQueryCount-Update=4 (blb1 is not updated, same as #1)
+		input:  "update t1 set blb2 = 'blb21' where id = 1",
+		output: "update t1 set val1='bbb', id2=99, blb2='blb21', val2='CCC' where id=1",
+
+		table: "t1",
+		data: [][]string{
+			{"1", "bbb", "blb1", "99", "blb21", "CCC"},
+		},
+	}, { // 6. Not a partial update
+		input:  "update t1 set blb2 = 'blb222', blb1 = 'blb11' where id = 1",
+		output: "update t1 set val1='bbb', blb1='blb11', id2=99, blb2='blb222', val2='CCC' where id=1",
+		table:  "t1",
+		data: [][]string{
+			{"1", "bbb", "blb11", "99", "blb222", "CCC"},
+		},
+	}, { // 7. PartialQueryTemplate-Insert=2, PartialQueryCount-Insert=2 (txt1 is not inserted)
+		input:  "insert into t2(id,val1,id2,val2) values (1,'aaa',10,'AAA')",
+		output: "insert into t2(id,val1,id2,val2) values (1,'aaa',10,'AAA')",
+		table:  "t2",
+		data: [][]string{
+			{"1", "aaa", "", "10", "AAA"},
+		},
+	}, { // 7. PartialQueryTemplate-Insert=2, PartialQueryCount-Insert=3 (txt1 is not inserted, same as #7)
+		input:  "insert into t2(id,val1,id2,val2) values (1,'bbb',20,'BBB')",
+		output: "insert into t2(id,val1,id2,val2) values (1,'bbb',20,'BBB')",
+		table:  "t2",
+		data: [][]string{
+			{"1", "aaa", "", "10", "AAA"},
+			{"1", "bbb", "", "20", "BBB"},
+		},
+	}, { // 8. Not a partial update, all columns are present
+		input:  "update t2 set txt1 = 'txt1' where id = 1 and val1 = 'aaa'",
+		output: "update t2 set txt1='txt1', id2=10, val2='AAA' where id=1 and val1='aaa'",
+		table:  "t2",
+		data: [][]string{
+			{"1", "aaa", "txt1", "10", "AAA"},
+			{"1", "bbb", "", "20", "BBB"},
+		},
+	}, { // 9. Not a partial update, all columns are present, same as #8
+		input:  "update t2 set val2 = 'DDD', txt1 = 'txt2' where id = 1 and val1 = 'bbb'",
+		output: "update t2 set txt1='txt2', id2=20, val2='DDD' where id=1 and val1='bbb'",
+		table:  "t2",
+		data: [][]string{
+			{"1", "aaa", "txt1", "10", "AAA"},
+			{"1", "bbb", "txt2", "20", "DDD"},
+		},
+	}}
+
+	for _, tcases := range testcases {
+		execStatements(t, []string{tcases.input})
+		output := qh.Expect(tcases.output)
+		expectNontxQueries(t, output)
+		time.Sleep(1 * time.Second)
+		log.Flush()
+		if tcases.table != "" {
+			expectData(t, tcases.table, tcases.data)
+		}
+	}
+	stats := globalStats.controllers[int32(vrId)].blpStats
+	require.Equal(t, 2, len(stats.PartialQueryCount.Counts()))
+	require.Equal(t, 2, len(stats.PartialQueryCacheSize.Counts()))
+	require.Equal(t, int64(2), stats.PartialQueryCacheSize.Counts()["insert"])
+	require.Equal(t, int64(3), stats.PartialQueryCount.Counts()["insert"])
+	require.Equal(t, int64(2), stats.PartialQueryCacheSize.Counts()["update"])
+	require.Equal(t, int64(4), stats.PartialQueryCount.Counts()["update"])
+}
+
 func expectJSON(t *testing.T, table string, values [][]string, id int, exec func(ctx context.Context, query string) (*sqltypes.Result, error)) {
 	t.Helper()
 
@@ -2882,13 +3065,12 @@ func expectJSON(t *testing.T, table string, values [][]string, id int, exec func
 		if qr.Rows[i][0].ToString() != row[0] {
 			t.Fatalf("Id mismatch: want %s, got %s", qr.Rows[i][0].ToString(), row[0])
 		}
-		got, err := ajson.Unmarshal([]byte(qr.Rows[i][1].ToString()))
-		require.NoError(t, err)
-		want, err := ajson.Unmarshal([]byte(row[1]))
-		require.NoError(t, err)
-		match, err := got.Eq(want)
-		require.NoError(t, err)
-		require.True(t, match)
+
+		opts := jsondiff.DefaultConsoleOptions()
+		compare, s := jsondiff.Compare(qr.Rows[i][1].Raw(), []byte(row[1]), &opts)
+		if compare != jsondiff.FullMatch {
+			t.Errorf("Diff:\n%s\n", s)
+		}
 	}
 }
 
@@ -2898,16 +3080,17 @@ func startVReplication(t *testing.T, bls *binlogdatapb.BinlogSource, pos string)
 	if pos == "" {
 		pos = primaryPosition(t)
 	}
-	query := binlogplayer.CreateVReplication("test", bls, pos, 9223372036854775807, 9223372036854775807, 0, vrepldb)
+	// fake workflow type as MoveTables so that we can test with "noblob" binlog row image
+	query := binlogplayer.CreateVReplication("test", bls, pos, 9223372036854775807, 9223372036854775807, 0, vrepldb, binlogdatapb.VReplicationWorkflowType_MoveTables, 0, false)
 	qr, err := playerEngine.Exec(query)
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectDBClientQueries(t, []string{
+	expectDBClientQueries(t, qh.Expect(
 		"/insert into _vt.vreplication",
 		"/update _vt.vreplication set message='Picked source tablet.*",
 		"/update _vt.vreplication set state='Running'",
-	})
+	))
 	var once sync.Once
 	return func() {
 		t.Helper()

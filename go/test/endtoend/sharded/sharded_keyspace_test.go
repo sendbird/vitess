@@ -28,6 +28,7 @@ import (
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/sidecardb"
 )
 
 var (
@@ -83,7 +84,7 @@ func TestMain(m *testing.M) {
 		if err := clusterInstance.StartTopo(); err != nil {
 			return 1, err
 		}
-		if err := clusterInstance.VtctlProcess.CreateKeyspace(keyspaceName); err != nil {
+		if err := clusterInstance.VtctlProcess.CreateKeyspace(keyspaceName, sidecardb.DefaultName); err != nil {
 			return 1, err
 		}
 
@@ -111,6 +112,9 @@ func TestShardedKeyspace(t *testing.T) {
 	require.Nil(t, err)
 	err = clusterInstance.VtctlclientProcess.InitializeShard(keyspaceName, shard2.Name, cell, shard2Primary.TabletUID)
 	require.Nil(t, err)
+
+	err = clusterInstance.StartVTOrc(keyspaceName)
+	require.NoError(t, err)
 
 	// apply the schema on the first shard through vtctl, so all tablets
 	// are the same.
@@ -212,7 +216,11 @@ func initCluster(shardNames []string, totalTabletsRequired int) {
 				tablet.Type = "primary"
 			}
 			// Start Mysqlctl process
-			tablet.MysqlctlProcess = *cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, clusterInstance.TmpDirectory)
+			mysqlctlProcess, err := cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, clusterInstance.TmpDirectory)
+			if err != nil {
+				return
+			}
+			tablet.MysqlctlProcess = *mysqlctlProcess
 			proc, err := tablet.MysqlctlProcess.StartProcess()
 			if err != nil {
 				return
@@ -233,7 +241,6 @@ func initCluster(shardNames []string, totalTabletsRequired int) {
 				clusterInstance.Hostname,
 				clusterInstance.TmpDirectory,
 				clusterInstance.VtTabletExtraArgs,
-				clusterInstance.EnableSemiSync,
 				clusterInstance.DefaultCharset)
 			tablet.Alias = tablet.VttabletProcess.TabletPath
 

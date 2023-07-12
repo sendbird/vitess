@@ -17,12 +17,11 @@ limitations under the License.
 package mysql
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
-
-	"context"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/proto/vtrpc"
@@ -49,8 +48,11 @@ const (
 	InstantAddDropVirtualColumnFlavorCapability
 	InstantAddDropColumnFlavorCapability
 	InstantChangeColumnDefaultFlavorCapability
+	InstantExpandEnumCapability
 	MySQLJSONFlavorCapability
 	MySQLUpgradeInServerFlavorCapability
+	DynamicRedoLogCapacityFlavorCapability // supported in MySQL 8.0.30 and above: https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-30.html
+	DisableRedoLogFlavorCapability         // supported in MySQL 8.0.21 and above: https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-21.html
 )
 
 const (
@@ -74,6 +76,15 @@ const (
 type flavor interface {
 	// primaryGTIDSet returns the current GTIDSet of a server.
 	primaryGTIDSet(c *Conn) (GTIDSet, error)
+
+	// purgedGTIDSet returns the purged GTIDSet of a server.
+	purgedGTIDSet(c *Conn) (GTIDSet, error)
+
+	// gtidMode returns the gtid mode of a server.
+	gtidMode(c *Conn) (string, error)
+
+	// serverUUID returns the UUID of a server.
+	serverUUID(c *Conn) (string, error)
 
 	// startReplicationCommand returns the command to start the replication.
 	startReplicationCommand() string
@@ -103,7 +114,7 @@ type flavor interface {
 
 	// sendBinlogDumpCommand sends the packet required to start
 	// dumping binlogs from the specified location.
-	sendBinlogDumpCommand(c *Conn, serverID uint32, startPos Position) error
+	sendBinlogDumpCommand(c *Conn, serverID uint32, binlogFilename string, startPos Position) error
 
 	// readBinlogEvent reads the next BinlogEvent from the connection.
 	readBinlogEvent(c *Conn) (BinlogEvent, error)
@@ -111,6 +122,10 @@ type flavor interface {
 	// resetReplicationCommands returns the commands to completely reset
 	// replication on the host.
 	resetReplicationCommands(c *Conn) []string
+
+	// resetReplicationParametersCommands returns the commands to reset
+	// replication parameters on the host.
+	resetReplicationParametersCommands(c *Conn) []string
 
 	// setReplicationPositionCommands returns the commands to set the
 	// replication position at which the replica will resume.
@@ -134,13 +149,7 @@ type flavor interface {
 	// returns NULL if GTIDs are not enabled.
 	waitUntilPositionCommand(ctx context.Context, pos Position) (string, error)
 
-	// enableBinlogPlaybackCommand and disableBinlogPlaybackCommand return an
-	// optional command to run to enable or disable binlog
-	// playback. This is used internally in Google, as the
-	// timestamp cannot be set by regular clients.
-	enableBinlogPlaybackCommand() string
-	disableBinlogPlaybackCommand() string
-
+	baseShowTables() string
 	baseShowTablesWithSizes() string
 
 	supportsCapability(serverVersion string, capability FlavorCapability) (bool, error)
@@ -266,6 +275,27 @@ func (c *Conn) PrimaryPosition() (Position, error) {
 	}, nil
 }
 
+// GetGTIDPurged returns the tablet's GTIDs which are purged.
+func (c *Conn) GetGTIDPurged() (Position, error) {
+	gtidSet, err := c.flavor.purgedGTIDSet(c)
+	if err != nil {
+		return Position{}, err
+	}
+	return Position{
+		GTIDSet: gtidSet,
+	}, nil
+}
+
+// GetGTIDMode returns the tablet's GTID mode. Only available in MySQL flavour
+func (c *Conn) GetGTIDMode() (string, error) {
+	return c.flavor.gtidMode(c)
+}
+
+// GetServerUUID returns the server's UUID.
+func (c *Conn) GetServerUUID() (string, error) {
+	return c.flavor.serverUUID(c)
+}
+
 // PrimaryFilePosition returns the current primary's file based replication position.
 func (c *Conn) PrimaryFilePosition() (Position, error) {
 	filePosFlavor := filePosFlavor{}
@@ -323,8 +353,8 @@ func (c *Conn) StartSQLThreadCommand() string {
 // SendBinlogDumpCommand sends the flavor-specific version of
 // the COM_BINLOG_DUMP command to start dumping raw binlog
 // events over a server connection, starting at a given GTID.
-func (c *Conn) SendBinlogDumpCommand(serverID uint32, startPos Position) error {
-	return c.flavor.sendBinlogDumpCommand(c, serverID, startPos)
+func (c *Conn) SendBinlogDumpCommand(serverID uint32, binlogFilename string, startPos Position) error {
+	return c.flavor.sendBinlogDumpCommand(c, serverID, binlogFilename, startPos)
 }
 
 // ReadBinlogEvent reads the next BinlogEvent. This must be used
@@ -339,6 +369,12 @@ func (c *Conn) ResetReplicationCommands() []string {
 	return c.flavor.resetReplicationCommands(c)
 }
 
+// ResetReplicationParametersCommands returns the commands to reset
+// replication parameters on the host.
+func (c *Conn) ResetReplicationParametersCommands() []string {
+	return c.flavor.resetReplicationParametersCommands(c)
+}
+
 // SetReplicationPositionCommands returns the commands to set the
 // replication position at which the replica will resume
 // when it is later reparented with SetReplicationSourceCommand.
@@ -350,7 +386,7 @@ func (c *Conn) SetReplicationPositionCommands(pos Position) []string {
 // as the new replication source (without changing any GTID position).
 // It is guaranteed to be called with replication stopped.
 // It should not start or stop replication.
-func (c *Conn) SetReplicationSourceCommand(params *ConnParams, host string, port int, connectRetry int) string {
+func (c *Conn) SetReplicationSourceCommand(params *ConnParams, host string, port int32, connectRetry int) string {
 	args := []string{
 		fmt.Sprintf("MASTER_HOST = '%s'", host),
 		fmt.Sprintf("MASTER_PORT = %d", port),
@@ -402,37 +438,44 @@ func parseReplicationStatus(fields map[string]string) ReplicationStatus {
 	// The field names in the map are identical to what we receive from the database
 	// Hence the names still contain Master
 	status := ReplicationStatus{
-		SourceHost: fields["Master_Host"],
+		SourceHost:            fields["Master_Host"],
+		SourceUser:            fields["Master_User"],
+		SSLAllowed:            fields["Master_SSL_Allowed"] == "Yes",
+		AutoPosition:          fields["Auto_Position"] == "1",
+		UsingGTID:             fields["Using_Gtid"] != "No" && fields["Using_Gtid"] != "",
+		HasReplicationFilters: (fields["Replicate_Do_DB"] != "") || (fields["Replicate_Ignore_DB"] != "") || (fields["Replicate_Do_Table"] != "") || (fields["Replicate_Ignore_Table"] != "") || (fields["Replicate_Wild_Do_Table"] != "") || (fields["Replicate_Wild_Ignore_Table"] != ""),
 		// These fields are returned from the underlying DB and cannot be renamed
 		IOState:      ReplicationStatusToState(fields["Slave_IO_Running"]),
 		LastIOError:  fields["Last_IO_Error"],
 		SQLState:     ReplicationStatusToState(fields["Slave_SQL_Running"]),
 		LastSQLError: fields["Last_SQL_Error"],
 	}
-	parseInt, _ := strconv.ParseInt(fields["Master_Port"], 10, 0)
-	status.SourcePort = int(parseInt)
-	parseInt, _ = strconv.ParseInt(fields["Connect_Retry"], 10, 0)
-	status.ConnectRetry = int(parseInt)
-	parseUint, err := strconv.ParseUint(fields["Seconds_Behind_Master"], 10, 0)
+	parseInt, _ := strconv.ParseInt(fields["Master_Port"], 10, 32)
+	status.SourcePort = int32(parseInt)
+	parseInt, _ = strconv.ParseInt(fields["Connect_Retry"], 10, 32)
+	status.ConnectRetry = int32(parseInt)
+	parseUint, err := strconv.ParseUint(fields["Seconds_Behind_Master"], 10, 32)
 	if err != nil {
-		// we could not parse the value into a valid uint -- most commonly because the value is NULL from the
+		// we could not parse the value into a valid uint32 -- most commonly because the value is NULL from the
 		// database -- so let's reflect that the underlying value was unknown on our last check
 		status.ReplicationLagUnknown = true
 	} else {
 		status.ReplicationLagUnknown = false
-		status.ReplicationLagSeconds = uint(parseUint)
+		status.ReplicationLagSeconds = uint32(parseUint)
 	}
-	parseUint, _ = strconv.ParseUint(fields["Master_Server_Id"], 10, 0)
-	status.SourceServerID = uint(parseUint)
+	parseUint, _ = strconv.ParseUint(fields["Master_Server_Id"], 10, 32)
+	status.SourceServerID = uint32(parseUint)
+	parseUint, _ = strconv.ParseUint(fields["SQL_Delay"], 10, 32)
+	status.SQLDelay = uint32(parseUint)
 
 	executedPosStr := fields["Exec_Master_Log_Pos"]
 	file := fields["Relay_Master_Log_File"]
 	if file != "" && executedPosStr != "" {
-		filePos, err := strconv.Atoi(executedPosStr)
+		filePos, err := strconv.ParseUint(executedPosStr, 10, 32)
 		if err == nil {
 			status.FilePosition.GTIDSet = filePosGTID{
 				file: file,
-				pos:  filePos,
+				pos:  uint32(filePos),
 			}
 		}
 	}
@@ -440,11 +483,23 @@ func parseReplicationStatus(fields map[string]string) ReplicationStatus {
 	readPosStr := fields["Read_Master_Log_Pos"]
 	file = fields["Master_Log_File"]
 	if file != "" && readPosStr != "" {
-		fileRelayPos, err := strconv.Atoi(readPosStr)
+		fileRelayPos, err := strconv.ParseUint(readPosStr, 10, 32)
 		if err == nil {
-			status.FileRelayLogPosition.GTIDSet = filePosGTID{
+			status.RelayLogSourceBinlogEquivalentPosition.GTIDSet = filePosGTID{
 				file: file,
-				pos:  fileRelayPos,
+				pos:  uint32(fileRelayPos),
+			}
+		}
+	}
+
+	relayPosStr := fields["Relay_Log_Pos"]
+	file = fields["Relay_Log_File"]
+	if file != "" && relayPosStr != "" {
+		relayFilePos, err := strconv.ParseUint(relayPosStr, 10, 32)
+		if err == nil {
+			status.RelayLogFilePosition.GTIDSet = filePosGTID{
+				file: file,
+				pos:  uint32(relayFilePos),
 			}
 		}
 	}
@@ -464,11 +519,11 @@ func parsePrimaryStatus(fields map[string]string) PrimaryStatus {
 	fileExecPosStr := fields["Position"]
 	file := fields["File"]
 	if file != "" && fileExecPosStr != "" {
-		filePos, err := strconv.Atoi(fileExecPosStr)
+		filePos, err := strconv.ParseUint(fileExecPosStr, 10, 32)
 		if err == nil {
 			status.FilePosition.GTIDSet = filePosGTID{
 				file: file,
-				pos:  filePos,
+				pos:  uint32(filePos),
 			}
 		}
 	}
@@ -499,20 +554,13 @@ func (c *Conn) WaitUntilFilePositionCommand(ctx context.Context, pos Position) (
 	return filePosFlavor.waitUntilPositionCommand(ctx, pos)
 }
 
-// EnableBinlogPlaybackCommand returns a command to run to enable
-// binlog playback.
-func (c *Conn) EnableBinlogPlaybackCommand() string {
-	return c.flavor.enableBinlogPlaybackCommand()
-}
-
-// DisableBinlogPlaybackCommand returns a command to run to disable
-// binlog playback.
-func (c *Conn) DisableBinlogPlaybackCommand() string {
-	return c.flavor.disableBinlogPlaybackCommand()
-}
-
-// BaseShowTables returns a query that shows tables and their sizes
+// BaseShowTables returns a query that shows tables
 func (c *Conn) BaseShowTables() string {
+	return c.flavor.baseShowTables()
+}
+
+// BaseShowTablesWithSizes returns a query that shows tables and their sizes
+func (c *Conn) BaseShowTablesWithSizes() string {
 	return c.flavor.baseShowTablesWithSizes()
 }
 

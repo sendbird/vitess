@@ -22,6 +22,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
 	"vitess.io/vitess/go/vt/log"
 
 	"vitess.io/vitess/go/vt/discovery"
@@ -83,6 +85,12 @@ func (tf *testFixture) process(lagRecord replicationLagRecord) {
 	tf.m.processRecord(lagRecord)
 }
 
+// recalculateRate does the same thing as MaxReplicationLagModule.recalculateRate() does
+// for a new "lagRecord".
+func (tf *testFixture) recalculateRate(lagRecord replicationLagRecord) {
+	tf.m.recalculateRate(lagRecord)
+}
+
 func (tf *testFixture) checkState(state state, rate int64, lastRateChange time.Time) error {
 	if got, want := tf.m.currentState, state; got != want {
 		return fmt.Errorf("module in wrong state. got = %v, want = %v", got, want)
@@ -94,6 +102,47 @@ func (tf *testFixture) checkState(state state, rate int64, lastRateChange time.T
 		return fmt.Errorf("module has wrong lastRateChange time. got = %v, want = %v", got, want)
 	}
 	return nil
+}
+
+func TestNewMaxReplicationLagModule_recalculateRate(t *testing.T) {
+	testCases := []struct {
+		name        string
+		lagRecord   replicationLagRecord
+		expectPanic bool
+	}{
+		{
+			name: "Zero lag",
+			lagRecord: replicationLagRecord{
+				time:         time.Time{},
+				TabletHealth: discovery.TabletHealth{Stats: nil},
+			},
+			expectPanic: true,
+		},
+		{
+			name: "nil lag record stats",
+			lagRecord: replicationLagRecord{
+				time:         time.Now(),
+				TabletHealth: discovery.TabletHealth{Stats: nil},
+			},
+			expectPanic: false,
+		},
+	}
+
+	for _, aTestCase := range testCases {
+		theCase := aTestCase
+
+		t.Run(theCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			fixture, err := newTestFixtureWithMaxReplicationLag(5)
+			assert.NoError(t, err)
+
+			if theCase.expectPanic {
+				assert.Panics(t, func() { fixture.recalculateRate(theCase.lagRecord) })
+			}
+		},
+		)
+	}
 }
 
 func TestMaxReplicationLagModule_RateNotZeroWhenDisabled(t *testing.T) {
@@ -225,7 +274,7 @@ func TestMaxReplicationLagModule_ReplicaUnderTest_LastErrorOrNotUp(t *testing.T)
 
 	// r2 @  75s, 0s lag, LastError set
 	rError := lagRecord(sinceZero(75*time.Second), r2, 0)
-	rError.LastError = errors.New("LegacyHealthCheck reporting broken")
+	rError.LastError = errors.New("HealthCheck reporting broken")
 	tf.m.replicaLagCache.add(rError)
 
 	// r1 @ 110s, 0s lag
@@ -244,7 +293,7 @@ func TestMaxReplicationLagModule_ReplicaUnderTest_LastErrorOrNotUp(t *testing.T)
 	tf.ratesHistory.add(sinceZero(110*time.Second), 200)
 	tf.ratesHistory.add(sinceZero(114*time.Second), 400)
 	rNotUp := lagRecord(sinceZero(115*time.Second), r1, 0)
-	rNotUp.Up = false
+	rNotUp.Serving = false
 	tf.m.replicaLagCache.add(rNotUp)
 
 	// r2 @ 150s, 0s lag (lastError no longer set)
@@ -453,7 +502,7 @@ func TestMaxReplicationLagModule_Increase_BadRateUpperBound(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	//Assume that a bad value of 150 was set @ 30s and log error
+	// Assume that a bad value of 150 was set @ 30s and log error
 	if err := tf.m.memory.markBad(150, sinceZero(30*time.Second)); err != nil {
 		log.Errorf("tf.m.memory.markBad(150, sinceZero(30*time.Second)) falied : %v", err)
 	}
@@ -955,7 +1004,7 @@ func lagRecord(t time.Time, uid, lag uint32) replicationLagRecord {
 }
 
 // tabletStats creates fake tablet health data.
-func tabletStats(uid, lag uint32) discovery.LegacyTabletStats {
+func tabletStats(uid, lag uint32) discovery.TabletHealth {
 	typ := topodatapb.TabletType_REPLICA
 	if uid == rdonly1 || uid == rdonly2 {
 		typ = topodatapb.TabletType_RDONLY
@@ -967,21 +1016,19 @@ func tabletStats(uid, lag uint32) discovery.LegacyTabletStats {
 		Type:     typ,
 		PortMap:  map[string]int32{"vt": int32(uid)},
 	}
-	return discovery.LegacyTabletStats{
+	return discovery.TabletHealth{
 		Tablet: tablet,
-		Key:    discovery.TabletToMapKey(tablet),
 		Target: &querypb.Target{
 			Keyspace:   "ks1",
 			Shard:      "-80",
 			TabletType: typ,
 		},
-		Up:      true,
 		Serving: true,
 		Stats: &querypb.RealtimeStats{
 			ReplicationLagSeconds: lag,
 		},
-		TabletExternallyReparentedTimestamp: 22,
-		LastError:                           nil,
+		PrimaryTermStartTime: 22,
+		LastError:            nil,
 	}
 }
 

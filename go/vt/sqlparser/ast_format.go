@@ -17,8 +17,6 @@ limitations under the License.
 package sqlparser
 
 import (
-	"strings"
-
 	"vitess.io/vitess/go/sqltypes"
 )
 
@@ -68,6 +66,13 @@ func (node *Select) Format(buf *TrackedBuffer) {
 }
 
 // Format formats the node.
+func (node *CommentOnly) Format(buf *TrackedBuffer) {
+	for _, comment := range node.Comments {
+		buf.WriteString(comment)
+	}
+}
+
+// Format formats the node.
 func (node *Union) Format(buf *TrackedBuffer) {
 	if requiresParen(node.Left) {
 		buf.astPrintf(node, "(%v)", node.Left)
@@ -111,17 +116,17 @@ func (node *Insert) Format(buf *TrackedBuffer) {
 		buf.astPrintf(node, "%s %v%sinto %v%v%v %v%v",
 			InsertStr,
 			node.Comments, node.Ignore.ToString(),
-			node.Table, node.Partitions, node.Columns, node.Rows, node.OnDup)
+			node.Table.Expr, node.Partitions, node.Columns, node.Rows, node.OnDup)
 	case ReplaceAct:
 		buf.astPrintf(node, "%s %v%sinto %v%v%v %v%v",
 			ReplaceStr,
 			node.Comments, node.Ignore.ToString(),
-			node.Table, node.Partitions, node.Columns, node.Rows, node.OnDup)
+			node.Table.Expr, node.Partitions, node.Columns, node.Rows, node.OnDup)
 	default:
 		buf.astPrintf(node, "%s %v%sinto %v%v%v %v%v",
 			"Unkown Insert Action",
 			node.Comments, node.Ignore.ToString(),
-			node.Table, node.Partitions, node.Columns, node.Rows, node.OnDup)
+			node.Table.Expr, node.Partitions, node.Columns, node.Rows, node.OnDup)
 	}
 
 }
@@ -142,7 +147,7 @@ func (node *With) Format(buf *TrackedBuffer) {
 
 // Format formats the node.
 func (node *CommonTableExpr) Format(buf *TrackedBuffer) {
-	buf.astPrintf(node, "%v%v as %v ", node.TableID, node.Columns, node.Subquery)
+	buf.astPrintf(node, "%v%v as %v ", node.ID, node.Columns, node.Subquery)
 }
 
 // Format formats the node.
@@ -173,22 +178,6 @@ func (node *Delete) Format(buf *TrackedBuffer) {
 // Format formats the node.
 func (node *Set) Format(buf *TrackedBuffer) {
 	buf.astPrintf(node, "set %v%v", node.Comments, node.Exprs)
-}
-
-// Format formats the node.
-func (node *SetTransaction) Format(buf *TrackedBuffer) {
-	if node.Scope == ImplicitScope {
-		buf.astPrintf(node, "set %vtransaction ", node.Comments)
-	} else {
-		buf.astPrintf(node, "set %v%s transaction ", node.Comments, node.Scope.ToString())
-	}
-
-	for i, char := range node.Characteristics {
-		if i > 0 {
-			buf.literal(", ")
-		}
-		buf.astPrintf(node, "%v", char)
-	}
 }
 
 // Format formats the node.
@@ -265,7 +254,7 @@ func (node *AlterVschema) Format(buf *TrackedBuffer) {
 func (node *AlterMigration) Format(buf *TrackedBuffer) {
 	buf.astPrintf(node, "alter vitess_migration")
 	if node.UUID != "" {
-		buf.astPrintf(node, " '%s'", node.UUID)
+		buf.astPrintf(node, " '%#s'", node.UUID)
 	}
 	var alterType string
 	switch node.Type {
@@ -273,8 +262,14 @@ func (node *AlterMigration) Format(buf *TrackedBuffer) {
 		alterType = "retry"
 	case CleanupMigrationType:
 		alterType = "cleanup"
+	case LaunchMigrationType:
+		alterType = "launch"
+	case LaunchAllMigrationType:
+		alterType = "launch all"
 	case CompleteMigrationType:
 		alterType = "complete"
+	case CompleteAllMigrationType:
+		alterType = "complete all"
 	case CancelMigrationType:
 		alterType = "cancel"
 	case CancelAllMigrationType:
@@ -288,28 +283,36 @@ func (node *AlterMigration) Format(buf *TrackedBuffer) {
 	case UnthrottleAllMigrationType:
 		alterType = "unthrottle all"
 	}
-	buf.astPrintf(node, " %s", alterType)
+	buf.astPrintf(node, " %#s", alterType)
 	if node.Expire != "" {
-		buf.astPrintf(node, " expire '%s'", node.Expire)
+		buf.astPrintf(node, " expire '%#s'", node.Expire)
 	}
 	if node.Ratio != nil {
 		buf.astPrintf(node, " ratio %v", node.Ratio)
+	}
+	if node.Shards != "" {
+		buf.astPrintf(node, " vitess_shards '%#s'", node.Shards)
 	}
 }
 
 // Format formats the node.
 func (node *RevertMigration) Format(buf *TrackedBuffer) {
-	buf.astPrintf(node, "revert %vvitess_migration '%s'", node.Comments, node.UUID)
+	buf.astPrintf(node, "revert %vvitess_migration '%#s'", node.Comments, node.UUID)
 }
 
 // Format formats the node.
 func (node *ShowMigrationLogs) Format(buf *TrackedBuffer) {
-	buf.astPrintf(node, "show vitess_migration '%s' logs", node.UUID)
+	buf.astPrintf(node, "show vitess_migration '%#s' logs", node.UUID)
 }
 
 // Format formats the node.
 func (node *ShowThrottledApps) Format(buf *TrackedBuffer) {
 	buf.astPrintf(node, "show vitess_throttled_apps")
+}
+
+// Format formats the node.
+func (node *ShowThrottlerStatus) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "show vitess_throttler status")
 }
 
 // Format formats the node.
@@ -482,7 +485,7 @@ func (node *PartitionDefinitionOptions) Format(buf *TrackedBuffer) {
 		buf.astPrintf(node, " min_rows %d", *node.MinRows)
 	}
 	if node.TableSpace != "" {
-		buf.astPrintf(node, " tablespace %s", node.TableSpace)
+		buf.astPrintf(node, " tablespace %#s", node.TableSpace)
 	}
 	if node.SubPartitionDefinitions != nil {
 		buf.astPrintf(node, " (%v)", node.SubPartitionDefinitions)
@@ -525,7 +528,7 @@ func (node *SubPartitionDefinitionOptions) Format(buf *TrackedBuffer) {
 		buf.astPrintf(node, " min_rows %d", *node.MinRows)
 	}
 	if node.TableSpace != "" {
-		buf.astPrintf(node, " tablespace %s", node.TableSpace)
+		buf.astPrintf(node, " tablespace %#s", node.TableSpace)
 	}
 }
 
@@ -563,7 +566,11 @@ func (node *PartitionOption) Format(buf *TrackedBuffer) {
 		if node.KeyAlgorithm != 0 {
 			buf.astPrintf(node, " algorithm = %d", node.KeyAlgorithm)
 		}
-		buf.astPrintf(node, " %v", node.ColList)
+		if len(node.ColList) == 0 {
+			buf.literal(" ()")
+		} else {
+			buf.astPrintf(node, " %v", node.ColList)
+		}
 	case RangeType, ListType:
 		buf.astPrintf(node, " %s", node.Type.ToString())
 		if node.Expr != nil {
@@ -606,7 +613,11 @@ func (node *SubPartition) Format(buf *TrackedBuffer) {
 		if node.KeyAlgorithm != 0 {
 			buf.astPrintf(node, " algorithm = %d", node.KeyAlgorithm)
 		}
-		buf.astPrintf(node, " %v", node.ColList)
+		if len(node.ColList) == 0 {
+			buf.literal(" ()")
+		} else {
+			buf.astPrintf(node, " %v", node.ColList)
+		}
 	}
 
 	if node.SubPartitions != -1 {
@@ -656,7 +667,7 @@ func (ts *TableSpec) Format(buf *TrackedBuffer) {
 
 // Format formats the node.
 func (col *ColumnDefinition) Format(buf *TrackedBuffer) {
-	buf.astPrintf(col, "%v %v", col.Name, &col.Type)
+	buf.astPrintf(col, "%v %v", col.Name, col.Type)
 }
 
 // Format returns a canonical string representation of the type and all relevant options
@@ -753,22 +764,22 @@ func (ct *ColumnType) Format(buf *TrackedBuffer) {
 		if ct.Options.SecondaryEngineAttribute != nil {
 			buf.astPrintf(ct, " %s %v", keywordStrings[SECONDARY_ENGINE_ATTRIBUTE], ct.Options.SecondaryEngineAttribute)
 		}
-		if ct.Options.KeyOpt == colKeyPrimary {
+		if ct.Options.KeyOpt == ColKeyPrimary {
 			buf.astPrintf(ct, " %s %s", keywordStrings[PRIMARY], keywordStrings[KEY])
 		}
-		if ct.Options.KeyOpt == colKeyUnique {
+		if ct.Options.KeyOpt == ColKeyUnique {
 			buf.astPrintf(ct, " %s", keywordStrings[UNIQUE])
 		}
-		if ct.Options.KeyOpt == colKeyUniqueKey {
+		if ct.Options.KeyOpt == ColKeyUniqueKey {
 			buf.astPrintf(ct, " %s %s", keywordStrings[UNIQUE], keywordStrings[KEY])
 		}
-		if ct.Options.KeyOpt == colKeySpatialKey {
+		if ct.Options.KeyOpt == ColKeySpatialKey {
 			buf.astPrintf(ct, " %s %s", keywordStrings[SPATIAL], keywordStrings[KEY])
 		}
-		if ct.Options.KeyOpt == colKeyFulltextKey {
+		if ct.Options.KeyOpt == ColKeyFulltextKey {
 			buf.astPrintf(ct, " %s %s", keywordStrings[FULLTEXT], keywordStrings[KEY])
 		}
-		if ct.Options.KeyOpt == colKey {
+		if ct.Options.KeyOpt == ColKey {
 			buf.astPrintf(ct, " %s", keywordStrings[KEY])
 		}
 		if ct.Options.Reference != nil {
@@ -804,7 +815,7 @@ func (idx *IndexDefinition) Format(buf *TrackedBuffer) {
 	for _, opt := range idx.Options {
 		buf.astPrintf(idx, " %s", opt.Name)
 		if opt.String != "" {
-			buf.astPrintf(idx, " %s", opt.String)
+			buf.astPrintf(idx, " %#s", opt.String)
 		} else if opt.Value != nil {
 			buf.astPrintf(idx, " %v", opt.Value)
 		}
@@ -852,7 +863,7 @@ func (node *VindexSpec) Format(buf *TrackedBuffer) {
 
 // Format formats the node.
 func (node VindexParam) Format(buf *TrackedBuffer) {
-	buf.astPrintf(node, "%s=%s", node.Key.String(), node.Val)
+	buf.astPrintf(node, "%#s=%#s", node.Key.String(), node.Val)
 }
 
 // Format formats the node.
@@ -952,7 +963,19 @@ func (node *Commit) Format(buf *TrackedBuffer) {
 
 // Format formats the node.
 func (node *Begin) Format(buf *TrackedBuffer) {
-	buf.literal("begin")
+	if node.TxAccessModes == nil {
+		buf.literal("begin")
+		return
+	}
+	buf.literal("start transaction")
+	for idx, accessMode := range node.TxAccessModes {
+		if idx == 0 {
+			buf.astPrintf(node, " %s", accessMode.ToString())
+			continue
+		}
+		buf.astPrintf(node, ", %s", accessMode.ToString())
+	}
+
 }
 
 // Format formats the node.
@@ -985,7 +1008,12 @@ func (node *ExplainStmt) Format(buf *TrackedBuffer) {
 	default:
 		format = "format = " + node.Type.ToString() + " "
 	}
-	buf.astPrintf(node, "explain %s%v", format, node.Statement)
+	buf.astPrintf(node, "explain %v%s%v", node.Comments, format, node.Statement)
+}
+
+// Format formats the node.
+func (node *VExplainStmt) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "vexplain %v%s %v", node.Comments, node.Type.ToString(), node.Statement)
 }
 
 // Format formats the node.
@@ -1019,7 +1047,7 @@ func (node *ExecuteStmt) Format(buf *TrackedBuffer) {
 
 // Format formats the node.
 func (node *DeallocateStmt) Format(buf *TrackedBuffer) {
-	buf.astPrintf(node, "%s %vprepare %v", node.Type.ToString(), node.Comments, node.Name)
+	buf.astPrintf(node, "deallocate %vprepare %v", node.Comments, node.Name)
 }
 
 // Format formats the node.
@@ -1043,7 +1071,7 @@ func (node *ParsedComments) Format(buf *TrackedBuffer) {
 		return
 	}
 	for _, c := range node.comments {
-		buf.astPrintf(node, "%s ", c)
+		buf.astPrintf(node, "%#s ", c)
 	}
 }
 
@@ -1082,7 +1110,8 @@ func (node Columns) Format(buf *TrackedBuffer) {
 	if node == nil {
 		return
 	}
-	prefix := "("
+	buf.WriteByte('(')
+	prefix := ""
 	for _, n := range node {
 		buf.astPrintf(node, "%s%v", prefix, n)
 		prefix = ", "
@@ -1260,24 +1289,41 @@ func (node *ExistsExpr) Format(buf *TrackedBuffer) {
 }
 
 // Format formats the node.
+func (node *AssignmentExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "%l := %r", node.Left, node.Right)
+}
+
+// Format formats the node.
 func (node *Literal) Format(buf *TrackedBuffer) {
 	switch node.Type {
 	case StrVal:
 		sqltypes.MakeTrusted(sqltypes.VarBinary, node.Bytes()).EncodeSQL(buf)
 	case IntVal, FloatVal, DecimalVal, HexNum:
-		buf.astPrintf(node, "%s", node.Val)
+		buf.astPrintf(node, "%#s", node.Val)
 	case HexVal:
-		buf.astPrintf(node, "X'%s'", node.Val)
+		buf.astPrintf(node, "X'%#s'", node.Val)
 	case BitVal:
-		buf.astPrintf(node, "B'%s'", node.Val)
+		buf.astPrintf(node, "B'%#s'", node.Val)
+	case DateVal:
+		buf.astPrintf(node, "date'%#s'", node.Val)
+	case TimeVal:
+		buf.astPrintf(node, "time'%#s'", node.Val)
+	case TimestampVal:
+		buf.astPrintf(node, "timestamp'%#s'", node.Val)
 	default:
 		panic("unexpected")
 	}
 }
 
 // Format formats the node.
-func (node Argument) Format(buf *TrackedBuffer) {
-	buf.WriteArg(":", string(node))
+func (node *Argument) Format(buf *TrackedBuffer) {
+	buf.WriteArg(":", node.Name)
+	if node.Type >= 0 {
+		// For bind variables that are statically typed, emit their type as an adjacent comment.
+		// This comment will be ignored by older versions of Vitess (and by MySQL) but will provide
+		// type safety when using the query as a cache key.
+		buf.astPrintf(node, " /* %s */", node.Type.String())
+	}
 }
 
 // Format formats the node.
@@ -1346,18 +1392,13 @@ func (node *IntroducerExpr) Format(buf *TrackedBuffer) {
 }
 
 // Format formats the node.
-func (node *IntervalExpr) Format(buf *TrackedBuffer) {
-	buf.astPrintf(node, "interval %v %s", node.Expr, node.Unit)
-}
-
-// Format formats the node.
-func (node *TimestampFuncExpr) Format(buf *TrackedBuffer) {
-	buf.astPrintf(node, "%s(%s, %v, %v)", node.Name, node.Unit, node.Expr1, node.Expr2)
+func (node *TimestampDiffExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "timestampdiff(%#s, %v, %v)", node.Unit.ToString(), node.Expr1, node.Expr2)
 }
 
 // Format formats the node.
 func (node *ExtractFuncExpr) Format(buf *TrackedBuffer) {
-	buf.astPrintf(node, "extract(%s from %v)", node.IntervalTypes.ToString(), node.Expr)
+	buf.astPrintf(node, "extract(%#s from %v)", node.IntervalType.ToString(), node.Expr)
 }
 
 // Format formats the node
@@ -1417,18 +1458,45 @@ func (node *RegexpSubstrExpr) Format(buf *TrackedBuffer) {
 	buf.WriteByte(')')
 }
 
+// Format formats the node
+func (node *IntervalDateExpr) Format(buf *TrackedBuffer) {
+	switch node.Syntax {
+	case IntervalDateExprAdddate, IntervalDateExprSubdate:
+		if node.Unit == IntervalNone {
+			buf.astPrintf(node, "%s(%v, %v)", node.FnName(), node.Date, node.Interval)
+			return
+		}
+		fallthrough
+	case IntervalDateExprDateAdd, IntervalDateExprDateSub:
+		buf.astPrintf(node, "%s(%v, interval %v %#s)", node.FnName(), node.Date, node.Interval, node.Unit.ToString())
+	case IntervalDateExprBinaryAdd:
+		buf.astPrintf(node, "%l + interval %r %#s", node.Date, node.Interval, node.Unit.ToString())
+	case IntervalDateExprBinaryAddLeft:
+		buf.astPrintf(node, "interval %l %#s + %r", node.Interval, node.Unit.ToString(), node.Date)
+	case IntervalDateExprBinarySub:
+		buf.astPrintf(node, "%l - interval %r %#s", node.Date, node.Interval, node.Unit.ToString())
+	case IntervalDateExprTimestampadd:
+		buf.astPrintf(node, "timestampadd(%#s, %v, %v)", node.Unit.ToString(), node.Interval, node.Date)
+	}
+}
+
 // Format formats the node.
 func (node *TrimFuncExpr) Format(buf *TrackedBuffer) {
 	buf.astPrintf(node, "%s(", node.TrimFuncType.ToString())
-	if node.Type.ToString() != "" {
-		buf.astPrintf(node, "%s ", node.Type.ToString())
-	}
-	if node.TrimArg != nil {
-		buf.astPrintf(node, "%v ", node.TrimArg)
-	}
+	if node.TrimFuncType == NormalTrimType {
+		var from bool
+		if node.Type != NoTrimType {
+			buf.astPrintf(node, "%s ", node.Type.ToString())
+			from = true
+		}
+		if node.TrimArg != nil {
+			buf.astPrintf(node, "%v ", node.TrimArg)
+			from = true
+		}
 
-	if (node.Type.ToString() != "") || (node.TrimArg != nil) {
-		buf.literal("from ")
+		if from {
+			buf.literal("from ")
+		}
 	}
 	buf.astPrintf(node, "%v", node.StringArg)
 	buf.WriteByte(')')
@@ -1445,10 +1513,10 @@ func (node *WeightStringFuncExpr) Format(buf *TrackedBuffer) {
 
 // Format formats the node.
 func (node *CurTimeFuncExpr) Format(buf *TrackedBuffer) {
-	if node.Fsp != nil {
-		buf.astPrintf(node, "%s(%v)", node.Name.String(), node.Fsp)
+	if node.Fsp > 0 {
+		buf.astPrintf(node, "%#s(%d)", node.Name.String(), node.Fsp)
 	} else {
-		buf.astPrintf(node, "%s()", node.Name.String())
+		buf.astPrintf(node, "%#s()", node.Name.String())
 	}
 }
 
@@ -1459,10 +1527,6 @@ func (node *CollateExpr) Format(buf *TrackedBuffer) {
 
 // Format formats the node.
 func (node *FuncExpr) Format(buf *TrackedBuffer) {
-	var distinct string
-	if node.Distinct {
-		distinct = "distinct "
-	}
 	if !node.Qualifier.IsEmpty() {
 		buf.astPrintf(node, "%v.", node.Qualifier)
 	}
@@ -1475,16 +1539,20 @@ func (node *FuncExpr) Format(buf *TrackedBuffer) {
 	} else {
 		buf.WriteString(funcName)
 	}
-	buf.astPrintf(node, "(%s%v)", distinct, node.Exprs)
+	buf.astPrintf(node, "(%v)", node.Exprs)
 }
 
 // Format formats the node
 func (node *GroupConcatExpr) Format(buf *TrackedBuffer) {
 	if node.Distinct {
-		buf.astPrintf(node, "group_concat(%s%v%v%s%v)", DistinctStr, node.Exprs, node.OrderBy, node.Separator, node.Limit)
+		buf.astPrintf(node, "group_concat(%s%v%v", DistinctStr, node.Exprs, node.OrderBy)
 	} else {
-		buf.astPrintf(node, "group_concat(%v%v%s%v)", node.Exprs, node.OrderBy, node.Separator, node.Limit)
+		buf.astPrintf(node, "group_concat(%v%v", node.Exprs, node.OrderBy)
 	}
+	if node.Separator != "" {
+		buf.astPrintf(node, " %s %#s", keywordStrings[SEPARATOR], node.Separator)
+	}
+	buf.astPrintf(node, "%v)", node.Limit)
 }
 
 // Format formats the node.
@@ -1560,7 +1628,11 @@ func (node *FromFirstLastClause) Format(buf *TrackedBuffer) {
 // Format formats the node
 func (node *FramePoint) Format(buf *TrackedBuffer) {
 	if node.Expr != nil {
-		buf.astPrintf(node, " %v", node.Expr)
+		if node.Unit != IntervalNone {
+			buf.astPrintf(node, " interval %v %#s", node.Expr, node.Unit.ToString())
+		} else {
+			buf.astPrintf(node, " %v", node.Expr)
+		}
 	}
 	buf.astPrintf(node, " %s", node.Type.ToString())
 }
@@ -1638,6 +1710,29 @@ func (node *UpdateXMLExpr) Format(buf *TrackedBuffer) {
 	buf.astPrintf(node, "updatexml(%v, %v, %v)", node.Target, node.XPathExpr, node.NewXML)
 }
 
+func (node *PerformanceSchemaFuncExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "%s(", node.Type.ToString())
+	if node.Argument != nil {
+		buf.astPrintf(node, "%v", node.Argument)
+	}
+	buf.astPrintf(node, ")")
+}
+
+// Format formats the node
+func (node *GTIDFuncExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "%s(%v", node.Type.ToString(), node.Set1)
+	if node.Set2 != nil {
+		buf.astPrintf(node, ", %v", node.Set2)
+	}
+	if node.Timeout != nil {
+		buf.astPrintf(node, ", %v", node.Timeout)
+	}
+	if node.Channel != nil {
+		buf.astPrintf(node, ", %v", node.Channel)
+	}
+	buf.astPrintf(node, ")")
+}
+
 // Format formats the node.
 func (node *SubstrExpr) Format(buf *TrackedBuffer) {
 	if node.To == nil {
@@ -1645,6 +1740,34 @@ func (node *SubstrExpr) Format(buf *TrackedBuffer) {
 	} else {
 		buf.astPrintf(node, "substr(%v, %v, %v)", node.Name, node.From, node.To)
 	}
+}
+
+// Format formats the node.
+func (node *InsertExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "insert(%v, %v, %v, %v)", node.Str, node.Pos, node.Len, node.NewStr)
+}
+
+// Format formats the node.
+func (node *IntervalFuncExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "interval(%v, %v)", node.Expr, node.Exprs)
+}
+
+// Format formats the node.
+func (node *LocateExpr) Format(buf *TrackedBuffer) {
+	if node.Pos != nil {
+		buf.astPrintf(node, "locate(%v, %v, %v)", node.SubStr, node.Str, node.Pos)
+	} else {
+		buf.astPrintf(node, "locate(%v, %v)", node.SubStr, node.Str)
+	}
+}
+
+// Format formats the node.
+func (node *CharExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "char(%v", node.Exprs)
+	if node.Charset != "" {
+		buf.astPrintf(node, " using %#s", node.Charset)
+	}
+	buf.astPrintf(node, ")")
 }
 
 // Format formats the node.
@@ -1676,22 +1799,27 @@ func (node WindowDefinitions) Format(buf *TrackedBuffer) {
 }
 
 // Format formats the node.
-func (node *ConvertExpr) Format(buf *TrackedBuffer) {
-	buf.astPrintf(node, "convert(%v, %v", node.Expr, node.Type)
+func (node *CastExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "cast(%v as %v", node.Expr, node.Type)
 	if node.Array {
-		buf.astPrintf(node, " %s", keywordStrings[ARRAY])
+		buf.astPrintf(node, " %#s", keywordStrings[ARRAY])
 	}
 	buf.astPrintf(node, ")")
 }
 
 // Format formats the node.
+func (node *ConvertExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "convert(%v, %v)", node.Expr, node.Type)
+}
+
+// Format formats the node.
 func (node *ConvertUsingExpr) Format(buf *TrackedBuffer) {
-	buf.astPrintf(node, "convert(%v using %s)", node.Expr, node.Type)
+	buf.astPrintf(node, "convert(%v using %#s)", node.Expr, node.Type)
 }
 
 // Format formats the node.
 func (node *ConvertType) Format(buf *TrackedBuffer) {
-	buf.astPrintf(node, "%s", node.Type)
+	buf.astPrintf(node, "%#s", node.Type)
 	if node.Length != nil {
 		buf.astPrintf(node, "(%v", node.Length)
 		if node.Scale != nil {
@@ -1709,7 +1837,15 @@ func (node *ConvertType) Format(buf *TrackedBuffer) {
 
 // Format formats the node
 func (node *MatchExpr) Format(buf *TrackedBuffer) {
-	buf.astPrintf(node, "match(%v) against (%v%s)", node.Columns, node.Expr, node.Option.ToString())
+	buf.astPrintf(node, "match(")
+	for i, col := range node.Columns {
+		if i != 0 {
+			buf.astPrintf(node, ", %v", col)
+		} else {
+			buf.astPrintf(node, "%v", col)
+		}
+	}
+	buf.astPrintf(node, ") against (%v%s)", node.Expr, node.Option.ToString())
 }
 
 // Format formats the node.
@@ -1822,19 +1958,12 @@ func (node SetExprs) Format(buf *TrackedBuffer) {
 
 // Format formats the node.
 func (node *SetExpr) Format(buf *TrackedBuffer) {
-	if node.Scope != ImplicitScope {
-		buf.literal(node.Scope.ToString())
-		buf.WriteByte(' ')
-	}
 	// We don't have to backtick set variable names.
 	switch {
-	case node.Name.EqualString("charset") || node.Name.EqualString("names"):
-		buf.astPrintf(node, "%s %v", node.Name.String(), node.Expr)
-	case node.Name.EqualString(TransactionStr):
-		literal := node.Expr.(*Literal)
-		buf.astPrintf(node, "%s %s", node.Name.String(), strings.ToLower(string(literal.Val)))
+	case node.Var.Name.EqualString("charset") || node.Var.Name.EqualString("names"):
+		buf.astPrintf(node, "%s %v", node.Var.Name.String(), node.Expr)
 	default:
-		buf.astPrintf(node, "%v = %v", node.Name, node.Expr)
+		buf.astPrintf(node, "%v = %v", node.Var, node.Expr)
 	}
 }
 
@@ -1847,45 +1976,16 @@ func (node OnDup) Format(buf *TrackedBuffer) {
 }
 
 // Format formats the node.
-func (node ColIdent) Format(buf *TrackedBuffer) {
+func (node IdentifierCI) Format(buf *TrackedBuffer) {
 	if node.IsEmpty() {
 		return
 	}
-	for i := NoAt; i < node.at; i++ {
-		buf.WriteByte('@')
-	}
-	formatID(buf, node.val, node.at)
+	formatID(buf, node.val, NoAt)
 }
 
 // Format formats the node.
-func (node TableIdent) Format(buf *TrackedBuffer) {
+func (node IdentifierCS) Format(buf *TrackedBuffer) {
 	formatID(buf, node.v, NoAt)
-}
-
-// Format formats the node.
-func (node IsolationLevel) Format(buf *TrackedBuffer) {
-	buf.literal("isolation level ")
-	switch node {
-	case ReadUncommitted:
-		buf.literal(ReadUncommittedStr)
-	case ReadCommitted:
-		buf.literal(ReadCommittedStr)
-	case RepeatableRead:
-		buf.literal(RepeatableReadStr)
-	case Serializable:
-		buf.literal(SerializableStr)
-	default:
-		buf.literal("Unknown Isolation level value")
-	}
-}
-
-// Format formats the node.
-func (node AccessMode) Format(buf *TrackedBuffer) {
-	if node == ReadOnly {
-		buf.literal(TxReadOnly)
-	} else {
-		buf.literal(TxReadWrite)
-	}
 }
 
 // Format formats the node.
@@ -1924,11 +2024,11 @@ func (node *SelectInto) Format(buf *TrackedBuffer) {
 	if node == nil {
 		return
 	}
-	buf.astPrintf(node, "%s%s", node.Type.ToString(), node.FileName)
+	buf.astPrintf(node, "%s%#s", node.Type.ToString(), node.FileName)
 	if node.Charset.Name != "" {
-		buf.astPrintf(node, " character set %s", node.Charset.Name)
+		buf.astPrintf(node, " character set %#s", node.Charset.Name)
 	}
-	buf.astPrintf(node, "%s%s%s%s", node.FormatOption, node.ExportOption, node.Manifest, node.Overwrite)
+	buf.astPrintf(node, "%#s%#s%#s%#s", node.FormatOption, node.ExportOption, node.Manifest, node.Overwrite)
 }
 
 // Format formats the node.
@@ -2141,7 +2241,7 @@ func (node *AddColumns) Format(buf *TrackedBuffer) {
 
 // Format formats the node.
 func (node AlgorithmValue) Format(buf *TrackedBuffer) {
-	buf.astPrintf(node, "algorithm = %s", string(node))
+	buf.astPrintf(node, "algorithm = %#s", string(node))
 }
 
 // Format formats the node
@@ -2373,13 +2473,8 @@ func (node *JtOnResponse) Format(buf *TrackedBuffer) {
 }
 
 // Format formats the node.
-// Using capital letter for this function as an indicator that it's not a normal function call ¯\_(ツ)_/¯
 func (node *Offset) Format(buf *TrackedBuffer) {
-	if node.Original == "" {
-		buf.astPrintf(node, "OFFSET(%d)", node.V)
-	} else {
-		buf.astPrintf(node, "OFFSET(%d, '%s')", node.V, node.Original)
-	}
+	buf.astPrintf(node, ":%d", node.V)
 }
 
 // Format formats the node.
@@ -2394,7 +2489,6 @@ func (node *JSONSchemaValidationReportFuncExpr) Format(buf *TrackedBuffer) {
 
 // Format formats the node.
 func (node *JSONArrayExpr) Format(buf *TrackedBuffer) {
-	// buf.astPrintf(node,"%s(,"node.Name.Lowered())
 	buf.literal("json_array(")
 	if len(node.Params) > 0 {
 		var prefix string
@@ -2408,7 +2502,6 @@ func (node *JSONArrayExpr) Format(buf *TrackedBuffer) {
 
 // Format formats the node.
 func (node *JSONObjectExpr) Format(buf *TrackedBuffer) {
-	// buf.astPrintf(node,"%s(,"node.Name.Lowered())
 	buf.literal("json_object(")
 	if len(node.Params) > 0 {
 		for i, p := range node.Params {
@@ -2423,7 +2516,7 @@ func (node *JSONObjectExpr) Format(buf *TrackedBuffer) {
 }
 
 // Format formats the node.
-func (node JSONObjectParam) Format(buf *TrackedBuffer) {
+func (node *JSONObjectParam) Format(buf *TrackedBuffer) {
 	buf.astPrintf(node, "%v, %v", node.Key, node.Value)
 }
 
@@ -2471,13 +2564,9 @@ func (node *JSONExtractExpr) Format(buf *TrackedBuffer) {
 // Format formats the node
 func (node *JSONKeysExpr) Format(buf *TrackedBuffer) {
 	buf.astPrintf(node, "json_keys(%v", node.JSONDoc)
-	if len(node.PathList) > 0 {
-		buf.literal(", ")
-	}
-	var prefix string
-	for _, n := range node.PathList {
-		buf.astPrintf(node, "%s%v", prefix, n)
-		prefix = ", "
+	if node.Path != nil {
+		buf.astPrintf(node, ", %v)", node.Path)
+		return
 	}
 	buf.WriteByte(')')
 }
@@ -2577,6 +2666,94 @@ func (node *JSONUnquoteExpr) Format(buf *TrackedBuffer) {
 	buf.WriteString(")")
 }
 
+func (node *Count) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "%s(", node.AggrName())
+	if node.Distinct {
+		buf.literal(DistinctStr)
+	}
+	buf.astPrintf(node, "%v)", node.Args)
+}
+
+func (node *CountStar) Format(buf *TrackedBuffer) {
+	buf.WriteString("count(*)")
+}
+
+func (node *AnyValue) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "any_value(%v)", node.Arg)
+}
+
+func (node *Avg) Format(buf *TrackedBuffer) {
+	buf.WriteString("avg(")
+	if node.Distinct {
+		buf.literal(DistinctStr)
+	}
+	buf.astPrintf(node, "%v)", node.Arg)
+}
+
+func (node *Max) Format(buf *TrackedBuffer) {
+	buf.WriteString("max(")
+	if node.Distinct {
+		buf.literal(DistinctStr)
+	}
+	buf.astPrintf(node, "%v)", node.Arg)
+}
+
+func (node *Min) Format(buf *TrackedBuffer) {
+	buf.WriteString("min(")
+	if node.Distinct {
+		buf.literal(DistinctStr)
+	}
+	buf.astPrintf(node, "%v)", node.Arg)
+}
+
+func (node *Sum) Format(buf *TrackedBuffer) {
+	buf.WriteString("sum(")
+	if node.Distinct {
+		buf.literal(DistinctStr)
+	}
+	buf.astPrintf(node, "%v)", node.Arg)
+}
+
+func (node *BitAnd) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "bit_and(%v)", node.Arg)
+}
+
+func (node *BitOr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "bit_or(%v)", node.Arg)
+}
+
+func (node *BitXor) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "bit_xor(%v)", node.Arg)
+}
+
+func (node *Std) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "std(%v)", node.Arg)
+}
+
+func (node *StdDev) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "stddev(%v)", node.Arg)
+}
+
+func (node *StdPop) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "stddev_pop(%v)", node.Arg)
+}
+
+func (node *StdSamp) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "stddev_samp(%v)", node.Arg)
+}
+
+func (node *VarPop) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "var_pop(%v)", node.Arg)
+}
+
+func (node *VarSamp) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "var_samp(%v)", node.Arg)
+}
+
+func (node *Variance) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "variance(%v)", node.Arg)
+}
+
 // Format formats the node.
 func (node *LockingFunc) Format(buf *TrackedBuffer) {
 	buf.WriteString(node.Type.ToString() + "(")
@@ -2587,4 +2764,186 @@ func (node *LockingFunc) Format(buf *TrackedBuffer) {
 		buf.astPrintf(node, ", %v", node.Timeout)
 	}
 	buf.WriteString(")")
+}
+
+// Format formats the node.
+func (node *Variable) Format(buf *TrackedBuffer) {
+	switch node.Scope {
+	case VariableScope:
+		buf.literal("@")
+	case SessionScope:
+		if node.Name.EqualString(TransactionIsolationStr) || node.Name.EqualString(TransactionReadOnlyStr) {
+			// @@ without session have `next transaction` scope for these system variables.
+			// so if they are in session scope it has to be printed explicitly.
+			buf.astPrintf(node, "@@%s.", node.Scope.ToString())
+			break
+		}
+		buf.literal("@@")
+	case GlobalScope, PersistSysScope, PersistOnlySysScope:
+		buf.astPrintf(node, "@@%s.", node.Scope.ToString())
+	case NextTxScope:
+		buf.literal("@@")
+	}
+	buf.astPrintf(node, "%v", node.Name)
+}
+
+// Format formats the node.
+func (node *PointExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "point(%v, %v)", node.XCordinate, node.YCordinate)
+}
+
+// Format formats the node.
+func (node *LineStringExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "linestring(%v)", node.PointParams)
+}
+
+// Format formats the node.
+func (node *PolygonExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "polygon(%v)", node.LinestringParams)
+}
+
+// Format formats the node.
+func (node *PurgeBinaryLogs) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "purge binary logs")
+	if node.To != "" {
+		buf.astPrintf(node, " to '%#s'", node.To)
+	} else {
+		buf.astPrintf(node, " before '%#s'", node.Before)
+	}
+}
+
+func (node *MultiPolygonExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "multipolygon(%v)", node.PolygonParams)
+}
+
+// Format formats the node.
+func (node *MultiPointExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "multipoint(%v)", node.PointParams)
+}
+
+// Format formats the node.
+func (node *MultiLinestringExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "multilinestring(%v)", node.LinestringParams)
+}
+
+// Format formats the node
+func (node *GeomFromTextExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "%s(%v", node.Type.ToString(), node.WktText)
+	if node.Srid != nil {
+		buf.astPrintf(node, ", %v", node.Srid)
+	}
+	if node.AxisOrderOpt != nil {
+		buf.astPrintf(node, ", %v", node.AxisOrderOpt)
+	}
+	buf.WriteByte(')')
+}
+
+// Format formats the node
+func (node *GeomFromWKBExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "%s(%v", node.Type.ToString(), node.WkbBlob)
+	if node.Srid != nil {
+		buf.astPrintf(node, ", %v", node.Srid)
+	}
+	if node.AxisOrderOpt != nil {
+		buf.astPrintf(node, ", %v", node.AxisOrderOpt)
+	}
+	buf.WriteByte(')')
+}
+
+// Format formats the node
+func (node *GeomFormatExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "%s(%v", node.FormatType.ToString(), node.Geom)
+	if node.AxisOrderOpt != nil {
+		buf.astPrintf(node, ", %v", node.AxisOrderOpt)
+	}
+	buf.WriteByte(')')
+}
+
+// Format formats the node
+func (node *GeomPropertyFuncExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "%s(%v)", node.Property.ToString(), node.Geom)
+}
+
+// Format formats the node
+func (node *PointPropertyFuncExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "%s(%v", node.Property.ToString(), node.Point)
+	if node.ValueToSet != nil {
+		buf.astPrintf(node, ", %v", node.ValueToSet)
+	}
+	buf.WriteByte(')')
+}
+
+// Format formats the node
+func (node *LinestrPropertyFuncExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "%s(%v", node.Property.ToString(), node.Linestring)
+	if node.PropertyDefArg != nil {
+		buf.astPrintf(node, ", %v", node.PropertyDefArg)
+	}
+	buf.WriteByte(')')
+}
+
+// Format formats the node
+func (node *PolygonPropertyFuncExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "%s(%v", node.Property.ToString(), node.Polygon)
+	if node.PropertyDefArg != nil {
+		buf.astPrintf(node, ", %v", node.PropertyDefArg)
+	}
+	buf.WriteByte(')')
+}
+
+// Format formats the node
+func (node *GeomCollPropertyFuncExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "%s(%v", node.Property.ToString(), node.GeomColl)
+	if node.PropertyDefArg != nil {
+		buf.astPrintf(node, ", %v", node.PropertyDefArg)
+	}
+	buf.WriteByte(')')
+}
+
+// Format formats the node
+func (node *GeomFromGeoHashExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "%s(%v", node.GeomType.ToString(), node.GeoHash)
+	if node.SridOpt != nil {
+		buf.astPrintf(node, ", %v", node.SridOpt)
+	}
+	buf.WriteByte(')')
+}
+
+// Format formats the node
+func (node *GeoHashFromLatLongExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "st_geohash(%v, %v, %v)", node.Longitude, node.Latitude, node.MaxLength)
+}
+
+// Format formats the node
+func (node *GeoHashFromPointExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "st_geohash(%v, %v)", node.Point, node.MaxLength)
+}
+
+// Format formats the node
+func (node *GeoJSONFromGeomExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "st_asgeojson(%v", node.Geom)
+	if node.MaxDecimalDigits != nil {
+		buf.astPrintf(node, ", %v", node.MaxDecimalDigits)
+	}
+	if node.Bitmask != nil {
+		buf.astPrintf(node, ", %v", node.Bitmask)
+	}
+	buf.WriteByte(')')
+}
+
+// Format formats the node
+func (node *GeomFromGeoJSONExpr) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "st_geomfromgeojson(%v", node.GeoJSON)
+	if node.HigherDimHandlerOpt != nil {
+		buf.astPrintf(node, ", %v", node.HigherDimHandlerOpt)
+	}
+	if node.Srid != nil {
+		buf.astPrintf(node, ", %v", node.Srid)
+	}
+	buf.WriteByte(')')
+}
+
+// Format formats the kill statement
+func (node *Kill) Format(buf *TrackedBuffer) {
+	buf.astPrintf(node, "kill %s %d", node.Type.ToString(), node.ProcesslistID)
 }

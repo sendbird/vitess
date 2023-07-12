@@ -18,10 +18,11 @@ package vtgate
 
 import (
 	"fmt"
-	"html/template"
 	"net/http"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/safehtml/template"
 
 	"vitess.io/vitess/go/vt/logz"
 
@@ -109,7 +110,7 @@ func (e *Executor) gatherScatterStats() (statsResults, error) {
 			PercentTimeOfScatters:  100 * float64(execTime) / float64(scatterExecTime),
 			PercentCountOfReads:    100 * float64(execCount) / float64(readOnlyCount),
 			PercentCountOfScatters: 100 * float64(execCount) / float64(scatterCount),
-			From:                   route.Keyspace.Name + "." + route.TableName,
+			From:                   route.Keyspace.Name + "." + route.GetTableName(),
 			Count:                  execCount,
 		}
 	}

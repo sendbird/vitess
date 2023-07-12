@@ -39,7 +39,7 @@ func BuildPermissions(stmt sqlparser.Statement) []Permission {
 	case *sqlparser.Union, *sqlparser.Select:
 		permissions = buildSubqueryPermissions(node, tableacl.READER, permissions)
 	case *sqlparser.Insert:
-		permissions = buildTableNamePermissions(node.Table, tableacl.WRITER, permissions)
+		permissions = buildTableExprPermissions(node.Table, tableacl.WRITER, permissions)
 		permissions = buildSubqueryPermissions(node, tableacl.READER, permissions)
 	case *sqlparser.Update:
 		permissions = buildTableExprsPermissions(node.TableExprs, tableacl.WRITER, permissions)
@@ -51,7 +51,12 @@ func BuildPermissions(stmt sqlparser.Statement) []Permission {
 		for _, t := range node.AffectedTables() {
 			permissions = buildTableNamePermissions(t, tableacl.ADMIN, permissions)
 		}
-	case *sqlparser.AlterMigration, *sqlparser.RevertMigration, *sqlparser.ShowMigrationLogs, *sqlparser.ShowThrottledApps:
+	case
+		*sqlparser.AlterMigration,
+		*sqlparser.RevertMigration,
+		*sqlparser.ShowMigrationLogs,
+		*sqlparser.ShowThrottledApps,
+		*sqlparser.ShowThrottlerStatus:
 		permissions = []Permission{} // TODO(shlomi) what are the correct permissions here? Table is unknown
 	case *sqlparser.Flush:
 		for _, t := range node.TableNames {

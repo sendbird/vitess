@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 
+	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/vterrors"
@@ -40,20 +41,26 @@ import (
 
 var autoIncr = regexp.MustCompile(` AUTO_INCREMENT=\d+`)
 
-// executeSchemaCommands executes some SQL commands, using the mysql
-// command line tool. It uses the dba connection parameters, with credentials.
-func (mysqld *Mysqld) executeSchemaCommands(sql string) error {
+type EmptyColumnsErr struct {
+	dbName, tableName, query string
+}
+
+func (e EmptyColumnsErr) Error() string {
+	return fmt.Sprintf("unable to get columns for table %s.%s using query %s", e.dbName, e.tableName, e.query)
+}
+
+// executeSchemaCommands executes some SQL commands. It uses the dba connection parameters, with credentials.
+func (mysqld *Mysqld) executeSchemaCommands(ctx context.Context, sql string) error {
 	params, err := mysqld.dbcfgs.DbaConnector().MysqlParams()
 	if err != nil {
 		return err
 	}
-
-	return mysqld.executeMysqlScript(params, strings.NewReader(sql))
+	return mysqld.executeMysqlScript(ctx, params, sql)
 }
 
-func encodeTableName(tableName string) string {
+func encodeEntityName(name string) string {
 	var buf strings.Builder
-	sqltypes.NewVarChar(tableName).EncodeSQL(&buf)
+	sqltypes.NewVarChar(name).EncodeSQL(&buf)
 	return buf.String()
 }
 
@@ -65,7 +72,7 @@ func tableListSQL(tables []string) (string, error) {
 
 	encodedTables := make([]string, len(tables))
 	for i, tableName := range tables {
-		encodedTables[i] = encodeTableName(tableName)
+		encodedTables[i] = encodeEntityName(tableName)
 	}
 
 	return "(" + strings.Join(encodedTables, ", ") + ")", nil
@@ -73,7 +80,7 @@ func tableListSQL(tables []string) (string, error) {
 
 // GetSchema returns the schema for database for tables listed in
 // tables. If tables is empty, return the schema for all tables.
-func (mysqld *Mysqld) GetSchema(ctx context.Context, dbName string, tables, excludeTables []string, includeViews bool) (*tabletmanagerdatapb.SchemaDefinition, error) {
+func (mysqld *Mysqld) GetSchema(ctx context.Context, dbName string, request *tabletmanagerdatapb.GetSchemaRequest) (*tabletmanagerdatapb.SchemaDefinition, error) {
 	sd := &tabletmanagerdatapb.SchemaDefinition{}
 	backtickDBName := sqlescape.EscapeID(dbName)
 
@@ -87,7 +94,7 @@ func (mysqld *Mysqld) GetSchema(ctx context.Context, dbName string, tables, excl
 	}
 	sd.DatabaseSchema = strings.Replace(qr.Rows[0][1].ToString(), backtickDBName, "{{.DatabaseName}}", 1)
 
-	tds, err := mysqld.collectBasicTableData(ctx, dbName, tables, excludeTables, includeViews)
+	tds, err := mysqld.collectBasicTableData(ctx, dbName, request.Tables, request.ExcludeTables, request.IncludeViews)
 	if err != nil {
 		return nil, err
 	}
@@ -107,8 +114,17 @@ func (mysqld *Mysqld) GetSchema(ctx context.Context, dbName string, tables, excl
 		go func(td *tabletmanagerdatapb.TableDefinition) {
 			defer wg.Done()
 
-			fields, columns, schema, err := mysqld.collectSchema(ctx, dbName, td.Name, td.Type)
+			fields, columns, schema, err := mysqld.collectSchema(ctx, dbName, td.Name, td.Type, request.TableSchemaOnly)
 			if err != nil {
+				// There's a possible race condition: it could happen that a table was dropped in between reading
+				// the list of tables (collectBasicTableData(), earlier) and the point above where we investigate
+				// the table.
+				// This is fine. We identify the situation and keep the table without any fields/columns/key information
+				sqlErr, isSQLErr := mysql.NewSQLErrorFromError(err).(*mysql.SQLError)
+				if isSQLErr && sqlErr != nil && sqlErr.Number() == mysql.ERNoSuchTable {
+					return
+				}
+
 				allErrors.RecordError(err)
 				cancel()
 				return
@@ -121,6 +137,8 @@ func (mysqld *Mysqld) GetSchema(ctx context.Context, dbName string, tables, excl
 	}
 
 	// Get primary columns concurrently.
+	// The below runs a single query on `INFORMATION_SCHEMA` and does not interact with the actual tables.
+	// It is therefore safe to run even if some tables are dropped in the interim.
 	colMap := map[string][]string{}
 	if len(tableNames) > 0 {
 		wg.Add(1)
@@ -147,8 +165,6 @@ func (mysqld *Mysqld) GetSchema(ctx context.Context, dbName string, tables, excl
 	}
 
 	sd.TableDefinitions = tds
-
-	tmutils.GenerateSchemaVersion(sd)
 	return sd, nil
 }
 
@@ -212,15 +228,16 @@ func (mysqld *Mysqld) collectBasicTableData(ctx context.Context, dbName string, 
 	return tds, nil
 }
 
-func (mysqld *Mysqld) collectSchema(ctx context.Context, dbName, tableName, tableType string) ([]*querypb.Field, []string, string, error) {
-	fields, columns, err := mysqld.GetColumns(ctx, dbName, tableName)
+func (mysqld *Mysqld) collectSchema(ctx context.Context, dbName, tableName, tableType string, tableSchemaOnly bool) (fields []*querypb.Field, columns []string, schema string, err error) {
+	schema, err = mysqld.normalizedSchema(ctx, dbName, tableName, tableType)
 	if err != nil {
 		return nil, nil, "", err
 	}
-
-	schema, err := mysqld.normalizedSchema(ctx, dbName, tableName, tableType)
-	if err != nil {
-		return nil, nil, "", err
+	if !tableSchemaOnly {
+		fields, columns, err = mysqld.GetColumns(ctx, dbName, tableName)
+		if err != nil {
+			return nil, nil, "", err
+		}
 	}
 
 	return fields, columns, schema, nil
@@ -231,7 +248,7 @@ func (mysqld *Mysqld) normalizedSchema(ctx context.Context, dbName, tableName, t
 	backtickDBName := sqlescape.EscapeID(dbName)
 	qr, fetchErr := mysqld.FetchSuperQuery(ctx, fmt.Sprintf("SHOW CREATE TABLE %s.%s", backtickDBName, sqlescape.EscapeID(tableName)))
 	if fetchErr != nil {
-		return "", fetchErr
+		return "", vterrors.Wrapf(fetchErr, "in Mysqld.normalizedSchema()")
 	}
 	if len(qr.Rows) == 0 {
 		return "", fmt.Errorf("empty create table statement for %v", tableName)
@@ -254,7 +271,8 @@ func (mysqld *Mysqld) normalizedSchema(ctx context.Context, dbName, tableName, t
 // ResolveTables returns a list of actual tables+views matching a list
 // of regexps
 func ResolveTables(ctx context.Context, mysqld MysqlDaemon, dbName string, tables []string) ([]string, error) {
-	sd, err := mysqld.GetSchema(ctx, dbName, tables, nil, true)
+	req := &tabletmanagerdatapb.GetSchemaRequest{Tables: tables, IncludeViews: true, TableSchemaOnly: true}
+	sd, err := mysqld.GetSchema(ctx, dbName, req)
 	if err != nil {
 		return nil, err
 	}
@@ -268,26 +286,30 @@ func ResolveTables(ctx context.Context, mysqld MysqlDaemon, dbName string, table
 const (
 	GetColumnNamesQuery = `SELECT COLUMN_NAME as column_name
 		FROM INFORMATION_SCHEMA.COLUMNS
-		WHERE TABLE_SCHEMA = %s AND TABLE_NAME = '%s'
+		WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
 		ORDER BY ORDINAL_POSITION`
 	GetFieldsQuery = "SELECT %s FROM %s WHERE 1 != 1"
 )
 
+// GetColumnsList returns the column names for a given table/view, using a query generating function.
+// Returned values:
+// - selectColumns: a string of comma delimited qualified names to be used in a SELECT query. e.g. "`id`, `name`, `val`"
+// - err: error
 func GetColumnsList(dbName, tableName string, exec func(string, int, bool) (*sqltypes.Result, error)) (string, error) {
 	var dbName2 string
 	if dbName == "" {
 		dbName2 = "database()"
 	} else {
-		dbName2 = fmt.Sprintf("'%s'", dbName)
+		dbName2 = encodeEntityName(dbName)
 	}
-	query := fmt.Sprintf(GetColumnNamesQuery, dbName2, sqlescape.UnescapeID(tableName))
+	query := fmt.Sprintf(GetColumnNamesQuery, dbName2, encodeEntityName(sqlescape.UnescapeID(tableName)))
 	qr, err := exec(query, -1, true)
 	if err != nil {
 		return "", err
 	}
 	if qr == nil || len(qr.Rows) == 0 {
-		err = fmt.Errorf("unable to get columns for table %s.%s using query %s", dbName, tableName, query)
-		log.Errorf("%s", fmt.Errorf("unable to get columns for table %s.%s using query %s", dbName, tableName, query))
+		err := &EmptyColumnsErr{dbName: dbName, tableName: tableName, query: query}
+		log.Error(err.Error())
 		return "", err
 	}
 	selectColumns := ""
@@ -320,7 +342,7 @@ func GetColumns(dbName, table string, exec func(string, int, bool) (*sqltypes.Re
 	query := fmt.Sprintf(GetFieldsQuery, selectColumns, tableSpec)
 	qr, err := exec(query, 0, true)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, vterrors.Wrapf(err, "in Mysqld.GetColumns()")
 	}
 
 	columns := make([]string, len(qr.Fields))
@@ -365,9 +387,9 @@ func (mysqld *Mysqld) getPrimaryKeyColumns(ctx context.Context, dbName string, t
 	sql := `
             SELECT TABLE_NAME as table_name, COLUMN_NAME as column_name
             FROM information_schema.STATISTICS
-            WHERE TABLE_SCHEMA = '%s' AND TABLE_NAME IN %s AND LOWER(INDEX_NAME) = 'primary'
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME IN %s AND LOWER(INDEX_NAME) = 'primary'
             ORDER BY table_name, SEQ_IN_INDEX`
-	sql = fmt.Sprintf(sql, dbName, tableList)
+	sql = fmt.Sprintf(sql, encodeEntityName(dbName), tableList)
 	qr, err := conn.ExecuteFetch(sql, len(tables)*100, true)
 	if err != nil {
 		return nil, err
@@ -388,7 +410,8 @@ func (mysqld *Mysqld) PreflightSchemaChange(ctx context.Context, dbName string, 
 	results := make([]*tabletmanagerdatapb.SchemaChangeResult, len(changes))
 
 	// Get current schema from the real database.
-	originalSchema, err := mysqld.GetSchema(ctx, dbName, nil, nil, true)
+	req := &tabletmanagerdatapb.GetSchemaRequest{IncludeViews: true, TableSchemaOnly: true}
+	originalSchema, err := mysqld.GetSchema(ctx, dbName, req)
 	if err != nil {
 		return nil, err
 	}
@@ -414,13 +437,14 @@ func (mysqld *Mysqld) PreflightSchemaChange(ctx context.Context, dbName string, 
 			initialCopySQL += s + ";\n"
 		}
 	}
-	if err = mysqld.executeSchemaCommands(initialCopySQL); err != nil {
+	if err = mysqld.executeSchemaCommands(ctx, initialCopySQL); err != nil {
 		return nil, err
 	}
 
 	// For each change, record the schema before and after.
 	for i, change := range changes {
-		beforeSchema, err := mysqld.GetSchema(ctx, "_vt_preflight", nil, nil, true)
+		req := &tabletmanagerdatapb.GetSchemaRequest{IncludeViews: true}
+		beforeSchema, err := mysqld.GetSchema(ctx, "_vt_preflight", req)
 		if err != nil {
 			return nil, err
 		}
@@ -429,12 +453,12 @@ func (mysqld *Mysqld) PreflightSchemaChange(ctx context.Context, dbName string, 
 		sql := "SET sql_log_bin = 0;\n"
 		sql += "USE _vt_preflight;\n"
 		sql += change
-		if err = mysqld.executeSchemaCommands(sql); err != nil {
+		if err = mysqld.executeSchemaCommands(ctx, sql); err != nil {
 			return nil, err
 		}
 
 		// get the result
-		afterSchema, err := mysqld.GetSchema(ctx, "_vt_preflight", nil, nil, true)
+		afterSchema, err := mysqld.GetSchema(ctx, "_vt_preflight", req)
 		if err != nil {
 			return nil, err
 		}
@@ -445,7 +469,7 @@ func (mysqld *Mysqld) PreflightSchemaChange(ctx context.Context, dbName string, 
 	// and clean up the extra database
 	dropSQL := "SET sql_log_bin = 0;\n"
 	dropSQL += "DROP DATABASE _vt_preflight;\n"
-	if err = mysqld.executeSchemaCommands(dropSQL); err != nil {
+	if err = mysqld.executeSchemaCommands(ctx, dropSQL); err != nil {
 		return nil, err
 	}
 
@@ -455,7 +479,8 @@ func (mysqld *Mysqld) PreflightSchemaChange(ctx context.Context, dbName string, 
 // ApplySchemaChange will apply the schema change to the given database.
 func (mysqld *Mysqld) ApplySchemaChange(ctx context.Context, dbName string, change *tmutils.SchemaChange) (*tabletmanagerdatapb.SchemaChangeResult, error) {
 	// check current schema matches
-	beforeSchema, err := mysqld.GetSchema(ctx, dbName, nil, nil, true)
+	req := &tabletmanagerdatapb.GetSchemaRequest{IncludeViews: true}
+	beforeSchema, err := mysqld.GetSchema(ctx, dbName, req)
 	if err != nil {
 		return nil, err
 	}
@@ -504,12 +529,12 @@ func (mysqld *Mysqld) ApplySchemaChange(ctx context.Context, dbName string, chan
 
 	// execute the schema change using an external mysql process
 	// (to benefit from the extra commands in mysql cli)
-	if err = mysqld.executeSchemaCommands(sql); err != nil {
+	if err = mysqld.executeSchemaCommands(ctx, sql); err != nil {
 		return nil, err
 	}
 
 	// get AfterSchema
-	afterSchema, err := mysqld.GetSchema(ctx, dbName, nil, nil, true)
+	afterSchema, err := mysqld.GetSchema(ctx, dbName, req)
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +564,9 @@ func (mysqld *Mysqld) ApplySchemaChange(ctx context.Context, dbName string, chan
 // are available it will attempt to choose the most efficient
 // one based on the column data types and the number of columns
 // in the index. See here for the data type storage sizes:
-//   https://dev.mysql.com/doc/refman/en/storage-requirements.html
+//
+//	https://dev.mysql.com/doc/refman/en/storage-requirements.html
+//
 // If this function is used on a table that DOES have a
 // defined PRIMARY KEY then it may return the columns for
 // that index if it is likely the most efficient one amongst
@@ -582,16 +609,18 @@ func (mysqld *Mysqld) GetPrimaryKeyEquivalentColumns(ctx context.Context, dbName
                                               END
                                             ) AS type_cost, COUNT(stats.COLUMN_NAME) AS col_count FROM information_schema.STATISTICS AS stats INNER JOIN
                   information_schema.COLUMNS AS cols ON stats.TABLE_SCHEMA = cols.TABLE_SCHEMA AND stats.TABLE_NAME = cols.TABLE_NAME AND stats.COLUMN_NAME = cols.COLUMN_NAME
-                WHERE stats.TABLE_SCHEMA = '%s' AND stats.TABLE_NAME = '%s' AND stats.INDEX_NAME NOT IN
+                WHERE stats.TABLE_SCHEMA = %s AND stats.TABLE_NAME = %s AND stats.INDEX_NAME NOT IN
                 (
                     SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS
-                    WHERE TABLE_SCHEMA = '%s' AND TABLE_NAME = '%s' AND (NON_UNIQUE = 1 OR NULLABLE = 'YES')
+                    WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND (NON_UNIQUE = 1 OR NULLABLE = 'YES')
                 )
                 GROUP BY INDEX_NAME ORDER BY type_cost ASC, col_count ASC LIMIT 1
             ) AS pke ON index_cols.INDEX_NAME = pke.INDEX_NAME
-            WHERE index_cols.TABLE_SCHEMA = '%s' AND index_cols.TABLE_NAME = '%s' AND NON_UNIQUE = 0 AND NULLABLE != 'YES'
+            WHERE index_cols.TABLE_SCHEMA = %s AND index_cols.TABLE_NAME = %s AND NON_UNIQUE = 0 AND NULLABLE != 'YES'
             ORDER BY SEQ_IN_INDEX ASC`
-	sql = fmt.Sprintf(sql, dbName, table, dbName, table, dbName, table)
+	encodedDbName := encodeEntityName(dbName)
+	encodedTable := encodeEntityName(table)
+	sql = fmt.Sprintf(sql, encodedDbName, encodedTable, encodedDbName, encodedTable, encodedDbName, encodedTable)
 	qr, err := conn.ExecuteFetch(sql, 1000, true)
 	if err != nil {
 		return nil, err
@@ -605,7 +634,7 @@ func (mysqld *Mysqld) GetPrimaryKeyEquivalentColumns(ctx context.Context, dbName
 	return cols, err
 }
 
-//tableDefinitions is a sortable collection of table definitions
+// tableDefinitions is a sortable collection of table definitions
 type tableDefinitions []*tabletmanagerdatapb.TableDefinition
 
 func (t tableDefinitions) Len() int {

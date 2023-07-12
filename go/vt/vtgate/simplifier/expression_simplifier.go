@@ -81,7 +81,6 @@ func SimplifyExpr(in sqlparser.Expr, test CheckF) (smallestKnown sqlparser.Expr)
 func getNodesAtLevel(e sqlparser.Expr, level int) (result []sqlparser.Expr, replaceF []func(node sqlparser.SQLNode)) {
 	lvl := 0
 	pre := func(cursor *sqlparser.Cursor) bool {
-
 		if expr, isExpr := cursor.Node().(sqlparser.Expr); level == lvl && isExpr {
 			result = append(result, expr)
 			replaceF = append(replaceF, cursor.ReplacerF())
@@ -224,6 +223,10 @@ func (s *shrinker) fillQueue() bool {
 				continue
 			}
 			s.queue = append(s.queue, expr.Expr)
+		}
+	case sqlparser.AggrFunc:
+		for _, ae := range e.GetArgs() {
+			s.queue = append(s.queue, ae)
 		}
 	case *sqlparser.ColName:
 		// we can try to replace the column with a literal value

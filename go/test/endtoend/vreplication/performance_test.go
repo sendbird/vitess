@@ -63,7 +63,8 @@ create table customer(cid int, name varbinary(128), meta json default null, typ 
 	vtgate = defaultCell.Vtgates[0]
 	require.NotNil(t, vtgate)
 
-	vtgate.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.primary", "product", "0"), 1)
+	err := cluster.WaitForHealthyShard(vc.VtctldClient, "product", "0")
+	require.NoError(t, err)
 
 	vtgateConn = getConnection(t, vc.ClusterConfig.hostname, vc.ClusterConfig.vtgateMySQLPort)
 	defer vtgateConn.Close()
@@ -79,11 +80,11 @@ create table customer(cid int, name varbinary(128), meta json default null, typ 
 		}
 	})
 
-	validateCount(t, vtgateConn, "stress_src:0", "largebin", insertCount)
+	waitForRowCount(t, vtgateConn, "stress_src:0", "largebin", insertCount)
 
 	t.Logf("creating new keysepace '%s'", targetKs)
 	vc.AddKeyspace(t, []*Cell{defaultCell}, targetKs, "0", initialStressVSchema, initialStressSchema, 0, 0, 200, nil)
-	validateCount(t, vtgateConn, "stress_tgt:0", "largebin", 0)
+	waitForRowCount(t, vtgateConn, "stress_tgt:0", "largebin", 0)
 
 	t.Logf("moving 'largebin' table...")
 	moveStart := time.Now()
@@ -96,13 +97,13 @@ create table customer(cid int, name varbinary(128), meta json default null, typ 
 		}
 	}
 
-	moveTables(t, defaultCell.Name, "stress_workflow", sourceKs, targetKs, "largebin")
+	moveTablesAction(t, "Create", defaultCell.Name, "stress_workflow", sourceKs, targetKs, "largebin")
 
 	keyspaceTgt := defaultCell.Keyspaces[targetKs]
 	for _, shard := range keyspaceTgt.Shards {
 		for _, tablet := range shard.Tablets {
 			t.Logf("catchup shard=%v, tablet=%v", shard.Name, tablet.Name)
-			tablet.Vttablet.WaitForVReplicationToCatchup(t, "stress_workflow", fmt.Sprintf("vt_%s", tablet.Vttablet.Keyspace), 5*time.Minute)
+			tablet.Vttablet.WaitForVReplicationToCatchup(t, "stress_workflow", fmt.Sprintf("vt_%s", tablet.Vttablet.Keyspace), sidecarDBName, 5*time.Minute)
 		}
 	}
 
@@ -115,5 +116,5 @@ create table customer(cid int, name varbinary(128), meta json default null, typ 
 	}
 
 	t.Logf("finished catching up after MoveTables (%v)", time.Since(moveStart))
-	validateCount(t, vtgateConn, "stress_tgt:0", "largebin", insertCount)
+	waitForRowCount(t, vtgateConn, "stress_tgt:0", "largebin", insertCount)
 }

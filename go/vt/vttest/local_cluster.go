@@ -21,32 +21,35 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode"
+
+	"vitess.io/vitess/go/vt/sidecardb"
 
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
 
+	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/proto/logutil"
+	"vitess.io/vitess/go/vt/vtctl/vtctlclient"
+
+	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
+	vttestpb "vitess.io/vitess/go/vt/proto/vttest"
 
 	// we need to import the grpcvtctlclient library so the gRPC
 	// vtctl client is registered and can be used.
 	_ "vitess.io/vitess/go/vt/vtctl/grpcvtctlclient"
-	"vitess.io/vitess/go/vt/vtctl/vtctlclient"
-
-	"vitess.io/vitess/go/mysql"
-	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/vt/log"
-
-	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
-	vttestpb "vitess.io/vitess/go/vt/proto/vttest"
 )
 
 // Config are the settings used to configure the self-contained Vitess cluster.
@@ -86,11 +89,8 @@ type Config struct {
 	Charset string
 
 	// PlannerVersion is the planner version to use for the vtgate.
-	// Choose between V3, Gen4, Gen4Greedy and Gen4Fallback
+	// Choose between V3, V3Insert, Gen4, Gen4Greedy and Gen4Fallback
 	PlannerVersion string
-
-	// PlannerVersionDeprecated is deprecated and should not be used
-	PlannerVersionDeprecated string
 
 	// ExtraMyCnf are the extra .CNF files to be added to the MySQL config
 	ExtraMyCnf []string
@@ -148,6 +148,8 @@ type Config struct {
 	ExternalTopoGlobalServerAddress string
 
 	ExternalTopoGlobalRoot string
+
+	VtgateTabletRefreshInterval time.Duration
 }
 
 // InitSchemas is a shortcut for tests that just want to setup a single
@@ -156,20 +158,20 @@ type Config struct {
 // It then sets the right value for cfg.SchemaDir.
 // At the end of the test, the caller should os.RemoveAll(cfg.SchemaDir).
 func (cfg *Config) InitSchemas(keyspace, schema string, vschema *vschemapb.Keyspace) error {
-	if cfg.SchemaDir != "" {
-		return fmt.Errorf("SchemaDir is already set to %v", cfg.SchemaDir)
-	}
-
-	// Create a base temporary directory.
-	tempSchemaDir, err := os.MkdirTemp("", "vttest")
-	if err != nil {
-		return err
+	schemaDir := cfg.SchemaDir
+	if schemaDir == "" {
+		// Create a base temporary directory.
+		tempSchemaDir, err := os.MkdirTemp("", "vttest")
+		if err != nil {
+			return err
+		}
+		schemaDir = tempSchemaDir
 	}
 
 	// Write the schema if set.
 	if schema != "" {
-		ksDir := path.Join(tempSchemaDir, keyspace)
-		err = os.Mkdir(ksDir, os.ModeDir|0775)
+		ksDir := path.Join(schemaDir, keyspace)
+		err := os.Mkdir(ksDir, os.ModeDir|0775)
 		if err != nil {
 			return err
 		}
@@ -182,7 +184,7 @@ func (cfg *Config) InitSchemas(keyspace, schema string, vschema *vschemapb.Keysp
 
 	// Write in the vschema if set.
 	if vschema != nil {
-		vschemaFilePath := path.Join(tempSchemaDir, keyspace, "vschema.json")
+		vschemaFilePath := path.Join(schemaDir, keyspace, "vschema.json")
 		vschemaJSON, err := json.Marshal(vschema)
 		if err != nil {
 			return err
@@ -191,7 +193,7 @@ func (cfg *Config) InitSchemas(keyspace, schema string, vschema *vschemapb.Keysp
 			return err
 		}
 	}
-	cfg.SchemaDir = tempSchemaDir
+	cfg.SchemaDir = schemaDir
 	return nil
 }
 
@@ -206,27 +208,40 @@ func (cfg *Config) DbName() string {
 	return ""
 }
 
+// TopoData is a struct representing a test topology.
+//
+// It implements pflag.Value and can be used as a destination command-line via
+// pflag.Var or pflag.VarP.
 type TopoData struct {
 	vtTestTopology *vttestpb.VTTestTopology
 	unmarshal      func(b []byte, m proto.Message) error
 }
 
+// String is part of the pflag.Value interface.
 func (td *TopoData) String() string {
 	return prototext.Format(td.vtTestTopology)
 }
 
+// Set is part of the pflag.Value interface.
 func (td *TopoData) Set(value string) error {
 	return td.unmarshal([]byte(value), td.vtTestTopology)
 }
 
-func TextTopoData(tpb *vttestpb.VTTestTopology) flag.Value {
+// Type is part of the pflag.Value interface.
+func (td *TopoData) Type() string { return "vttest.TopoData" }
+
+// TextTopoData returns a test TopoData that unmarshals using
+// prototext.Unmarshal.
+func TextTopoData(tpb *vttestpb.VTTestTopology) *TopoData {
 	return &TopoData{
 		vtTestTopology: tpb,
 		unmarshal:      prototext.Unmarshal,
 	}
 }
 
-func JSONTopoData(tpb *vttestpb.VTTestTopology) flag.Value {
+// JSONTopoData returns a test TopoData that unmarshals using
+// protojson.Unmarshal.
+func JSONTopoData(tpb *vttestpb.VTTestTopology) *TopoData {
 	return &TopoData{
 		vtTestTopology: tpb,
 		unmarshal:      protojson.Unmarshal,
@@ -271,6 +286,32 @@ func (db *LocalCluster) MySQLAppDebugConnParams() mysql.ConnParams {
 	connParams := db.MySQLConnParams()
 	connParams.Uname = "vt_appdebug"
 	return connParams
+}
+
+// SimulateMySQLHang simulates a scenario where the backend MySQL stops all data from flowing through.
+// Please ensure to `defer db.StopSimulateMySQLHang()` after calling this method.
+func (db *LocalCluster) SimulateMySQLHang() error {
+	if toxiproxy, ok := db.mysql.(*Toxiproxyctl); ok {
+		return toxiproxy.AddTimeoutToxic()
+	}
+	return fmt.Errorf("cannot simulate MySQL hang on non-Toxiproxyctl MySQLManager %v", db.mysql)
+}
+
+// PauseSimulateMySQLHang pauses the MySQL hang simulation to allow queries to go through.
+// This is useful when you want to allow new queries to go through, but keep the existing ones hanging.
+func (db *LocalCluster) PauseSimulateMySQLHang() error {
+	if toxiproxy, ok := db.mysql.(*Toxiproxyctl); ok {
+		return toxiproxy.UpdateTimeoutToxicity(0)
+	}
+	return fmt.Errorf("cannot simulate MySQL hang on non-Toxiproxyctl MySQLManager %v", db.mysql)
+}
+
+// StopSimulateMySQLHang stops the MySQL hang simulation to allow queries to go through.
+func (db *LocalCluster) StopSimulateMySQLHang() error {
+	if toxiproxy, ok := db.mysql.(*Toxiproxyctl); ok {
+		return toxiproxy.RemoveTimeoutToxic()
+	}
+	return fmt.Errorf("cannot simulate MySQL hang on non-Toxiproxyctl MySQLManager %v", db.mysql)
 }
 
 // Setup brings up the self-contained Vitess cluster by spinning up
@@ -450,28 +491,26 @@ func (db *LocalCluster) loadSchema(shouldRunDatabaseMigrations bool) error {
 			}
 		}
 
-		glob, _ := filepath.Glob(path.Join(schemaDir, "*.sql"))
-		for _, filepath := range glob {
-			cmds, err := LoadSQLFile(filepath, schemaDir)
-			if err != nil {
-				return err
-			}
-
-			// One single vschema migration per file
-			if !db.OnlyMySQL && len(cmds) == 1 && strings.HasPrefix(strings.ToUpper(cmds[0]), "ALTER VSCHEMA") {
-				if err = db.applyVschema(keyspace, cmds[0]); err != nil {
+		if shouldRunDatabaseMigrations {
+			glob, _ := filepath.Glob(path.Join(schemaDir, "*.sql"))
+			for _, filepath := range glob {
+				cmds, err := LoadSQLFile(filepath, schemaDir)
+				if err != nil {
 					return err
 				}
-				continue
-			}
 
-			if !shouldRunDatabaseMigrations {
-				continue
-			}
+				// One single vschema migration per file
+				if !db.OnlyMySQL && len(cmds) == 1 && strings.HasPrefix(strings.ToUpper(cmds[0]), "ALTER VSCHEMA") {
+					if err = db.applyVschema(keyspace, cmds[0]); err != nil {
+						return err
+					}
+					continue
+				}
 
-			for _, dbname := range db.shardNames(kpb) {
-				if err := db.Execute(cmds, dbname); err != nil {
-					return err
+				for _, dbname := range db.shardNames(kpb) {
+					if err := db.Execute(cmds, dbname); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -486,8 +525,29 @@ func (db *LocalCluster) loadSchema(shouldRunDatabaseMigrations bool) error {
 	return nil
 }
 
+func (db *LocalCluster) createVTSchema() error {
+	var sidecardbExec sidecardb.Exec = func(ctx context.Context, query string, maxRows int, useDB bool) (*sqltypes.Result, error) {
+		if useDB {
+			if err := db.Execute([]string{fmt.Sprintf("use %s", sidecardb.GetIdentifier())}, ""); err != nil {
+				return nil, err
+			}
+		}
+		return db.ExecuteFetch(query, "")
+	}
+
+	if err := sidecardb.Init(context.Background(), sidecardbExec); err != nil {
+		return err
+	}
+	return nil
+}
 func (db *LocalCluster) createDatabases() error {
 	log.Info("Creating databases in cluster...")
+
+	// The tablets created in vttest do not follow the same tablet init process, so we need to explicitly create
+	// the sidecar database tables
+	if err := db.createVTSchema(); err != nil {
+		return err
+	}
 
 	var sql []string
 	for _, kpb := range db.Topology.Keyspaces {
@@ -519,7 +579,7 @@ func (db *LocalCluster) Execute(sql []string, dbname string) error {
 
 	for _, cmd := range sql {
 		log.Infof("Execute(%s): \"%s\"", dbname, cmd)
-		_, err := conn.ExecuteFetch(cmd, 0, false)
+		_, err := conn.ExecuteFetch(cmd, -1, false)
 		if err != nil {
 			return err
 		}
@@ -527,6 +587,21 @@ func (db *LocalCluster) Execute(sql []string, dbname string) error {
 
 	_, err = conn.ExecuteFetch("COMMIT", 0, false)
 	return err
+}
+
+// ExecuteFetch runs a SQL statement on the MySQL instance backing
+// this local cluster and returns the result.
+func (db *LocalCluster) ExecuteFetch(sql string, dbname string) (*sqltypes.Result, error) {
+	params := db.mysql.Params(dbname)
+	conn, err := mysql.Connect(context.Background(), &params)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	log.Infof("ExecuteFetch(%s): \"%s\"", dbname, sql)
+	rs, err := conn.ExecuteFetch(sql, -1, true)
+	return rs, err
 }
 
 // Query runs a  SQL query on the MySQL instance backing this local cluster and returns
@@ -684,4 +759,29 @@ func LoadSQLFile(filename, sourceroot string) ([]string, error) {
 	}
 
 	return sql, nil
+}
+
+func (db *LocalCluster) VTProcess() *VtProcess {
+	return db.vt
+}
+
+// ReadVSchema reads the vschema from the vtgate endpoint for it and returns
+// a pointer to the interface. To read this vschema, the caller must convert it to a map
+func (vt *VtProcess) ReadVSchema() (*interface{}, error) {
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := httpClient.Get(fmt.Sprintf("http://%s:%d/debug/vschema", "127.0.0.1", vt.Port))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	res, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var results interface{}
+	err = json.Unmarshal(res, &results)
+	if err != nil {
+		return nil, err
+	}
+	return &results, nil
 }

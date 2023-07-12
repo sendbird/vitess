@@ -22,13 +22,6 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
-func colWithMaskedName(col *sqlparser.ColumnDefinition) string {
-	col = sqlparser.CloneRefOfColumnDefinition(col)
-	col.Name = sqlparser.NewColIdent("mask")
-	return sqlparser.CanonicalString(col)
-
-}
-
 // columnDetails decorates a column with more details, used by diffing logic
 type columnDetails struct {
 	col     *sqlparser.ColumnDefinition
@@ -40,7 +33,7 @@ func (c *columnDetails) identicalOtherThanName(other *sqlparser.ColumnDefinition
 	if other == nil {
 		return false
 	}
-	return colWithMaskedName(c.col) == colWithMaskedName(other)
+	return sqlparser.Equals.SQLNode(c.col.Type, other.Type)
 }
 
 func (c *columnDetails) prevColName() string {
@@ -57,8 +50,8 @@ func (c *columnDetails) nextColName() string {
 	return c.nextCol.col.Name.String()
 }
 
-func getColName(colIdent *sqlparser.ColIdent) *sqlparser.ColName {
-	return &sqlparser.ColName{Name: *colIdent}
+func getColName(id *sqlparser.IdentifierCI) *sqlparser.ColName {
+	return &sqlparser.ColName{Name: *id}
 }
 
 type ModifyColumnDiff struct {
@@ -88,10 +81,8 @@ func NewColumnDefinitionEntity(c *sqlparser.ColumnDefinition) *ColumnDefinitionE
 // change this table to look like the other table.
 // It returns an AlterTable statement if changes are found, or nil if not.
 // the other table may be of different name; its name is ignored.
-func (c *ColumnDefinitionEntity) ColumnDiff(other *ColumnDefinitionEntity, hints *DiffHints) *ModifyColumnDiff {
-	format := sqlparser.CanonicalString(c.columnDefinition)
-	otherFormat := sqlparser.CanonicalString(other.columnDefinition)
-	if format == otherFormat {
+func (c *ColumnDefinitionEntity) ColumnDiff(other *ColumnDefinitionEntity, _ *DiffHints) *ModifyColumnDiff {
+	if sqlparser.Equals.RefOfColumnDefinition(c.columnDefinition, other.columnDefinition) {
 		return nil
 	}
 

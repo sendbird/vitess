@@ -19,18 +19,23 @@ package onlineddl
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
 	"os"
 	"testing"
 	"time"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/schema"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
 
+	"github.com/buger/jsonparser"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -92,6 +97,17 @@ func CheckRetryMigration(t *testing.T, vtParams *mysql.ConnParams, shards []clus
 	}
 }
 
+// CheckRetryPartialMigration attempts to retry a migration where a subset of shards failed
+func CheckRetryPartialMigration(t *testing.T, vtParams *mysql.ConnParams, uuid string, expectAtLeastRowsAffected uint64) {
+	query, err := sqlparser.ParseAndBind("alter vitess_migration %a retry",
+		sqltypes.StringBindVariable(uuid),
+	)
+	require.NoError(t, err)
+	r := VtgateExecQuery(t, vtParams, query, "")
+
+	assert.GreaterOrEqual(t, expectAtLeastRowsAffected, r.RowsAffected)
+}
+
 // CheckCancelMigration attempts to cancel a migration, and expects success/failure by counting affected rows
 func CheckCancelMigration(t *testing.T, vtParams *mysql.ConnParams, shards []cluster.Shard, uuid string, expectCancelPossible bool) {
 	query, err := sqlparser.ParseAndBind("alter vitess_migration %a cancel",
@@ -133,11 +149,49 @@ func CheckCompleteMigration(t *testing.T, vtParams *mysql.ConnParams, shards []c
 	}
 }
 
+// CheckLaunchMigration attempts to launch a migration, and expects success by counting affected rows
+func CheckLaunchMigration(t *testing.T, vtParams *mysql.ConnParams, shards []cluster.Shard, uuid string, launchShards string, expectLaunchPossible bool) {
+	query, err := sqlparser.ParseAndBind("alter vitess_migration %a launch vitess_shards %a",
+		sqltypes.StringBindVariable(uuid),
+		sqltypes.StringBindVariable(launchShards),
+	)
+	require.NoError(t, err)
+	r := VtgateExecQuery(t, vtParams, query, "")
+
+	if expectLaunchPossible {
+		assert.Equal(t, len(shards), int(r.RowsAffected))
+	} else {
+		assert.Equal(t, int(0), int(r.RowsAffected))
+	}
+}
+
+// CheckCompleteAllMigrations completes all pending migrations and expect number of affected rows
+// A negative value for expectCount indicates "don't care, no need to check"
+func CheckCompleteAllMigrations(t *testing.T, vtParams *mysql.ConnParams, expectCount int) {
+	completeQuery := "alter vitess_migration complete all"
+	r := VtgateExecQuery(t, vtParams, completeQuery, "")
+
+	if expectCount >= 0 {
+		assert.Equal(t, expectCount, int(r.RowsAffected))
+	}
+}
+
 // CheckCancelAllMigrations cancels all pending migrations and expect number of affected rows
 // A negative value for expectCount indicates "don't care, no need to check"
 func CheckCancelAllMigrations(t *testing.T, vtParams *mysql.ConnParams, expectCount int) {
 	cancelQuery := "alter vitess_migration cancel all"
 	r := VtgateExecQuery(t, vtParams, cancelQuery, "")
+
+	if expectCount >= 0 {
+		assert.Equal(t, expectCount, int(r.RowsAffected))
+	}
+}
+
+// CheckLaunchAllMigrations launches all queued posponed migrations and expect number of affected rows
+// A negative value for expectCount indicates "don't care, no need to check"
+func CheckLaunchAllMigrations(t *testing.T, vtParams *mysql.ConnParams, expectCount int) {
+	completeQuery := "alter vitess_migration launch all"
+	r := VtgateExecQuery(t, vtParams, completeQuery, "")
 
 	if expectCount >= 0 {
 		assert.Equal(t, expectCount, int(r.RowsAffected))
@@ -258,15 +312,120 @@ func UnthrottleAllMigrations(t *testing.T, vtParams *mysql.ConnParams) {
 }
 
 // CheckThrottledApps checks for existence or non-existence of an app in the throttled apps list
-func CheckThrottledApps(t *testing.T, vtParams *mysql.ConnParams, appName string, expectFind bool) {
+func CheckThrottledApps(t *testing.T, vtParams *mysql.ConnParams, throttlerApp throttlerapp.Name, expectFind bool) {
 	query := "show vitess_throttled_apps"
 	r := VtgateExecQuery(t, vtParams, query, "")
 
 	found := false
 	for _, row := range r.Named().Rows {
-		if row.AsString("app", "") == appName {
+		if throttlerApp.Equals(row.AsString("app", "")) {
 			found = true
 		}
 	}
-	assert.Equal(t, expectFind, found, "check app %v in throttled apps: %v", appName, found)
+	assert.Equal(t, expectFind, found, "check app %v in throttled apps: %v", throttlerApp, found)
+}
+
+// WaitForThrottledTimestamp waits for a migration to have a non-empty last_throttled_timestamp
+func WaitForThrottledTimestamp(t *testing.T, vtParams *mysql.ConnParams, uuid string, timeout time.Duration) (
+	row sqltypes.RowNamedValues,
+	startedTimestamp string,
+	lastThrottledTimestamp string,
+) {
+	startTime := time.Now()
+	for time.Since(startTime) < timeout {
+		rs := ReadMigrations(t, vtParams, uuid)
+		require.NotNil(t, rs)
+		for _, row = range rs.Named().Rows {
+			startedTimestamp = row.AsString("started_timestamp", "")
+			require.NotEmpty(t, startedTimestamp)
+			lastThrottledTimestamp = row.AsString("last_throttled_timestamp", "")
+			if lastThrottledTimestamp != "" {
+				// good. This is what we've been waiting for.
+				return row, startedTimestamp, lastThrottledTimestamp
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+	t.Error("timeout waiting for last_throttled_timestamp to have nonempty value")
+	return
+}
+
+// WaitForThrottlerStatusEnabled waits for a tablet to report its throttler status as enabled.
+func WaitForThrottlerStatusEnabled(t *testing.T, tablet *cluster.Vttablet, timeout time.Duration) {
+	jsonPath := "IsEnabled"
+	url := fmt.Sprintf("http://localhost:%d/throttler/status", tablet.HTTPPort)
+
+	ctx, cancel := context.WithTimeout(context.Background(), throttlerConfigTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		body := getHTTPBody(url)
+		val, err := jsonparser.GetBoolean([]byte(body), jsonPath)
+		require.NoError(t, err)
+		if val {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Error("timeout waiting for tablet's throttler status to be enabled")
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func getHTTPBody(url string) string {
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Infof("http Get returns %+v", err)
+		return ""
+	}
+	if resp.StatusCode != 200 {
+		log.Infof("http Get returns status %d", resp.StatusCode)
+		return ""
+	}
+	respByte, _ := io.ReadAll(resp.Body)
+	defer resp.Body.Close()
+	body := string(respByte)
+	return body
+}
+
+// ValidateSequentialMigrationIDs validates that schem_migrations.id column, which is an AUTO_INCREMENT, does
+// not have gaps
+func ValidateSequentialMigrationIDs(t *testing.T, vtParams *mysql.ConnParams, shards []cluster.Shard) {
+	r := VtgateExecQuery(t, vtParams, "show vitess_migrations", "")
+	shardMin := map[string]uint64{}
+	shardMax := map[string]uint64{}
+	shardCount := map[string]uint64{}
+
+	for _, row := range r.Named().Rows {
+		id := row.AsUint64("id", 0)
+		require.NotZero(t, id)
+
+		shard := row.AsString("shard", "")
+		require.NotEmpty(t, shard)
+
+		if _, ok := shardMin[shard]; !ok {
+			shardMin[shard] = id
+			shardMax[shard] = id
+		}
+		if id < shardMin[shard] {
+			shardMin[shard] = id
+		}
+		if id > shardMax[shard] {
+			shardMax[shard] = id
+		}
+		shardCount[shard]++
+	}
+	require.NotEmpty(t, shards)
+	assert.Equal(t, len(shards), len(shardMin))
+	assert.Equal(t, len(shards), len(shardMax))
+	assert.Equal(t, len(shards), len(shardCount))
+	for shard, count := range shardCount {
+		assert.NotZero(t, count)
+		assert.Equalf(t, count, shardMax[shard]-shardMin[shard]+1, "mismatch: shared=%v, count=%v, min=%v, max=%v", shard, count, shardMin[shard], shardMax[shard])
+	}
 }

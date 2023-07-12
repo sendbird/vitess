@@ -17,6 +17,7 @@ limitations under the License.
 package engine
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -76,7 +77,7 @@ func TestJoinExecute(t *testing.T) {
 			"bv": 1,
 		},
 	}
-	r, err := jn.TryExecute(&noopVCursor{}, bv, true)
+	r, err := jn.TryExecute(context.Background(), &noopVCursor{}, bv, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +104,7 @@ func TestJoinExecute(t *testing.T) {
 	leftPrim.rewind()
 	rightPrim.rewind()
 	jn.Opcode = LeftJoin
-	r, err = jn.TryExecute(&noopVCursor{}, bv, true)
+	r, err = jn.TryExecute(context.Background(), &noopVCursor{}, bv, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +195,7 @@ func TestJoinExecuteMaxMemoryRows(t *testing.T) {
 			},
 		}
 		testIgnoreMaxMemoryRows = test.ignoreMaxMemoryRows
-		_, err := jn.TryExecute(&noopVCursor{}, bv, true)
+		_, err := jn.TryExecute(context.Background(), &noopVCursor{}, bv, true)
 		if testIgnoreMaxMemoryRows {
 			require.NoError(t, err)
 		} else {
@@ -235,10 +236,8 @@ func TestJoinExecuteNoResult(t *testing.T) {
 			"bv": 1,
 		},
 	}
-	r, err := jn.TryExecute(&noopVCursor{}, map[string]*querypb.BindVariable{}, true)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r, err := jn.TryExecute(context.Background(), &noopVCursor{}, map[string]*querypb.BindVariable{}, true)
+	require.NoError(t, err)
 	leftPrim.ExpectLog(t, []string{
 		`Execute  true`,
 	})
@@ -265,7 +264,7 @@ func TestJoinExecuteErrors(t *testing.T) {
 		Opcode: InnerJoin,
 		Left:   leftPrim,
 	}
-	_, err := jn.TryExecute(&noopVCursor{}, map[string]*querypb.BindVariable{}, true)
+	_, err := jn.TryExecute(context.Background(), &noopVCursor{}, map[string]*querypb.BindVariable{}, true)
 	require.EqualError(t, err, "left err")
 
 	// Error on right query
@@ -295,7 +294,7 @@ func TestJoinExecuteErrors(t *testing.T) {
 			"bv": 1,
 		},
 	}
-	_, err = jn.TryExecute(&noopVCursor{}, map[string]*querypb.BindVariable{}, true)
+	_, err = jn.TryExecute(context.Background(), &noopVCursor{}, map[string]*querypb.BindVariable{}, true)
 	require.EqualError(t, err, "right err")
 
 	// Error on right getfields
@@ -322,7 +321,7 @@ func TestJoinExecuteErrors(t *testing.T) {
 			"bv": 1,
 		},
 	}
-	_, err = jn.TryExecute(&noopVCursor{}, map[string]*querypb.BindVariable{}, true)
+	_, err = jn.TryExecute(context.Background(), &noopVCursor{}, map[string]*querypb.BindVariable{}, true)
 	require.EqualError(t, err, "right err")
 }
 
@@ -464,7 +463,7 @@ func TestGetFields(t *testing.T) {
 			"bv": 1,
 		},
 	}
-	r, err := jn.GetFields(nil, map[string]*querypb.BindVariable{})
+	r, err := jn.GetFields(context.Background(), nil, map[string]*querypb.BindVariable{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -501,7 +500,7 @@ func TestGetFieldsErrors(t *testing.T) {
 			"bv": 1,
 		},
 	}
-	_, err := jn.GetFields(nil, map[string]*querypb.BindVariable{})
+	_, err := jn.GetFields(context.Background(), nil, map[string]*querypb.BindVariable{})
 	require.EqualError(t, err, "left err")
 
 	jn.Left = &fakePrimitive{
@@ -514,6 +513,6 @@ func TestGetFieldsErrors(t *testing.T) {
 			),
 		},
 	}
-	_, err = jn.GetFields(nil, map[string]*querypb.BindVariable{})
+	_, err = jn.GetFields(context.Background(), nil, map[string]*querypb.BindVariable{})
 	require.EqualError(t, err, "right err")
 }

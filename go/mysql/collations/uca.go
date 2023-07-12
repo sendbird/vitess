@@ -17,42 +17,18 @@ limitations under the License.
 package collations
 
 import (
+	"bytes"
 	"math/bits"
-	"sync"
-	"unsafe"
 
-	"vitess.io/vitess/go/mysql/collations/internal/charset"
+	"vitess.io/vitess/go/mysql/collations/charset"
 	"vitess.io/vitess/go/mysql/collations/internal/uca"
+	"vitess.io/vitess/go/vt/vthash"
 )
-
-func init() {
-	register(&Collation_utf8mb4_0900_bin{})
-}
 
 type Collation_utf8mb4_uca_0900 struct {
 	name string
 	id   ID
-
-	weights          uca.Weights
-	tailoring        []uca.Patch
-	contract         uca.Contractor
-	reorder          []uca.Reorder
-	upperCaseFirst   bool
-	levelsForCompare int
-
-	uca     *uca.Collation900
-	ucainit sync.Once
-}
-
-func (c *Collation_utf8mb4_uca_0900) Init() {
-	c.ucainit.Do(func() {
-		c.uca = uca.NewCollation(c.name, c.weights, c.tailoring, c.reorder, c.contract, c.upperCaseFirst, c.levelsForCompare)
-
-		// Clear the external metadata for this collation, so it can be picked up by the GC
-		c.weights = nil
-		c.tailoring = nil
-		c.reorder = nil
-	})
+	uca  *uca.Collation900
 }
 
 func (c *Collation_utf8mb4_uca_0900) Name() string {
@@ -76,7 +52,7 @@ func (c *Collation_utf8mb4_uca_0900) Collate(left, right []byte, rightIsPrefix b
 		l, r            uint16
 		lok, rok        bool
 		level           int
-		levelsToCompare = c.levelsForCompare
+		levelsToCompare = c.uca.MaxLevel()
 		itleft          = c.uca.Iterator(left)
 		itright         = c.uca.Iterator(right)
 
@@ -182,8 +158,8 @@ performPadding:
 	return dst
 }
 
-func (c *Collation_utf8mb4_uca_0900) Hash(src []byte, _ int) HashCode {
-	var hash = uintptr(c.id)
+func (c *Collation_utf8mb4_uca_0900) Hash(hasher *vthash.Hasher, src []byte, _ int) {
+	hasher.Write64(uint64(c.id))
 
 	it := c.uca.Iterator(src)
 	defer it.Done()
@@ -196,9 +172,10 @@ func (c *Collation_utf8mb4_uca_0900) Hash(src []byte, _ int) HashCode {
 			if n < 16 {
 				break
 			}
-			hash = memhash128(unsafe.Pointer(&chunk), hash)
+			hasher.Write(chunk[:16])
 		}
-		return memhashraw(unsafe.Pointer(&chunk), hash, uintptr(n))
+		hasher.Write(chunk[:n])
+		return
 	}
 
 	for {
@@ -206,16 +183,15 @@ func (c *Collation_utf8mb4_uca_0900) Hash(src []byte, _ int) HashCode {
 		if !ok {
 			break
 		}
-		hash = memhash16(bits.ReverseBytes16(w), hash)
+		hasher.Write16(bits.ReverseBytes16(w))
 	}
-	return hash
 }
 
 func (c *Collation_utf8mb4_uca_0900) WeightStringLen(numBytes int) int {
 	if numBytes%4 != 0 {
 		panic("WeightStringLen called with non-MOD4 length")
 	}
-	levels := int(c.levelsForCompare)
+	levels := int(c.uca.MaxLevel())
 	weights := (numBytes / 4) * uca.MaxCollationElementsPerCodepoint * levels
 	weights += levels - 1 // one NULL byte as a separator between levels
 	return weights * 2    // two bytes per weight
@@ -225,9 +201,17 @@ func (c *Collation_utf8mb4_uca_0900) Wildcard(pat []byte, matchOne rune, matchMa
 	return newUnicodeWildcardMatcher(charset.Charset_utf8mb4{}, c.uca.WeightsEqual, c.Collate, pat, matchOne, matchMany, escape)
 }
 
-type Collation_utf8mb4_0900_bin struct{}
+func (c *Collation_utf8mb4_uca_0900) ToLower(dst, src []byte) []byte {
+	dst = append(dst, bytes.ToLower(src)...)
+	return dst
+}
 
-func (c *Collation_utf8mb4_0900_bin) Init() {}
+func (c *Collation_utf8mb4_uca_0900) ToUpper(dst, src []byte) []byte {
+	dst = append(dst, bytes.ToUpper(src)...)
+	return dst
+}
+
+type Collation_utf8mb4_0900_bin struct{}
 
 func (c *Collation_utf8mb4_0900_bin) ID() ID {
 	return 309
@@ -259,8 +243,9 @@ func (c *Collation_utf8mb4_0900_bin) WeightString(dst, src []byte, numCodepoints
 	return dst
 }
 
-func (c *Collation_utf8mb4_0900_bin) Hash(src []byte, _ int) HashCode {
-	return memhash(src, 0xb900b900)
+func (c *Collation_utf8mb4_0900_bin) Hash(hasher *vthash.Hasher, src []byte, _ int) {
+	hasher.Write64(0xb900b900)
+	hasher.Write(src)
 }
 
 func (c *Collation_utf8mb4_0900_bin) WeightStringLen(numBytes int) int {
@@ -274,26 +259,20 @@ func (c *Collation_utf8mb4_0900_bin) Wildcard(pat []byte, matchOne rune, matchMa
 	return newUnicodeWildcardMatcher(charset.Charset_utf8mb4{}, equals, c.Collate, pat, matchOne, matchMany, escape)
 }
 
+func (c *Collation_utf8mb4_0900_bin) ToLower(dst, src []byte) []byte {
+	dst = append(dst, bytes.ToLower(src)...)
+	return dst
+}
+
+func (c *Collation_utf8mb4_0900_bin) ToUpper(dst, src []byte) []byte {
+	dst = append(dst, bytes.ToUpper(src)...)
+	return dst
+}
+
 type Collation_uca_legacy struct {
 	name string
 	id   ID
-
-	charset      charset.Charset
-	weights      uca.Weights
-	tailoring    []uca.Patch
-	contract     uca.Contractor
-	maxCodepoint rune
-
-	uca     *uca.CollationLegacy
-	ucainit sync.Once
-}
-
-func (c *Collation_uca_legacy) Init() {
-	c.ucainit.Do(func() {
-		c.uca = uca.NewCollationLegacy(c.charset, c.weights, c.tailoring, c.contract, c.maxCodepoint)
-		c.weights = nil
-		c.tailoring = nil
-	})
+	uca  *uca.CollationLegacy
 }
 
 func (c *Collation_uca_legacy) ID() ID {
@@ -305,7 +284,7 @@ func (c *Collation_uca_legacy) Name() string {
 }
 
 func (c *Collation_uca_legacy) Charset() charset.Charset {
-	return c.charset
+	return c.uca.Charset()
 }
 
 func (c *Collation_uca_legacy) IsBinary() bool {
@@ -319,9 +298,6 @@ func (c *Collation_uca_legacy) Collate(left, right []byte, isPrefix bool) int {
 		itleft   = c.uca.Iterator(left)
 		itright  = c.uca.Iterator(right)
 	)
-
-	defer itleft.Done()
-	defer itright.Done()
 
 	for {
 		l, lok = itleft.Next()
@@ -339,7 +315,6 @@ func (c *Collation_uca_legacy) Collate(left, right []byte, isPrefix bool) int {
 
 func (c *Collation_uca_legacy) WeightString(dst, src []byte, numCodepoints int) []byte {
 	it := c.uca.Iterator(src)
-	defer it.Done()
 
 	for {
 		w, ok := it.Next()
@@ -372,29 +347,26 @@ func (c *Collation_uca_legacy) WeightString(dst, src []byte, numCodepoints int) 
 	return dst
 }
 
-func (c *Collation_uca_legacy) Hash(src []byte, numCodepoints int) HashCode {
+func (c *Collation_uca_legacy) Hash(hasher *vthash.Hasher, src []byte, numCodepoints int) {
 	it := c.uca.Iterator(src)
-	defer it.Done()
 
-	var hash = uintptr(c.id)
+	hasher.Write64(uint64(c.id))
 	for {
 		w, ok := it.Next()
 		if !ok {
 			break
 		}
-		hash = memhash16(bits.ReverseBytes16(w), hash)
+		hasher.Write16(bits.ReverseBytes16(w))
 	}
 
 	if numCodepoints > 0 {
 		weightForSpace := bits.ReverseBytes16(c.uca.WeightForSpace())
 		numCodepoints -= it.Length()
 		for numCodepoints > 0 {
-			hash = memhash16(weightForSpace, hash)
+			hasher.Write16(weightForSpace)
 			numCodepoints--
 		}
 	}
-
-	return hash
 }
 
 func (c *Collation_uca_legacy) WeightStringLen(numBytes int) int {
@@ -403,5 +375,5 @@ func (c *Collation_uca_legacy) WeightStringLen(numBytes int) int {
 }
 
 func (c *Collation_uca_legacy) Wildcard(pat []byte, matchOne rune, matchMany rune, escape rune) WildcardPattern {
-	return newUnicodeWildcardMatcher(c.charset, c.uca.WeightsEqual, c.Collate, pat, matchOne, matchMany, escape)
+	return newUnicodeWildcardMatcher(c.uca.Charset(), c.uca.WeightsEqual, c.Collate, pat, matchOne, matchMany, escape)
 }

@@ -19,11 +19,11 @@ package vreplication
 import (
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/test/endtoend/cluster"
 )
 
 func insertInitialDataIntoExternalCluster(t *testing.T, conn *mysql.Conn) {
@@ -49,15 +49,6 @@ func TestMigrate(t *testing.T) {
 	allCellNames = "zone1"
 	vc = NewVitessCluster(t, "TestMigrate", cells, mainClusterConfig)
 
-	// VDiff2 does not support this mount+migrate use case today
-	// TODO: add support for this in the tablet picker phase
-	if runVDiffsSideBySide {
-		runVDiffsSideBySide = false
-		defer func() {
-			runVDiffsSideBySide = true
-		}()
-	}
-
 	require.NotNil(t, vc)
 	defaultReplicas = 0
 	defaultRdonly = 0
@@ -65,9 +56,10 @@ func TestMigrate(t *testing.T) {
 
 	defaultCell = vc.Cells[defaultCellName]
 	vc.AddKeyspace(t, []*Cell{defaultCell}, "product", "0", initialProductVSchema, initialProductSchema, defaultReplicas, defaultRdonly, 100, nil)
+	err := cluster.WaitForHealthyShard(vc.VtctldClient, "product", "0")
+	require.NoError(t, err)
 	vtgate = defaultCell.Vtgates[0]
 	require.NotNil(t, vtgate)
-	vtgate.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.primary", "product", "0"), 1)
 
 	vtgateConn = getConnection(t, vc.ClusterConfig.hostname, vc.ClusterConfig.vtgateMySQLPort)
 	defer vtgateConn.Close()
@@ -86,12 +78,12 @@ func TestMigrate(t *testing.T) {
 	extVtgate := extCell2.Vtgates[0]
 	require.NotNil(t, extVtgate)
 
-	extVtgate.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.primary", "rating", "0"), 1)
+	err = cluster.WaitForHealthyShard(extVc.VtctldClient, "rating", "0")
+	require.NoError(t, err)
 	verifyClusterHealth(t, extVc)
 	extVtgateConn := getConnection(t, extVc.ClusterConfig.hostname, extVc.ClusterConfig.vtgateMySQLPort)
 	insertInitialDataIntoExternalCluster(t, extVtgateConn)
 
-	var err error
 	var output, expected string
 	ksWorkflow := "product.e1"
 
@@ -117,15 +109,14 @@ func TestMigrate(t *testing.T) {
 			"--source=ext1.rating", "create", ksWorkflow); err != nil {
 			t.Fatalf("Migrate command failed with %+v : %s\n", err, output)
 		}
-		time.Sleep(1 * time.Second) // wait for migrate to run
+		waitForWorkflowState(t, vc, ksWorkflow, workflowStateRunning)
 		expectNumberOfStreams(t, vtgateConn, "migrate", "e1", "product:0", 1)
-		validateCount(t, vtgateConn, "product:0", "rating", 2)
-		validateCount(t, vtgateConn, "product:0", "review", 3)
+		waitForRowCount(t, vtgateConn, "product:0", "rating", 2)
+		waitForRowCount(t, vtgateConn, "product:0", "review", 3)
 		execVtgateQuery(t, extVtgateConn, "rating", "insert into review(rid, pid, review) values(4, 1, 'review4');")
 		execVtgateQuery(t, extVtgateConn, "rating", "insert into rating(gid, pid, rating) values(3, 1, 3);")
-		time.Sleep(1 * time.Second) // wait for stream to find row
-		validateCount(t, vtgateConn, "product:0", "rating", 3)
-		validateCount(t, vtgateConn, "product:0", "review", 4)
+		waitForRowCount(t, vtgateConn, "product:0", "rating", 3)
+		waitForRowCount(t, vtgateConn, "product:0", "review", 4)
 		vdiff1(t, ksWorkflow, "extcell1")
 
 		if output, err = vc.VtctlClient.ExecuteCommandWithOutput("Migrate", "complete", ksWorkflow); err != nil {
@@ -142,8 +133,8 @@ func TestMigrate(t *testing.T) {
 			t.Fatalf("Migrate command failed with %+v : %s\n", err, output)
 		}
 		expectNumberOfStreams(t, vtgateConn, "migrate", "e1", "product:0", 1)
-		validateCount(t, vtgateConn, "product:0", "rating", 0)
-		validateCount(t, vtgateConn, "product:0", "review", 0)
+		waitForRowCount(t, vtgateConn, "product:0", "rating", 0)
+		waitForRowCount(t, vtgateConn, "product:0", "review", 0)
 		if output, err = vc.VtctlClient.ExecuteCommandWithOutput("Migrate", "cancel", ksWorkflow); err != nil {
 			t.Fatalf("Migrate command failed with %+v : %s\n", err, output)
 		}

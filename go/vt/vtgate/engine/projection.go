@@ -17,6 +17,7 @@ limitations under the License.
 package engine
 
 import (
+	"context"
 	"sync"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -50,14 +51,13 @@ func (p *Projection) GetTableName() string {
 }
 
 // TryExecute implements the Primitive interface
-func (p *Projection) TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
-	result, err := vcursor.ExecutePrimitive(p.Input, bindVars, wantfields)
+func (p *Projection) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
+	result, err := vcursor.ExecutePrimitive(ctx, p.Input, bindVars, wantfields)
 	if err != nil {
 		return nil, err
 	}
 
-	env := evalengine.EnvWithBindVars(bindVars, vcursor.ConnCollation())
-	env.Fields = result.Fields
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
 	var resultRows []sqltypes.Row
 	for _, row := range result.Rows {
 		resultRow := make(sqltypes.Row, 0, len(p.Exprs))
@@ -72,7 +72,7 @@ func (p *Projection) TryExecute(vcursor VCursor, bindVars map[string]*querypb.Bi
 		resultRows = append(resultRows, resultRow)
 	}
 	if wantfields {
-		err := p.addFields(env, result)
+		result.Fields, err = p.evalFields(env, result.Fields)
 		if err != nil {
 			return nil, err
 		}
@@ -82,22 +82,19 @@ func (p *Projection) TryExecute(vcursor VCursor, bindVars map[string]*querypb.Bi
 }
 
 // TryStreamExecute implements the Primitive interface
-func (p *Projection) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
-	env := evalengine.EnvWithBindVars(bindVars, vcursor.ConnCollation())
+func (p *Projection) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
 	var once sync.Once
 	var fields []*querypb.Field
-	return vcursor.StreamExecutePrimitive(p.Input, bindVars, wantfields, func(qr *sqltypes.Result) error {
+	return vcursor.StreamExecutePrimitive(ctx, p.Input, bindVars, wantfields, func(qr *sqltypes.Result) error {
 		var err error
 		if wantfields {
 			once.Do(func() {
-				env.Fields = qr.Fields
-				fieldRes := &sqltypes.Result{}
-				err = p.addFields(env, fieldRes)
+				fields, err = p.evalFields(env, qr.Fields)
 				if err != nil {
 					return
 				}
-				fields = fieldRes.Fields
-				err = callback(fieldRes)
+				err = callback(&sqltypes.Result{Fields: fields})
 				if err != nil {
 					return
 				}
@@ -126,32 +123,32 @@ func (p *Projection) TryStreamExecute(vcursor VCursor, bindVars map[string]*quer
 }
 
 // GetFields implements the Primitive interface
-func (p *Projection) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	qr, err := p.Input.GetFields(vcursor, bindVars)
+func (p *Projection) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	qr, err := p.Input.GetFields(ctx, vcursor, bindVars)
 	if err != nil {
 		return nil, err
 	}
-	env := evalengine.EnvWithBindVars(bindVars, vcursor.ConnCollation())
-	err = p.addFields(env, qr)
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
+	qr.Fields, err = p.evalFields(env, qr.Fields)
 	if err != nil {
 		return nil, err
 	}
 	return qr, nil
 }
 
-func (p *Projection) addFields(env *evalengine.ExpressionEnv, qr *sqltypes.Result) error {
-	qr.Fields = nil
+func (p *Projection) evalFields(env *evalengine.ExpressionEnv, infields []*querypb.Field) ([]*querypb.Field, error) {
+	var fields []*querypb.Field
 	for i, col := range p.Cols {
-		q, err := env.TypeOf(p.Exprs[i])
+		q, err := env.TypeOf(p.Exprs[i], infields)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		qr.Fields = append(qr.Fields, &querypb.Field{
+		fields = append(fields, &querypb.Field{
 			Name: col,
 			Type: q,
 		})
 	}
-	return nil
+	return fields, nil
 }
 
 // Inputs implements the Primitive interface

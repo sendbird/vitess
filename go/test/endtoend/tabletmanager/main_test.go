@@ -95,6 +95,7 @@ func TestMain(m *testing.M) {
 		// List of users authorized to execute vschema ddl operations
 		clusterInstance.VtGateExtraArgs = []string{
 			"--vschema_ddl_authorized_users=%",
+			"--enable-views",
 			"--discovery_low_replication_lag", tabletUnhealthyThreshold.String(),
 		}
 		// Set extra tablet args for lock timeout
@@ -105,8 +106,6 @@ func TestMain(m *testing.M) {
 			"--health_check_interval", tabletHealthcheckRefreshInterval.String(),
 			"--unhealthy_threshold", tabletUnhealthyThreshold.String(),
 		}
-		// We do not need semiSync for this test case.
-		clusterInstance.EnableSemiSync = false
 
 		// Start keyspace
 		keyspace := &cluster.Keyspace{
@@ -174,6 +173,11 @@ func tmcStopReplication(ctx context.Context, tabletGrpcPort int) error {
 func tmcStartReplication(ctx context.Context, tabletGrpcPort int) error {
 	vtablet := getTablet(tabletGrpcPort)
 	return tmClient.StartReplication(ctx, vtablet, false)
+}
+
+func tmcResetReplicationParameters(ctx context.Context, tabletGrpcPort int) error {
+	vttablet := getTablet(tabletGrpcPort)
+	return tmClient.ResetReplicationParameters(ctx, vttablet)
 }
 
 func tmcPrimaryPosition(ctx context.Context, tabletGrpcPort int) (string, error) {

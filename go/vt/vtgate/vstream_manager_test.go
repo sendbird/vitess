@@ -17,13 +17,13 @@ limitations under the License.
 package vtgate
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
-
-	"vitess.io/vitess/go/sync2"
 
 	"vitess.io/vitess/go/vt/topo"
 
@@ -33,8 +33,6 @@ import (
 
 	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/vttablet/sandboxconn"
-
-	"context"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -227,9 +225,7 @@ func TestVStreamChunks(t *testing.T) {
 
 	rowEncountered := false
 	doneCounting := false
-	var rowCount, ddlCount sync2.AtomicInt32
-	rowCount.Set(0)
-	ddlCount.Set(0)
+	var rowCount, ddlCount atomic.Int32
 	vgtid := &binlogdatapb.VGtid{
 		ShardGtids: []*binlogdatapb.ShardGtid{{
 			Keyspace: ks,
@@ -266,13 +262,13 @@ func TestVStreamChunks(t *testing.T) {
 			t.Errorf("Unexpected event: %v", events[0])
 			return fmt.Errorf("unexpected event: %v", events[0])
 		}
-		if rowCount.Get() == int32(100) && ddlCount.Get() == int32(100) {
+		if rowCount.Load() == int32(100) && ddlCount.Load() == int32(100) {
 			cancel()
 		}
 		return nil
 	})
-	assert.Equal(t, int32(100), rowCount.Get())
-	assert.Equal(t, int32(100), ddlCount.Get())
+	assert.Equal(t, int32(100), rowCount.Load())
+	assert.Equal(t, int32(100), ddlCount.Load())
 }
 
 func TestVStreamMulti(t *testing.T) {
@@ -337,6 +333,59 @@ func TestVStreamMulti(t *testing.T) {
 	}
 }
 
+func TestVStreamsCreatedAndLagMetrics(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cell := "aa"
+	ks := "TestVStream"
+	_ = createSandbox(ks)
+	hc := discovery.NewFakeHealthCheck(nil)
+	st := getSandboxTopo(ctx, cell, ks, []string{"-20", "20-40"})
+	vsm := newTestVStreamManager(hc, st, cell)
+	vsm.vstreamsCreated.ResetAll()
+	vsm.vstreamsLag.ResetAll()
+	sbc0 := hc.AddTestTablet(cell, "1.1.1.1", 1001, ks, "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
+	addTabletToSandboxTopo(t, st, ks, "-20", sbc0.Tablet())
+	sbc1 := hc.AddTestTablet(cell, "1.1.1.1", 1002, ks, "20-40", topodatapb.TabletType_PRIMARY, true, 1, nil)
+	addTabletToSandboxTopo(t, st, ks, "20-40", sbc1.Tablet())
+
+	send0 := []*binlogdatapb.VEvent{
+		{Type: binlogdatapb.VEventType_GTID, Gtid: "gtid01"},
+		{Type: binlogdatapb.VEventType_COMMIT, Timestamp: 10, CurrentTime: 15 * 1e9},
+	}
+	sbc0.AddVStreamEvents(send0, nil)
+
+	send1 := []*binlogdatapb.VEvent{
+		{Type: binlogdatapb.VEventType_GTID, Gtid: "gtid02"},
+		{Type: binlogdatapb.VEventType_COMMIT, Timestamp: 10, CurrentTime: 17 * 1e9},
+	}
+	sbc1.AddVStreamEvents(send1, nil)
+
+	vgtid := &binlogdatapb.VGtid{
+		ShardGtids: []*binlogdatapb.ShardGtid{{
+			Keyspace: ks,
+			Shard:    "-20",
+			Gtid:     "pos",
+		}, {
+			Keyspace: ks,
+			Shard:    "20-40",
+			Gtid:     "pos",
+		}},
+	}
+	ch := startVStream(ctx, t, vsm, vgtid, nil)
+	<-ch
+	<-ch
+	wantVStreamsCreated := make(map[string]int64)
+	wantVStreamsCreated["TestVStream.-20.PRIMARY"] = 1
+	wantVStreamsCreated["TestVStream.20-40.PRIMARY"] = 1
+	assert.Equal(t, wantVStreamsCreated, vsm.vstreamsCreated.Counts(), "vstreamsCreated matches")
+
+	wantVStreamsLag := make(map[string]int64)
+	wantVStreamsLag["TestVStream.-20.PRIMARY"] = 5
+	wantVStreamsLag["TestVStream.20-40.PRIMARY"] = 7
+	assert.Equal(t, wantVStreamsLag, vsm.vstreamsLag.Counts(), "vstreamsLag matches")
+}
+
 func TestVStreamRetry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -359,8 +408,7 @@ func TestVStreamRetry(t *testing.T) {
 	sbc0.AddVStreamEvents(nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "bb"))
 	sbc0.AddVStreamEvents(nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "cc"))
 	sbc0.AddVStreamEvents(nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "final error"))
-	var count sync2.AtomicInt32
-	count.Set(0)
+	var count atomic.Int32
 	vgtid := &binlogdatapb.VGtid{
 		ShardGtids: []*binlogdatapb.ShardGtid{{
 			Keyspace: ks,
@@ -377,7 +425,7 @@ func TestVStreamRetry(t *testing.T) {
 		t.Errorf("vstream end: %v, must contain %v", err.Error(), wantErr)
 	}
 	time.Sleep(100 * time.Millisecond) // wait for goroutine within VStream to finish
-	assert.Equal(t, int32(2), count.Get())
+	assert.Equal(t, int32(2), count.Load())
 }
 
 func TestVStreamShouldNotSendSourceHeartbeats(t *testing.T) {
@@ -877,7 +925,7 @@ func TestResolveVStreamParams(t *testing.T) {
 	name := "TestVStream"
 	_ = createSandbox(name)
 	hc := discovery.NewFakeHealthCheck(nil)
-	vsm := newTestVStreamManager(hc, new(sandboxTopo), "aa")
+	vsm := newTestVStreamManager(hc, newSandboxForCells([]string{"aa"}), "aa")
 	testcases := []struct {
 		input  *binlogdatapb.VGtid
 		output *binlogdatapb.VGtid
@@ -894,9 +942,44 @@ func TestResolveVStreamParams(t *testing.T) {
 		input: &binlogdatapb.VGtid{
 			ShardGtids: []*binlogdatapb.ShardGtid{{
 				Keyspace: "TestVStream",
+				Gtid:     "other",
 			}},
 		},
-		err: "if shards are unspecified, the Gtid value must be 'current'",
+		err: "if shards are unspecified, the Gtid value must be 'current' or empty",
+	}, {
+		// Verify that the function maps the input missing the shard to a list of all shards in the topology.
+		input: &binlogdatapb.VGtid{
+			ShardGtids: []*binlogdatapb.ShardGtid{{
+				Keyspace: "TestVStream",
+			}},
+		},
+		output: &binlogdatapb.VGtid{
+			ShardGtids: []*binlogdatapb.ShardGtid{{
+				Keyspace: "TestVStream",
+				Shard:    "-20",
+			}, {
+				Keyspace: "TestVStream",
+				Shard:    "20-40",
+			}, {
+				Keyspace: "TestVStream",
+				Shard:    "40-60",
+			}, {
+				Keyspace: "TestVStream",
+				Shard:    "60-80",
+			}, {
+				Keyspace: "TestVStream",
+				Shard:    "80-a0",
+			}, {
+				Keyspace: "TestVStream",
+				Shard:    "a0-c0",
+			}, {
+				Keyspace: "TestVStream",
+				Shard:    "c0-e0",
+			}, {
+				Keyspace: "TestVStream",
+				Shard:    "e0-",
+			}},
+		},
 	}, {
 		input: &binlogdatapb.VGtid{
 			ShardGtids: []*binlogdatapb.ShardGtid{{
@@ -988,17 +1071,49 @@ func TestResolveVStreamParams(t *testing.T) {
 		assert.Equal(t, wantFilter, filter, tcase.input)
 		require.False(t, flags.MinimizeSkew)
 	}
-	// Special-case: empty keyspace because output is too big.
-	input := &binlogdatapb.VGtid{
-		ShardGtids: []*binlogdatapb.ShardGtid{{
-			Gtid: "current",
-		}},
+
+	// Special-case: empty keyspace or keyspace containing wildcards because output is too big.
+	// Verify that the function resolves input for multiple keyspaces into a list of all corresponding shards.
+	// Ensure that the number of shards returned is greater than the number of shards in a single keyspace named 'TestVStream.'
+	specialCases := []struct {
+		input *binlogdatapb.ShardGtid
+	}{
+		{
+			input: &binlogdatapb.ShardGtid{
+				Gtid: "current",
+			},
+		},
+		{
+			input: &binlogdatapb.ShardGtid{
+				Keyspace: "/.*",
+			},
+		},
+		{
+			input: &binlogdatapb.ShardGtid{
+				Keyspace: "/.*",
+				Gtid:     "current",
+			},
+		},
+		{
+			input: &binlogdatapb.ShardGtid{
+				Keyspace: "/Test.*",
+			},
+		},
 	}
-	vgtid, _, _, err := vsm.resolveParams(context.Background(), topodatapb.TabletType_REPLICA, input, nil, nil)
-	require.NoError(t, err, input)
-	if got, want := len(vgtid.ShardGtids), 8; want >= got {
-		t.Errorf("len(vgtid.ShardGtids): %v, must be >%d", got, want)
+	for _, tcase := range specialCases {
+		input := &binlogdatapb.VGtid{
+			ShardGtids: []*binlogdatapb.ShardGtid{tcase.input},
+		}
+		vgtid, _, _, err := vsm.resolveParams(context.Background(), topodatapb.TabletType_REPLICA, input, nil, nil)
+		require.NoError(t, err, tcase.input)
+		if got, expectTestVStreamShardNumber := len(vgtid.ShardGtids), 8; expectTestVStreamShardNumber >= got {
+			t.Errorf("len(vgtid.ShardGtids): %v, must be >%d", got, expectTestVStreamShardNumber)
+		}
+		for _, s := range vgtid.ShardGtids {
+			require.Equal(t, tcase.input.Gtid, s.Gtid)
+		}
 	}
+
 	for _, minimizeSkew := range []bool{true, false} {
 		t.Run(fmt.Sprintf("resolveParams MinimizeSkew %t", minimizeSkew), func(t *testing.T) {
 			flags := &vtgatepb.VStreamFlags{MinimizeSkew: minimizeSkew}
@@ -1095,7 +1210,8 @@ func startVStream(ctx context.Context, t *testing.T, vsm *vstreamManager, vgtid 
 func verifyEvents(t *testing.T, ch <-chan *binlogdatapb.VStreamResponse, wants ...*binlogdatapb.VStreamResponse) {
 	t.Helper()
 	for i, want := range wants {
-		got := <-ch
+		val := <-ch
+		got := proto.Clone(val).(*binlogdatapb.VStreamResponse)
 		require.NotNil(t, got)
 		for _, event := range got.Events {
 			event.Timestamp = 0

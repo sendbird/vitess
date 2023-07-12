@@ -17,11 +17,13 @@ limitations under the License.
 package planbuilder
 
 import (
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"fmt"
+
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
-	"vitess.io/vitess/go/vt/vtgate/planbuilder/physical"
+	popcode "vitess.io/vitess/go/vt/vtgate/engine/opcode"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/operators"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 	"vitess.io/vitess/go/vt/vtgate/semantics"
 )
@@ -55,7 +57,7 @@ func pushProjection(
 	case *concatenateGen4:
 		return pushProjectionIntoConcatenate(ctx, expr, hasAggregation, node, inner, reuseCol)
 	default:
-		return 0, false, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "[BUG] push projection does not yet support: %T", node)
+		return 0, false, vterrors.VT13001(fmt.Sprintf("push projection does not yet support: %T", node))
 	}
 }
 
@@ -70,14 +72,14 @@ func pushProjectionIntoVindexFunc(node *vindexFunc, expr *sqlparser.AliasedExpr,
 
 func pushProjectionIntoConcatenate(ctx *plancontext.PlanningContext, expr *sqlparser.AliasedExpr, hasAggregation bool, node *concatenateGen4, inner bool, reuseCol bool) (int, bool, error) {
 	if hasAggregation {
-		return 0, false, vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "unsupported: aggregation on unions")
+		return 0, false, vterrors.VT12001("aggregation on UNIONs")
 	}
 	offset, added, err := pushProjection(ctx, expr, node.sources[0], inner, reuseCol, hasAggregation)
 	if err != nil {
 		return 0, false, err
 	}
-	if added && ctx.SemTable.DirectDeps(expr.Expr).NumberOfTables() > 0 {
-		return 0, false, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "pushing projection %v on concatenate should reference an existing column", sqlparser.String(expr))
+	if added && ctx.SemTable.DirectDeps(expr.Expr).NonEmpty() {
+		return 0, false, vterrors.VT13001(fmt.Sprintf("pushing projection %v on concatenate should reference an existing column", sqlparser.String(expr)))
 	}
 	if added {
 		for _, source := range node.sources[1:] {
@@ -120,7 +122,7 @@ func pushProjectionIntoSemiJoin(
 func pushProjectionIntoOA(ctx *plancontext.PlanningContext, expr *sqlparser.AliasedExpr, node *orderedAggregate, inner, hasAggregation bool) (int, bool, error) {
 	colName, isColName := expr.Expr.(*sqlparser.ColName)
 	for _, aggregate := range node.aggregates {
-		if sqlparser.EqualsExpr(aggregate.Expr, expr.Expr) {
+		if ctx.SemTable.EqualsExpr(aggregate.Expr, expr.Expr) {
 			return aggregate.Col, false, nil
 		}
 		if isColName && colName.Name.EqualString(aggregate.Alias) {
@@ -128,7 +130,7 @@ func pushProjectionIntoOA(ctx *plancontext.PlanningContext, expr *sqlparser.Alia
 		}
 	}
 	for _, key := range node.groupByKeys {
-		if sqlparser.EqualsExpr(key.Expr, expr.Expr) {
+		if ctx.SemTable.EqualsExpr(key.Expr, expr.Expr) {
 			return key.KeyCol, false, nil
 		}
 	}
@@ -136,13 +138,10 @@ func pushProjectionIntoOA(ctx *plancontext.PlanningContext, expr *sqlparser.Alia
 	if err != nil {
 		return 0, false, err
 	}
-	node.aggregates = append(node.aggregates, &engine.AggregateParams{
-		Opcode:   engine.AggregateRandom,
-		Col:      offset,
-		Alias:    expr.ColumnName(),
-		Expr:     expr.Expr,
-		Original: expr,
-	})
+	aggr := engine.NewAggregateParam(popcode.AggregateAnyValue, offset, expr.ColumnName())
+	aggr.Expr = expr.Expr
+	aggr.Original = expr
+	node.aggregates = append(node.aggregates, aggr)
 	return offset, true, nil
 }
 
@@ -202,25 +201,25 @@ func pushProjectionIntoJoin(
 		// for example an expression like count(*) will have dependencies on both sides, but we should not push it
 		// instead we should return an error
 		if hasAggregation {
-			return 0, false, vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "unsupported: cross-shard query with aggregates")
+			return 0, false, vterrors.VT12001("cross-shard query with aggregates")
 		}
 		// now we break the expression into left and right side dependencies and rewrite the left ones to bind variables
-		bvName, cols, rewrittenExpr, err := physical.BreakExpressionInLHSandRHS(ctx, expr.Expr, lhsSolves)
+		joinCol, err := operators.BreakExpressionInLHSandRHS(ctx, expr.Expr, lhsSolves)
 		if err != nil {
 			return 0, false, err
 		}
 		// go over all the columns coming from the left side of the tree and push them down. While at it, also update the bind variable map.
 		// It is okay to reuse the columns on the left side since
 		// the final expression which will be selected will be pushed into the right side.
-		for i, col := range cols {
+		for i, col := range joinCol.LHSExprs {
 			colOffset, _, err := pushProjection(ctx, &sqlparser.AliasedExpr{Expr: col}, node.Left, inner, true, false)
 			if err != nil {
 				return 0, false, err
 			}
-			node.Vars[bvName[i]] = colOffset
+			node.Vars[joinCol.BvNames[i]] = colOffset
 		}
 		// push the rewritten expression on the right side of the tree. Here we should take care whether we want to reuse the expression or not.
-		expr.Expr = rewrittenExpr
+		expr.Expr = joinCol.RHSExpr
 		offset, added, err := pushProjection(ctx, expr, node.Right, inner && node.Opcode != engine.LeftJoin, passDownReuseCol, false)
 		if err != nil {
 			return 0, false, err
@@ -276,9 +275,9 @@ func pushProjectionIntoHashJoin(
 		// for example an expression like count(*) will have dependencies on both sides, but we should not push it
 		// instead we should return an error
 		if hasAggregation {
-			return 0, false, vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "unsupported: cross-shard query with aggregates")
+			return 0, false, vterrors.VT12001("cross-shard query with aggregates")
 		}
-		return 0, false, vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "unsupported: hash join with projection from both sides of the join")
+		return 0, false, vterrors.VT12001("hash join with projection from both sides of the join")
 	}
 	if reuseCol && !appended {
 		for idx, col := range node.Cols {
@@ -299,10 +298,10 @@ func addExpressionToRoute(ctx *plancontext.PlanningContext, rb *routeGen4, expr 
 			return i, false, nil
 		}
 	}
-	expr.Expr = sqlparser.RemoveKeyspaceFromColName(expr.Expr)
+	sqlparser.RemoveKeyspaceFromColName(expr.Expr)
 	sel, isSel := rb.Select.(*sqlparser.Select)
 	if !isSel {
-		return 0, false, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.BadFieldError, "unsupported: pushing projection '%s' on %T", sqlparser.String(expr), rb.Select)
+		return 0, false, vterrors.VT12001(fmt.Sprintf("pushing projection '%s' on %T", sqlparser.String(expr), rb.Select))
 	}
 
 	if ctx.RewriteDerivedExpr {
@@ -322,15 +321,12 @@ func addExpressionToRoute(ctx *plancontext.PlanningContext, rb *routeGen4, expr 
 
 func rewriteProjectionOfDerivedTable(expr *sqlparser.AliasedExpr, semTable *semantics.SemTable) error {
 	ti, err := semTable.TableInfoForExpr(expr.Expr)
-	if err != nil && err != semantics.ErrMultipleTables {
+	if err != nil && err != semantics.ErrNotSingleTable {
 		return err
 	}
 	_, isDerivedTable := ti.(*semantics.DerivedTable)
 	if isDerivedTable {
-		expr.Expr, err = semantics.RewriteDerivedExpression(expr.Expr, ti)
-		if err != nil {
-			return err
-		}
+		expr.Expr = semantics.RewriteDerivedTableExpression(expr.Expr, ti)
 	}
 	return nil
 }

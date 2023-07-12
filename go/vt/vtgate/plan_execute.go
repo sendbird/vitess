@@ -18,6 +18,7 @@ package vtgate
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -26,17 +27,20 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/logstats"
+	"vitess.io/vitess/go/vt/vtgate/vtgateservice"
 )
 
-type planExec func(plan *engine.Plan, vc *vcursorImpl, bindVars map[string]*querypb.BindVariable, startTime time.Time) error
+type planExec func(ctx context.Context, plan *engine.Plan, vc *vcursorImpl, bindVars map[string]*querypb.BindVariable, startTime time.Time) error
 type txResult func(sqlparser.StatementType, *sqltypes.Result) error
 
 func (e *Executor) newExecute(
 	ctx context.Context,
+	mysqlCtx vtgateservice.MySQLConnection,
 	safeSession *SafeSession,
 	sql string,
 	bindVars map[string]*querypb.BindVariable,
-	logStats *LogStats,
+	logStats *logstats.LogStats,
 	execPlan planExec, // used when there is a plan to execute
 	recResult txResult, // used when it's something simple like begin/commit/rollback/savepoint
 ) error {
@@ -53,20 +57,19 @@ func (e *Executor) newExecute(
 	}
 
 	query, comments := sqlparser.SplitMarginComments(sql)
-	vcursor, err := newVCursorImpl(ctx, safeSession, comments, e, logStats, e.vm, e.VSchema(), e.resolver.resolver, e.serv, e.warnShardedOnly, e.pv)
+	vcursor, err := newVCursorImpl(safeSession, comments, e, logStats, e.vm, e.VSchema(), e.resolver.resolver, e.serv, e.warnShardedOnly, e.pv)
 	if err != nil {
 		return err
 	}
 
-	// 2: Create a plan for the query
-	plan, err := e.getPlan(
-		vcursor,
-		query,
-		comments,
-		bindVars,
-		safeSession,
-		logStats,
-	)
+	// 2: Parse and Validate query
+	stmt, reservedVars, err := parseAndValidateQuery(query)
+	if err != nil {
+		return err
+	}
+
+	// 3: Create a plan for the query
+	plan, err := e.getPlan(ctx, vcursor, query, stmt, comments, bindVars, reservedVars, e.normalize, logStats)
 	execStart := e.logPlanningFinished(logStats, plan)
 
 	if err != nil {
@@ -83,7 +86,7 @@ func (e *Executor) newExecute(
 		safeSession.RecordWarning(warning)
 	}
 
-	result, err := e.handleTransactions(ctx, safeSession, plan, logStats, vcursor)
+	result, err := e.handleTransactions(ctx, mysqlCtx, safeSession, plan, logStats, vcursor, stmt)
 	if err != nil {
 		return err
 	}
@@ -101,20 +104,28 @@ func (e *Executor) newExecute(
 	if plan.Instructions.NeedsTransaction() {
 		return e.insideTransaction(ctx, safeSession, logStats,
 			func() error {
-				return execPlan(plan, vcursor, bindVars, execStart)
+				return execPlan(ctx, plan, vcursor, bindVars, execStart)
 			})
 	}
 
-	return execPlan(plan, vcursor, bindVars, execStart)
+	return execPlan(ctx, plan, vcursor, bindVars, execStart)
 }
 
 // handleTransactions deals with transactional queries: begin, commit, rollback and savepoint management
-func (e *Executor) handleTransactions(ctx context.Context, safeSession *SafeSession, plan *engine.Plan, logStats *LogStats, vcursor *vcursorImpl) (*sqltypes.Result, error) {
+func (e *Executor) handleTransactions(
+	ctx context.Context,
+	mysqlCtx vtgateservice.MySQLConnection,
+	safeSession *SafeSession,
+	plan *engine.Plan,
+	logStats *logstats.LogStats,
+	vcursor *vcursorImpl,
+	stmt sqlparser.Statement,
+) (*sqltypes.Result, error) {
 	// We need to explicitly handle errors, and begin/commit/rollback, since these control transactions. Everything else
 	// will fall through and be handled through planning
 	switch plan.Type {
 	case sqlparser.StmtBegin:
-		qr, err := e.handleBegin(ctx, safeSession, logStats)
+		qr, err := e.handleBegin(ctx, safeSession, logStats, stmt)
 		return qr, err
 	case sqlparser.StmtCommit:
 		qr, err := e.handleCommit(ctx, safeSession, logStats)
@@ -140,24 +151,26 @@ func (e *Executor) handleTransactions(ctx context.Context, safeSession *SafeSess
 			return nil, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.SPDoesNotExist, "SAVEPOINT does not exist: %s", query)
 		}, vcursor.ignoreMaxMemoryRows)
 		return qr, err
+	case sqlparser.StmtKill:
+		return e.handleKill(ctx, mysqlCtx, stmt, logStats)
 	}
 	return nil, nil
 }
 
 func (e *Executor) startTxIfNecessary(ctx context.Context, safeSession *SafeSession) error {
 	if !safeSession.Autocommit && !safeSession.InTransaction() {
-		if err := e.txConn.Begin(ctx, safeSession); err != nil {
+		if err := e.txConn.Begin(ctx, safeSession, nil); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (e *Executor) insideTransaction(ctx context.Context, safeSession *SafeSession, logStats *LogStats, execPlan func() error) error {
+func (e *Executor) insideTransaction(ctx context.Context, safeSession *SafeSession, logStats *logstats.LogStats, execPlan func() error) error {
 	mustCommit := false
 	if safeSession.Autocommit && !safeSession.InTransaction() {
 		mustCommit = true
-		if err := e.txConn.Begin(ctx, safeSession); err != nil {
+		if err := e.txConn.Begin(ctx, safeSession, nil); err != nil {
 			return err
 		}
 		// The defer acts as a failsafe. If commit was successful,
@@ -201,12 +214,12 @@ func (e *Executor) executePlan(
 	plan *engine.Plan,
 	vcursor *vcursorImpl,
 	bindVars map[string]*querypb.BindVariable,
-	logStats *LogStats,
+	logStats *logstats.LogStats,
 	execStart time.Time,
 ) (*sqltypes.Result, error) {
 
 	// 4: Execute!
-	qr, err := vcursor.ExecutePrimitive(plan.Instructions, bindVars, true)
+	qr, err := vcursor.ExecutePrimitive(ctx, plan.Instructions, bindVars, true)
 
 	// 5: Log and add statistics
 	e.setLogStats(logStats, plan, vcursor, execStart, err, qr)
@@ -219,7 +232,7 @@ func (e *Executor) executePlan(
 }
 
 // rollbackExecIfNeeded rollbacks the partial execution if earlier it was detected that it needs partial query execution to be rolled back.
-func (e *Executor) rollbackExecIfNeeded(ctx context.Context, safeSession *SafeSession, bindVars map[string]*querypb.BindVariable, logStats *LogStats, err error) error {
+func (e *Executor) rollbackExecIfNeeded(ctx context.Context, safeSession *SafeSession, bindVars map[string]*querypb.BindVariable, logStats *logstats.LogStats, err error) error {
 	if safeSession.InTransaction() && safeSession.IsRollbackSet() {
 		rErr := e.rollbackPartialExec(ctx, safeSession, bindVars, logStats)
 		return vterrors.Wrap(err, rErr.Error())
@@ -230,39 +243,51 @@ func (e *Executor) rollbackExecIfNeeded(ctx context.Context, safeSession *SafeSe
 // rollbackPartialExec rollbacks to the savepoint or rollbacks transaction based on the value set on SafeSession.rollbackOnPartialExec.
 // Once, it is used the variable is reset.
 // If it fails to rollback to the previous savepoint then, the transaction is forced to be rolled back.
-func (e *Executor) rollbackPartialExec(ctx context.Context, safeSession *SafeSession, bindVars map[string]*querypb.BindVariable, logStats *LogStats) error {
+func (e *Executor) rollbackPartialExec(ctx context.Context, safeSession *SafeSession, bindVars map[string]*querypb.BindVariable, logStats *logstats.LogStats) error {
 	var err error
+	var errMsg strings.Builder
+
+	// If the context got cancelled we still have to revert the partial DML execution.
+	// We cannot use the parent context here anymore.
+	if ctx.Err() != nil {
+		errMsg.WriteString("context canceled: ")
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+	}
 
 	// needs to rollback only once.
 	rQuery := safeSession.rollbackOnPartialExec
 	if rQuery != txRollback {
 		safeSession.SavepointRollback()
-		_, _, err := e.execute(ctx, safeSession, rQuery, bindVars, logStats)
+		_, _, err = e.execute(ctx, nil, safeSession, rQuery, bindVars, logStats)
+		// If no error, the revert is successful with the savepoint. Notify the reason as error to the client.
 		if err == nil {
-			return vterrors.New(vtrpcpb.Code_ABORTED, "reverted partial DML execution failure")
+			errMsg.WriteString("reverted partial DML execution failure")
+			return vterrors.New(vtrpcpb.Code_ABORTED, errMsg.String())
 		}
 		// not able to rollback changes of the failed query, so have to abort the complete transaction.
 	}
 
 	// abort the transaction.
 	_ = e.txConn.Rollback(ctx, safeSession)
-	var errMsg = "transaction rolled back to reverse changes of partial DML execution"
+	errMsg.WriteString("transaction rolled back to reverse changes of partial DML execution")
 	if err != nil {
-		return vterrors.Wrap(err, errMsg)
+		return vterrors.Wrap(err, errMsg.String())
 	}
-	return vterrors.New(vtrpcpb.Code_ABORTED, errMsg)
+	return vterrors.New(vtrpcpb.Code_ABORTED, errMsg.String())
 }
 
-func (e *Executor) setLogStats(logStats *LogStats, plan *engine.Plan, vcursor *vcursorImpl, execStart time.Time, err error, qr *sqltypes.Result) {
+func (e *Executor) setLogStats(logStats *logstats.LogStats, plan *engine.Plan, vcursor *vcursorImpl, execStart time.Time, err error, qr *sqltypes.Result) {
 	logStats.StmtType = plan.Type.String()
-	logStats.Keyspace = plan.Instructions.GetKeyspaceName()
-	logStats.Table = plan.Instructions.GetTableName()
+	logStats.ActiveKeyspace = vcursor.keyspace
+	logStats.TablesUsed = plan.TablesUsed
 	logStats.TabletType = vcursor.TabletType().String()
 	errCount := e.logExecutionEnd(logStats, execStart, plan, err, qr)
 	plan.AddStats(1, time.Since(logStats.StartTime), logStats.ShardQueries, logStats.RowsAffected, logStats.RowsReturned, errCount)
 }
 
-func (e *Executor) logExecutionEnd(logStats *LogStats, execStart time.Time, plan *engine.Plan, err error, qr *sqltypes.Result) uint64 {
+func (e *Executor) logExecutionEnd(logStats *logstats.LogStats, execStart time.Time, plan *engine.Plan, err error, qr *sqltypes.Result) uint64 {
 	logStats.ExecuteTime = time.Since(execStart)
 
 	e.updateQueryCounts(plan.Instructions.RouteType(), plan.Instructions.GetKeyspaceName(), plan.Instructions.GetTableName(), int64(logStats.ShardQueries))
@@ -278,7 +303,7 @@ func (e *Executor) logExecutionEnd(logStats *LogStats, execStart time.Time, plan
 	return errCount
 }
 
-func (e *Executor) logPlanningFinished(logStats *LogStats, plan *engine.Plan) time.Time {
+func (e *Executor) logPlanningFinished(logStats *logstats.LogStats, plan *engine.Plan) time.Time {
 	execStart := time.Now()
 	if plan != nil {
 		logStats.StmtType = plan.Type.String()

@@ -31,6 +31,10 @@ import (
 //TODO: Add Counter checks in all the tests.
 
 func TestMultipleReserveHaveDifferentConnection(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client1 := framework.NewClient()
 	client2 := framework.NewClient()
 
@@ -53,6 +57,10 @@ func TestMultipleReserveHaveDifferentConnection(t *testing.T) {
 }
 
 func TestReserveBeginRelease(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select connection_id()"
@@ -70,6 +78,10 @@ func TestReserveBeginRelease(t *testing.T) {
 }
 
 func TestBeginReserveRelease(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select connection_id()"
@@ -87,6 +99,10 @@ func TestBeginReserveRelease(t *testing.T) {
 }
 
 func TestReserveBeginExecuteRelease(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	insQuery := "insert into vitess_test (intval, floatval, charval, binval) values (4, null, null, null)"
@@ -107,6 +123,10 @@ func TestReserveBeginExecuteRelease(t *testing.T) {
 }
 
 func TestMultipleReserveBeginHaveDifferentConnection(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client1 := framework.NewClient()
 	client2 := framework.NewClient()
 
@@ -129,6 +149,10 @@ func TestMultipleReserveBeginHaveDifferentConnection(t *testing.T) {
 }
 
 func TestCommitOnReserveBeginConn(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select connection_id()"
@@ -149,6 +173,10 @@ func TestCommitOnReserveBeginConn(t *testing.T) {
 }
 
 func TestRollbackOnReserveBeginConn(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select connection_id()"
@@ -169,6 +197,10 @@ func TestRollbackOnReserveBeginConn(t *testing.T) {
 }
 
 func TestReserveBeginRollbackAndBeginCommitAgain(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select connection_id()"
@@ -203,6 +235,10 @@ func TestReserveBeginRollbackAndBeginCommitAgain(t *testing.T) {
 }
 
 func TestReserveBeginCommitFailToReuseTxID(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select connection_id()"
@@ -225,6 +261,10 @@ func TestReserveBeginCommitFailToReuseTxID(t *testing.T) {
 }
 
 func TestReserveBeginRollbackFailToReuseTxID(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select connection_id()"
@@ -247,6 +287,10 @@ func TestReserveBeginRollbackFailToReuseTxID(t *testing.T) {
 }
 
 func TestReserveBeginCommitFailToReuseOldReservedID(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select connection_id()"
@@ -271,6 +315,10 @@ func TestReserveBeginCommitFailToReuseOldReservedID(t *testing.T) {
 }
 
 func TestReserveBeginRollbackFailToReuseOldReservedID(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select connection_id()"
@@ -294,6 +342,10 @@ func TestReserveBeginRollbackFailToReuseOldReservedID(t *testing.T) {
 }
 
 func TestReserveReleaseAndFailToUseReservedIDAgain(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select 42"
@@ -312,6 +364,10 @@ func TestReserveReleaseAndFailToUseReservedIDAgain(t *testing.T) {
 }
 
 func TestReserveAndFailToRunTwiceConcurrently(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select 42"
@@ -336,6 +392,10 @@ func TestReserveAndFailToRunTwiceConcurrently(t *testing.T) {
 }
 
 func TestBeginReserveCommitAndNewTransactionsOnSameReservedID(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select connection_id()"
@@ -369,6 +429,10 @@ func TestBeginReserveCommitAndNewTransactionsOnSameReservedID(t *testing.T) {
 }
 
 func TestBeginReserveRollbackAndNewTransactionsOnSameReservedID(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select connection_id()"
@@ -402,6 +466,10 @@ func TestBeginReserveRollbackAndNewTransactionsOnSameReservedID(t *testing.T) {
 }
 
 func TestBeginReserveReleaseAndFailToUseReservedIDAndTxIDAgain(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select 42"
@@ -429,6 +497,10 @@ func TestBeginReserveReleaseAndFailToUseReservedIDAndTxIDAgain(t *testing.T) {
 }
 
 func TestReserveBeginReleaseAndFailToUseReservedIDAndTxIDAgain(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	query := "select 42"
@@ -456,6 +528,10 @@ func TestReserveBeginReleaseAndFailToUseReservedIDAndTxIDAgain(t *testing.T) {
 }
 
 func TestReserveExecuteWithFailingQueryAndReserveConnectionRemainsOpen(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	_, err := client.ReserveExecute("select foo", nil, nil)
@@ -469,6 +545,10 @@ func TestReserveExecuteWithFailingQueryAndReserveConnectionRemainsOpen(t *testin
 }
 
 func TestReserveAndExecuteWithFailingQueryAndReserveConnectionRemainsOpen(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	qr1, err := client.ReserveExecute("select connection_id()", nil, nil)
@@ -485,6 +565,10 @@ func TestReserveAndExecuteWithFailingQueryAndReserveConnectionRemainsOpen(t *tes
 }
 
 func TestReserveBeginExecuteWithFailingQueryAndReserveConnAndTxRemainsOpen(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	_, err := client.ReserveBeginExecute("select foo", nil, nil, nil)
@@ -516,6 +600,10 @@ func TestReserveBeginExecuteWithFailingQueryAndReserveConnAndTxRemainsOpen(t *te
 }
 
 func TestReserveAndBeginExecuteWithFailingQueryAndReserveConnAndTxRemainsOpen(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	// Save the connection id to check in the end that everything got executed on same connection.
@@ -547,6 +635,10 @@ func TestReserveAndBeginExecuteWithFailingQueryAndReserveConnAndTxRemainsOpen(t 
 }
 
 func TestReserveExecuteWithPreQueriesAndCheckConnectionState(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client1 := framework.NewClient()
 	client2 := framework.NewClient()
 
@@ -583,6 +675,10 @@ func TestReserveExecuteWithPreQueriesAndCheckConnectionState(t *testing.T) {
 }
 
 func TestReserveExecuteWithPreQueriesAndSavepoint(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 	defer client.Release()
 
@@ -648,6 +744,10 @@ func TestReserveExecuteWithPreQueriesAndSavepoint(t *testing.T) {
 }
 
 func TestReserveBeginExecuteWithPreQueriesAndCheckConnectionState(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	rcClient := framework.NewClient()
 	rucClient := framework.NewClient()
 
@@ -714,6 +814,10 @@ func TestReserveBeginExecuteWithPreQueriesAndCheckConnectionState(t *testing.T) 
 }
 
 func TestReserveExecuteWithFailingPreQueriesAndCheckConnectionState(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	selQuery := "select 42"
@@ -729,6 +833,10 @@ func TestReserveExecuteWithFailingPreQueriesAndCheckConnectionState(t *testing.T
 }
 
 func TestReserveBeginExecuteWithFailingPreQueriesAndCheckConnectionState(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	selQuery := "select 42"
@@ -747,6 +855,10 @@ func TestReserveBeginExecuteWithFailingPreQueriesAndCheckConnectionState(t *test
 }
 
 func TestBeginReserveExecuteWithFailingPreQueriesAndCheckConnectionState(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	selQuery := "select 42"
@@ -768,6 +880,10 @@ func TestBeginReserveExecuteWithFailingPreQueriesAndCheckConnectionState(t *test
 }
 
 func TestReserveBeginExecuteWithCommitFailureAndCheckConnectionAndDBState(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	connQuery := "select connection_id()"
@@ -798,6 +914,10 @@ func TestReserveBeginExecuteWithCommitFailureAndCheckConnectionAndDBState(t *tes
 }
 
 func TestReserveBeginExecuteWithRollbackFailureAndCheckConnectionAndDBState(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	connQuery := "select connection_id()"
@@ -828,6 +948,10 @@ func TestReserveBeginExecuteWithRollbackFailureAndCheckConnectionAndDBState(t *t
 }
 
 func TestReserveExecuteWithExecuteFailureAndCheckConnectionAndDBState(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 
 	connQuery := "select connection_id()"
@@ -866,6 +990,10 @@ func TestReserveExecuteWithExecuteFailureAndCheckConnectionAndDBState(t *testing
 }
 
 func TestReserveExecuteDDLWithoutTx(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 	defer client.Release()
 
@@ -892,6 +1020,10 @@ func TestReserveExecuteDDLWithoutTx(t *testing.T) {
 }
 
 func TestReserveExecuteDDLWithTx(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
 	client := framework.NewClient()
 	defer client.Release()
 
@@ -922,4 +1054,139 @@ func killConnection(t *testing.T, connID string) {
 	_, err := client.ReserveExecute("select 1", []string{fmt.Sprintf("kill %s", connID)}, nil)
 	require.NoError(t, err)
 	defer client.Release()
+}
+
+func BenchmarkPreQueries(b *testing.B) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
+	client := framework.NewClient()
+
+	tcases := []struct {
+		name     string
+		settings []string
+	}{{
+		name: "split_1",
+		settings: []string{
+			"set @@sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'"},
+	}, {
+		name: "split_2",
+		settings: []string{
+			"set @@sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'",
+			"set @@sql_safe_updates = false"},
+	}, {
+		name: "split_3",
+		settings: []string{
+			"set @@sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'",
+			"set @@sql_safe_updates = false",
+			"set @@read_buffer_size = 9191181919"},
+	}, {
+		name: "split_4",
+		settings: []string{
+			"set @@sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'",
+			"set @@sql_safe_updates = false", "set @@read_buffer_size = 9191181919",
+			"set @@max_heap_table_size = 10204023"},
+	}, {
+		name:     "combined_2",
+		settings: []string{"set @@sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION', @@sql_safe_updates = false"},
+	}, {
+		name:     "combined_3",
+		settings: []string{"set @@sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION', @@sql_safe_updates = false, @@read_buffer_size = 9191181919"},
+	}, {
+		name:     "combined_4",
+		settings: []string{"set @@sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION', @@sql_safe_updates = false, @@read_buffer_size = 9191181919, @@max_heap_table_size = 10204023"},
+	}}
+	query := "select connection_id()"
+
+	for _, tcase := range tcases {
+		b.Run(tcase.name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				if _, err := client.ReserveExecute(query, tcase.settings, nil); err != nil {
+					b.Error(err)
+				}
+				if err := client.Release(); err != nil {
+					b.Error(err)
+				}
+			}
+		})
+	}
+}
+
+func TestFailInfiniteSessions(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
+	client := framework.NewClient()
+	qr, err := client.Execute("select @@max_connections", nil)
+	require.NoError(t, err)
+	maxConn, err := qr.Rows[0][0].ToInt64()
+	require.NoError(t, err)
+
+	// twice the number of sessions than the pool size.
+	numOfSessions := int(maxConn * 2)
+
+	var clients []*framework.QueryClient
+
+	// read session
+	var failed bool
+	for i := 0; i < numOfSessions; i++ {
+		client := framework.NewClient()
+		_, err := client.ReserveExecute("select 1", []string{"set sql_mode = ''"}, nil)
+		if err != nil {
+			failed = true
+			require.Contains(t, err.Error(), "immediate error from server errorCode=1040 errorMsg=Too many connections")
+			break
+		}
+		clients = append(clients, client)
+	}
+	require.True(t, failed, "should have failed to create more sessions than the max mysql connection")
+
+	// Release all the sessions.
+	for _, client := range clients {
+		require.NoError(t,
+			client.Release())
+	}
+	clients = nil
+
+	// write session
+	failed = false
+	for i := 0; i < numOfSessions; i++ {
+		client := framework.NewClient()
+		_, err := client.ReserveBeginExecute("select 1", []string{"set sql_mode = ''"}, nil, nil)
+		if err != nil {
+			failed = true
+			require.Contains(t, err.Error(), "immediate error from server errorCode=1040 errorMsg=Too many connections")
+			break
+		}
+		require.NoError(t,
+			client.Commit())
+		clients = append(clients, client)
+	}
+	require.True(t, failed, "should have failed to create more sessions than the max mysql connection")
+
+	// Release all the sessions.
+	for _, client := range clients {
+		require.NoError(t,
+			client.Release())
+	}
+}
+
+func TestReserveQueryTimeout(t *testing.T) {
+	framework.Server.Config().EnableSettingsPool = false
+	defer func() {
+		framework.Server.Config().EnableSettingsPool = true
+	}()
+	client := framework.NewClient()
+
+	_, err := client.ReserveExecute("select sleep(19)", []string{"set sql_mode = ''"}, nil)
+	assert.NoError(t, err)
+	assert.NoError(t,
+		client.Release())
+
+	_, err = client.ReserveStreamExecute("select sleep(19)", []string{"set sql_mode = ''"}, nil)
+	assert.NoError(t, err)
+	assert.NoError(t,
+		client.Release())
 }

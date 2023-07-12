@@ -17,10 +17,10 @@ limitations under the License.
 package vindexes
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -30,22 +30,66 @@ import (
 var hash SingleColumn
 
 func init() {
-	hv, err := CreateVindex("hash", "nn", map[string]string{"Table": "t", "Column": "c"})
+	hv, err := CreateVindex("hash", "nn", map[string]string{})
+	unknownParams := hv.(ParamValidating).UnknownParams()
+	if len(unknownParams) > 0 {
+		panic("hash test init: expected 0 unknown params")
+	}
 	if err != nil {
 		panic(err)
 	}
 	hash = hv.(SingleColumn)
 }
 
-func TestHashInfo(t *testing.T) {
-	assert.Equal(t, 1, hash.Cost())
-	assert.Equal(t, "nn", hash.String())
-	assert.True(t, hash.IsUnique())
-	assert.False(t, hash.NeedsVCursor())
+func hashCreateVindexTestCase(
+	testName string,
+	vindexParams map[string]string,
+	expectErr error,
+	expectUnknownParams []string,
+) createVindexTestCase {
+	return createVindexTestCase{
+		testName: testName,
+
+		vindexType:   "hash",
+		vindexName:   "hash",
+		vindexParams: vindexParams,
+
+		expectCost:          1,
+		expectErr:           expectErr,
+		expectIsUnique:      true,
+		expectNeedsVCursor:  false,
+		expectString:        "hash",
+		expectUnknownParams: expectUnknownParams,
+	}
+}
+
+func TestHashCreateVindex(t *testing.T) {
+	cases := []createVindexTestCase{
+		hashCreateVindexTestCase(
+			"no params",
+			nil,
+			nil,
+			nil,
+		),
+		hashCreateVindexTestCase(
+			"empty params",
+			map[string]string{},
+			nil,
+			nil,
+		),
+		hashCreateVindexTestCase(
+			"unknown params",
+			map[string]string{"hello": "world"},
+			nil,
+			[]string{"hello"},
+		),
+	}
+
+	testCreateVindexes(t, cases)
 }
 
 func TestHashMap(t *testing.T) {
-	got, err := hash.Map(nil, []sqltypes.Value{
+	got, err := hash.Map(context.Background(), nil, []sqltypes.Value{
 		sqltypes.NewInt64(1),
 		sqltypes.NewInt64(2),
 		sqltypes.NewInt64(3),
@@ -88,7 +132,7 @@ func TestHashMap(t *testing.T) {
 func TestHashVerify(t *testing.T) {
 	ids := []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)}
 	ksids := [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6"), []byte("\x16k@\xb4J\xbaK\xd6")}
-	got, err := hash.Verify(nil, ids, ksids)
+	got, err := hash.Verify(context.Background(), nil, ids, ksids)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +142,7 @@ func TestHashVerify(t *testing.T) {
 	}
 
 	// Failure test
-	_, err = hash.Verify(nil, []sqltypes.Value{sqltypes.NewVarBinary("aa")}, [][]byte{nil})
+	_, err = hash.Verify(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary("aa")}, [][]byte{nil})
 	require.EqualError(t, err, "could not parse value: 'aa'")
 }
 

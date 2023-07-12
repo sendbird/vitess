@@ -18,12 +18,14 @@ package vtgateconn
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"sync"
 
+	"github.com/spf13/pflag"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -31,10 +33,27 @@ import (
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 )
 
-var (
-	// VtgateProtocol defines the RPC implementation used for connecting to vtgate.
-	VtgateProtocol = flag.String("vtgate_protocol", "grpc", "how to talk to vtgate")
-)
+// vtgateProtocol defines the RPC implementation used for connecting to vtgate.
+var vtgateProtocol = "grpc"
+
+func registerFlags(fs *pflag.FlagSet) {
+	fs.StringVar(&vtgateProtocol, "vtgate_protocol", vtgateProtocol, "how to talk to vtgate")
+}
+
+func init() {
+	servenv.OnParseFor("vttablet", registerFlags)
+	servenv.OnParseFor("vtclient", registerFlags)
+}
+
+// GetVTGateProtocol returns the protocol used to connect to vtgate as provided in the flag.
+func GetVTGateProtocol() string {
+	return vtgateProtocol
+}
+
+// SetVTGateProtocol set the protocol to be used to connect to vtgate.
+func SetVTGateProtocol(protocol string) {
+	vtgateProtocol = protocol
+}
 
 // VTGateConn is the client API object to talk to vtgate.
 // It can support concurrent sessions.
@@ -122,10 +141,12 @@ func (sn *VTGateSession) ExecuteBatch(ctx context.Context, query []string, bindV
 // error. Then you can pull values from the ResultStream until io.EOF,
 // or another error.
 func (sn *VTGateSession) StreamExecute(ctx context.Context, query string, bindVars map[string]*querypb.BindVariable) (sqltypes.ResultStream, error) {
-	// StreamExecute is only used for SELECT queries that don't change
-	// the session. So, the protocol doesn't return an updated session.
-	// This may change in the future.
-	return sn.impl.StreamExecute(ctx, sn.session, query, bindVars)
+	// passing in the function that will update the session when received on the stream.
+	return sn.impl.StreamExecute(ctx, sn.session, query, bindVars, func(response *vtgatepb.StreamExecuteResponse) {
+		if response.Session != nil {
+			sn.session = response.Session
+		}
+	})
 }
 
 // Prepare performs a VTGate Prepare.
@@ -149,7 +170,7 @@ type Impl interface {
 	ExecuteBatch(ctx context.Context, session *vtgatepb.Session, queryList []string, bindVarsList []map[string]*querypb.BindVariable) (*vtgatepb.Session, []sqltypes.QueryResponse, error)
 
 	// StreamExecute executes a streaming query on vtgate. This is a V3 function.
-	StreamExecute(ctx context.Context, session *vtgatepb.Session, query string, bindVars map[string]*querypb.BindVariable) (sqltypes.ResultStream, error)
+	StreamExecute(ctx context.Context, session *vtgatepb.Session, query string, bindVars map[string]*querypb.BindVariable, processResponse func(*vtgatepb.StreamExecuteResponse)) (sqltypes.ResultStream, error)
 
 	// Prepare returns the fields information for the query as part of supporting prepare statements.
 	Prepare(ctx context.Context, session *vtgatepb.Session, sql string, bindVariables map[string]*querypb.BindVariable) (*vtgatepb.Session, []*querypb.Field, error)
@@ -188,6 +209,17 @@ func RegisterDialer(name string, dialer DialerFunc) {
 	dialers[name] = dialer
 }
 
+// DeregisterDialer removes the named DialerFunc from the registered list of
+// dialers. If the named DialerFunc does not exist, it is a noop.
+//
+// This is useful to avoid unbounded memory use if many different dialer
+// implementations are used throughout the lifetime of a program.
+func DeregisterDialer(name string) {
+	dialersM.Lock()
+	defer dialersM.Unlock()
+	delete(dialers, name)
+}
+
 // DialProtocol dials a specific protocol, and returns the *VTGateConn
 func DialProtocol(ctx context.Context, protocol string, address string) (*VTGateConn, error) {
 	dialersM.Lock()
@@ -209,5 +241,5 @@ func DialProtocol(ctx context.Context, protocol string, address string) (*VTGate
 // Dial dials using the command-line specified protocol, and returns
 // the *VTGateConn.
 func Dial(ctx context.Context, address string) (*VTGateConn, error) {
-	return DialProtocol(ctx, *VtgateProtocol, address)
+	return DialProtocol(ctx, vtgateProtocol, address)
 }

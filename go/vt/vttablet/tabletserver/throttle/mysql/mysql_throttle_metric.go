@@ -12,7 +12,8 @@ import (
 	"time"
 
 	"github.com/patrickmn/go-cache"
-	metrics "github.com/rcrowley/go-metrics"
+
+	"vitess.io/vitess/go/stats"
 )
 
 // MetricsQueryType indicates the type of metrics query on MySQL backend. See following.
@@ -94,7 +95,7 @@ func (metric *MySQLThrottleMetric) Get() (float64, error) {
 }
 
 // ReadThrottleMetric returns a metric for the given probe. Either by explicit query
-// or via SHOW SLAVE STATUS
+// or via SHOW REPLICA STATUS
 func ReadThrottleMetric(probe *Probe, clusterName string, overrideGetMetricFunc func() *MySQLThrottleMetric) (mySQLThrottleMetric *MySQLThrottleMetric) {
 	if mySQLThrottleMetric := getCachedMySQLThrottleMetric(probe); mySQLThrottleMetric != nil {
 		return mySQLThrottleMetric
@@ -108,10 +109,10 @@ func ReadThrottleMetric(probe *Probe, clusterName string, overrideGetMetricFunc 
 
 	defer func(metric *MySQLThrottleMetric, started time.Time) {
 		go func() {
-			metrics.GetOrRegisterTimer("probes.latency", nil).Update(time.Since(started))
-			metrics.GetOrRegisterCounter("probes.total", nil).Inc(1)
+			stats.GetOrNewGauge("ThrottlerProbesLatency", "probes latency").Set(time.Since(started).Nanoseconds())
+			stats.GetOrNewCounter("ThrottlerProbesTotal", "total probes").Add(1)
 			if metric.Err != nil {
-				metrics.GetOrRegisterCounter("probes.error", nil).Inc(1)
+				stats.GetOrNewCounter("ThrottlerProbesError", "total probes errors").Add(1)
 			}
 		}()
 	}(mySQLThrottleMetric, started)

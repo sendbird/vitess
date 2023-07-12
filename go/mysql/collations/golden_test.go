@@ -25,7 +25,10 @@ import (
 	"strings"
 	"testing"
 
-	"vitess.io/vitess/go/mysql/collations/internal/charset"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/mysql/collations/charset"
 	"vitess.io/vitess/go/mysql/collations/internal/testutil"
 )
 
@@ -52,10 +55,8 @@ func TestGoldenWeights(t *testing.T) {
 					}
 
 					result := coll.WeightString(nil, input, 0)
-					if !bytes.Equal(expected, result) {
-						t.Errorf("mismatch for collation=%s\noriginal: %s\ninput:    %#v\nexpected: %v\nactual:   %v",
-							coll.Name(), string(goldenCase.Text), input, expected, result)
-					}
+					assert.True(t, bytes.Equal(expected, result), "mismatch for collation=%s\noriginal: %s\ninput:    %#v\nexpected: %v\nactual:   %v", coll.Name(), string(goldenCase.Text), input, expected, result)
+
 				}
 			})
 		}
@@ -78,9 +79,8 @@ func TestCollationsForLanguage(t *testing.T) {
 	}
 
 	for lang := range testutil.KnownLanguages {
-		if len(langCounts[lang]) == 0 {
-			t.Errorf("no collations found for %q", lang)
-		}
+		assert.NotEqual(t, 0, len(langCounts[lang]), "no collations found for %q", lang)
+
 		t.Logf("%s: %v", lang, langCounts[lang])
 	}
 }
@@ -120,7 +120,7 @@ func XTestSupportTables(t *testing.T) {
 	fmt.Fprintf(out, " |\n|%s\n", strings.Repeat("---|", len(envs)+2))
 
 	for _, id := range all {
-		coll := globalAllCollations[id]
+		coll := collationsById[id]
 		if coll == nil {
 			vdata := globalVersionInfo[id]
 
@@ -150,7 +150,7 @@ func XTestSupportTables(t *testing.T) {
 		} else {
 			fmt.Fprintf(out, "| %s | %s", coll.Name(), coll.Charset().Name())
 			for _, env := range envs {
-				_, supported := env.byID[coll.ID()]
+				_, supported := env.byName[coll.Name()]
 				if supported {
 					fmt.Fprintf(out, " | ✅")
 				} else {
@@ -191,12 +191,9 @@ func TestAllCollationsByCharset(t *testing.T) {
 					// this doesn't work yet
 					continue
 				}
-				if cset.Default == nil {
-					t.Fatalf("charset %s has no default", csname)
-				}
-				if cset.Binary == nil {
-					t.Fatalf("charset %s has no binary", csname)
-				}
+				require.NotNil(t, cset.Default, "charset %s has no default", csname)
+				require.NotNil(t, cset.Binary, "charset %s has no binary", csname)
+
 			}
 
 			for charset, expected := range tc.defaults {

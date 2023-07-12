@@ -18,13 +18,16 @@ package throttler
 
 import (
 	"fmt"
-	"html/template"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/google/safehtml/template"
+	"golang.org/x/exp/slices"
+
 	"vitess.io/vitess/go/vt/logz"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 const logHeaderHTML = `
@@ -99,7 +102,7 @@ var (
 )
 
 func init() {
-	http.HandleFunc("/throttlerlogz/", func(w http.ResponseWriter, r *http.Request) {
+	servenv.HTTPHandleFunc("/throttlerlogz/", func(w http.ResponseWriter, r *http.Request) {
 		throttlerlogzHandler(w, r, GlobalManager)
 	})
 }
@@ -109,8 +112,7 @@ func throttlerlogzHandler(w http.ResponseWriter, r *http.Request, m *managerImpl
 	parts := strings.SplitN(r.URL.Path, "/", 3)
 
 	if len(parts) != 3 {
-		errMsg := fmt.Sprintf("invalid /throttlerlogz path: %q expected paths: /throttlerlogz/ or /throttlerlogz/<throttler name>", r.URL.Path)
-		http.Error(w, errMsg, http.StatusInternalServerError)
+		http.Error(w, "invalid /throttlerlogz path", http.StatusNotFound)
 		return
 	}
 
@@ -121,11 +123,16 @@ func throttlerlogzHandler(w http.ResponseWriter, r *http.Request, m *managerImpl
 		return
 	}
 
+	if !slices.Contains(m.Throttlers(), name) {
+		http.Error(w, "throttler not found", http.StatusNotFound)
+		return
+	}
+
 	showThrottlerLog(w, m, name)
 }
 
 func showThrottlerLog(w http.ResponseWriter, m *managerImpl, name string) {
-	results, err := m.Log(name)
+	results, err := m.log(name)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

@@ -84,19 +84,17 @@ func (tc *tableCollector) up(cursor *sqlparser.Cursor) error {
 	case sqlparser.TableName:
 		var tbl *vindexes.Table
 		var vindex vindexes.Vindex
-		var isInfSchema bool
-		if sqlparser.SystemSchema(t.Qualifier.String()) {
-			isInfSchema = true
-		} else {
-			var err error
-			tbl, vindex, _, _, _, err = tc.si.FindTableOrVindex(t)
-			if err != nil {
-				return err
-			}
-			if tbl == nil && vindex != nil {
-				tbl = newVindexTable(t.Name)
-			}
+		isInfSchema := sqlparser.SystemSchema(t.Qualifier.String())
+		var err error
+		tbl, vindex, _, _, _, err = tc.si.FindTableOrVindex(t)
+		if err != nil && !isInfSchema {
+			// if we are dealing with a system table, it might not be available in the vschema, but that is OK
+			return err
 		}
+		if tbl == nil && vindex != nil {
+			tbl = newVindexTable(t.Name)
+		}
+
 		scope := tc.scoper.currentScope()
 		tableInfo := tc.createTable(t, node, tbl, isInfSchema, vindex)
 
@@ -106,14 +104,14 @@ func (tc *tableCollector) up(cursor *sqlparser.Cursor) error {
 	return nil
 }
 
-func newVindexTable(t sqlparser.TableIdent) *vindexes.Table {
+func newVindexTable(t sqlparser.IdentifierCS) *vindexes.Table {
 	vindexCols := []vindexes.Column{
-		{Name: sqlparser.NewColIdent("id")},
-		{Name: sqlparser.NewColIdent("keyspace_id")},
-		{Name: sqlparser.NewColIdent("range_start")},
-		{Name: sqlparser.NewColIdent("range_end")},
-		{Name: sqlparser.NewColIdent("hex_keyspace_id")},
-		{Name: sqlparser.NewColIdent("shard")},
+		{Name: sqlparser.NewIdentifierCI("id")},
+		{Name: sqlparser.NewIdentifierCI("keyspace_id")},
+		{Name: sqlparser.NewIdentifierCI("range_start")},
+		{Name: sqlparser.NewIdentifierCI("range_end")},
+		{Name: sqlparser.NewIdentifierCI("hex_keyspace_id")},
+		{Name: sqlparser.NewIdentifierCI("shard")},
 	}
 
 	return &vindexes.Table{
@@ -127,7 +125,7 @@ func newVindexTable(t sqlparser.TableIdent) *vindexes.Table {
 // The code lives in this file since it is only touching tableCollector data
 func (tc *tableCollector) tableSetFor(t *sqlparser.AliasedTableExpr) TableSet {
 	for i, t2 := range tc.Tables {
-		if t == t2.getExpr() {
+		if t == t2.GetExpr() {
 			return SingleTableSet(i)
 		}
 	}
@@ -138,7 +136,7 @@ func (tc *tableCollector) tableSetFor(t *sqlparser.AliasedTableExpr) TableSet {
 func (tc *tableCollector) tableInfoFor(id TableSet) (TableInfo, error) {
 	offset := id.TableOffset()
 	if offset < 0 {
-		return nil, ErrMultipleTables
+		return nil, ErrNotSingleTable
 	}
 	return tc.Tables[offset], nil
 }

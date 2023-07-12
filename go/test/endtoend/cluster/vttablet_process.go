@@ -21,6 +21,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +29,7 @@ import (
 	"os/exec"
 	"path"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -36,7 +38,11 @@ import (
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/sidecardb"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
+
+const vttabletStateTimeout = 30 * time.Second
 
 // VttabletProcess is a generic handle for a running vttablet .
 // It can be spawned manually
@@ -64,7 +70,6 @@ type VttabletProcess struct {
 	VerifyURL                   string
 	QueryzURL                   string
 	StatusDetailsURL            string
-	EnableSemiSync              bool
 	SupportsBackup              bool
 	ServingStatus               string
 	DbPassword                  string
@@ -72,6 +77,7 @@ type VttabletProcess struct {
 	VreplicationTabletType      string
 	DbFlavor                    string
 	Charset                     string
+	ConsolidationsURL           string
 
 	//Extra Args to be set before starting the vttablet process
 	ExtraArgs []string
@@ -82,7 +88,6 @@ type VttabletProcess struct {
 
 // Setup starts vttablet process with required arguements
 func (vttablet *VttabletProcess) Setup() (err error) {
-
 	vttablet.proc = exec.Command(
 		vttablet.Binary,
 		"--topo_implementation", vttablet.CommonArg.TopoImplementation,
@@ -117,9 +122,6 @@ func (vttablet *VttabletProcess) Setup() (err error) {
 	if vttablet.SupportsBackup {
 		vttablet.proc.Args = append(vttablet.proc.Args, "--restore_from_backup")
 	}
-	if vttablet.EnableSemiSync {
-		vttablet.proc.Args = append(vttablet.proc.Args, "--enable_semi_sync")
-	}
 	if vttablet.DbFlavor != "" {
 		vttablet.proc.Args = append(vttablet.proc.Args, fmt.Sprintf("--db_flavor=%s", vttablet.DbFlavor))
 	}
@@ -142,6 +144,7 @@ func (vttablet *VttabletProcess) Setup() (err error) {
 	go func() {
 		if vttablet.proc != nil {
 			vttablet.exit <- vttablet.proc.Wait()
+			close(vttablet.exit)
 		}
 	}()
 
@@ -164,9 +167,9 @@ func (vttablet *VttabletProcess) GetStatus() string {
 	if err != nil {
 		return ""
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode == 200 {
 		respByte, _ := io.ReadAll(resp.Body)
-		defer resp.Body.Close()
 		return string(respByte)
 	}
 	return ""
@@ -178,6 +181,8 @@ func (vttablet *VttabletProcess) GetVars() map[string]any {
 	if err != nil {
 		return nil
 	}
+	defer resp.Body.Close()
+
 	if resp.StatusCode == 200 {
 		resultMap := make(map[string]any)
 		respByte, _ := io.ReadAll(resp.Body)
@@ -196,8 +201,45 @@ func (vttablet *VttabletProcess) GetStatusDetails() string {
 	if err != nil {
 		return fmt.Sprintf("Status details failed: %v", err.Error())
 	}
+	defer resp.Body.Close()
+
 	respByte, _ := io.ReadAll(resp.Body)
 	return string(respByte)
+}
+
+// GetConsolidations gets consolidations
+func (vttablet *VttabletProcess) GetConsolidations() (map[string]int, error) {
+	resp, err := http.Get(vttablet.ConsolidationsURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get consolidations: %v", err)
+	}
+	defer resp.Body.Close()
+
+	result := make(map[string]int)
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		splits := strings.SplitN(line, ":", 2)
+		if len(splits) != 2 {
+			return nil, fmt.Errorf("failed to split consolidations line: %v", err)
+		}
+		// Discard "Length: [N]" lines.
+		if splits[0] == "Length" {
+			continue
+		}
+		countS := splits[0]
+		countI, err := strconv.Atoi(countS)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse consolidations count: %v", err)
+		}
+		result[strings.TrimSpace(splits[1])] = countI
+	}
+	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("failed to read consolidations: %v", err)
+	}
+
+	return result, nil
 }
 
 // WaitForStatus waits till desired status of tablet is reached
@@ -229,19 +271,19 @@ func (vttablet *VttabletProcess) GetTabletType() string {
 	return ""
 }
 
-// WaitForTabletStatus waits for 10 second till expected status is reached
+// WaitForTabletStatus waits for one of the expected statuses to be reached
 func (vttablet *VttabletProcess) WaitForTabletStatus(expectedStatus string) error {
-	return vttablet.WaitForTabletStatusesForTimeout([]string{expectedStatus}, 10*time.Second)
+	return vttablet.WaitForTabletStatusesForTimeout([]string{expectedStatus}, vttabletStateTimeout)
 }
 
-// WaitForTabletStatuses waits for 10 second till one of expected statuses is reached
+// WaitForTabletStatuses waits for one of expected statuses is reached
 func (vttablet *VttabletProcess) WaitForTabletStatuses(expectedStatuses []string) error {
-	return vttablet.WaitForTabletStatusesForTimeout(expectedStatuses, 10*time.Second)
+	return vttablet.WaitForTabletStatusesForTimeout(expectedStatuses, vttabletStateTimeout)
 }
 
-// WaitForTabletTypes waits for 10 second till one of expected statuses is reached
+// WaitForTabletTypes waits for one of expected statuses is reached
 func (vttablet *VttabletProcess) WaitForTabletTypes(expectedTypes []string) error {
-	return vttablet.WaitForTabletTypesForTimeout(expectedTypes, 10*time.Second)
+	return vttablet.WaitForTabletTypesForTimeout(expectedTypes, vttabletStateTimeout)
 }
 
 // WaitForTabletStatusesForTimeout waits till the tablet reaches to any of the provided statuses
@@ -295,7 +337,7 @@ func contains(arr []string, str string) bool {
 
 // WaitForBinLogPlayerCount waits till binlog player count var matches
 func (vttablet *VttabletProcess) WaitForBinLogPlayerCount(expectedCount int) error {
-	timeout := time.Now().Add(10 * time.Second)
+	timeout := time.Now().Add(vttabletStateTimeout)
 	for time.Now().Before(timeout) {
 		if vttablet.getVReplStreamCount() == fmt.Sprintf("%d", expectedCount) {
 			return nil
@@ -312,19 +354,23 @@ func (vttablet *VttabletProcess) WaitForBinLogPlayerCount(expectedCount int) err
 
 // WaitForBinlogServerState wait for the tablet's binlog server to be in the provided state.
 func (vttablet *VttabletProcess) WaitForBinlogServerState(expectedStatus string) error {
-	timeout := time.Now().Add(10 * time.Second)
-	for time.Now().Before(timeout) {
+	ctx, cancel := context.WithTimeout(context.Background(), vttabletStateTimeout)
+	defer cancel()
+	t := time.NewTicker(300 * time.Millisecond)
+	defer t.Stop()
+	for {
 		if vttablet.getVarValue("UpdateStreamState") == expectedStatus {
 			return nil
 		}
 		select {
 		case err := <-vttablet.exit:
 			return fmt.Errorf("process '%s' exited prematurely (err: %s)", vttablet.Name, err)
-		default:
-			time.Sleep(300 * time.Millisecond)
+		case <-ctx.Done():
+			return fmt.Errorf("vttablet %s, expected status of %s not reached before timeout of %v",
+				vttablet.TabletPath, expectedStatus, vttabletStateTimeout)
+		case <-t.C:
 		}
 	}
-	return fmt.Errorf("vttablet %s, expected status not reached", vttablet.TabletPath)
 }
 
 func (vttablet *VttabletProcess) getVReplStreamCount() string {
@@ -337,9 +383,20 @@ func (vttablet *VttabletProcess) getVarValue(keyname string) string {
 	return fmt.Sprintf("%v", object)
 }
 
-// TearDown shuts down the running vttablet service and fails after 10 seconds
+// TearDown shuts down the running vttablet service and fails after a timeout
 func (vttablet *VttabletProcess) TearDown() error {
-	return vttablet.TearDownWithTimeout(10 * time.Second)
+	return vttablet.TearDownWithTimeout(vttabletStateTimeout)
+}
+
+// Kill shuts down the running vttablet service immediately.
+func (vttablet *VttabletProcess) Kill() error {
+	if vttablet.proc == nil || vttablet.exit == nil {
+		return nil
+	}
+	vttablet.proc.Process.Kill()
+	err := <-vttablet.exit
+	vttablet.proc = nil
+	return err
 }
 
 // TearDownWithTimeout shuts down the running vttablet service and fails once the given
@@ -357,12 +414,7 @@ func (vttablet *VttabletProcess) TearDownWithTimeout(timeout time.Duration) erro
 		return nil
 
 	case <-time.After(timeout):
-		proc := vttablet.proc
-		if proc != nil {
-			vttablet.proc.Process.Kill()
-			vttablet.proc = nil
-		}
-		return <-vttablet.exit
+		return vttablet.Kill()
 	}
 }
 
@@ -465,11 +517,19 @@ func (vttablet *VttabletProcess) ToggleProfiling() error {
 }
 
 // WaitForVReplicationToCatchup waits for "workflow" to finish copying
-func (vttablet *VttabletProcess) WaitForVReplicationToCatchup(t testing.TB, workflow, database string, duration time.Duration) {
+func (vttablet *VttabletProcess) WaitForVReplicationToCatchup(t testing.TB, workflow, database string, sidecarDBName string, duration time.Duration) {
+	if sidecarDBName == "" {
+		sidecarDBName = sidecardb.DefaultName
+	}
+	// Escape it if/as needed
+	ics := sqlparser.NewIdentifierCS(sidecarDBName)
+	sdbi := sqlparser.String(ics)
 	queries := [3]string{
-		fmt.Sprintf(`select count(*) from _vt.vreplication where workflow = "%s" and db_name = "%s" and pos = ''`, workflow, database),
-		"select count(*) from information_schema.tables where table_schema='_vt' and table_name='copy_state' limit 1;",
-		fmt.Sprintf(`select count(*) from _vt.copy_state where vrepl_id in (select id from _vt.vreplication where workflow = "%s" and db_name = "%s" )`, workflow, database),
+		sqlparser.BuildParsedQuery(`select count(*) from %s.vreplication where workflow = "%s" and db_name = "%s" and pos = ''`,
+			sdbi, workflow, database).Query,
+		sqlparser.BuildParsedQuery("select count(*) from information_schema.tables where table_schema='%s' and table_name='copy_state' limit 1", sidecarDBName).Query,
+		sqlparser.BuildParsedQuery(`select count(*) from %s.copy_state where vrepl_id in (select id from %s.vreplication where workflow = "%s" and db_name = "%s" )`,
+			sdbi, sdbi, workflow, database).Query,
 	}
 	results := [3]string{"[INT64(0)]", "[INT64(1)]", "[INT64(0)]"}
 
@@ -552,7 +612,7 @@ func (vttablet *VttabletProcess) IsShutdown() bool {
 // VttabletProcessInstance returns a VttabletProcess handle for vttablet process
 // configured with the given Config.
 // The process must be manually started by calling setup()
-func VttabletProcessInstance(port, grpcPort, tabletUID int, cell, shard, keyspace string, vtctldPort int, tabletType string, topoPort int, hostname, tmpDirectory string, extraArgs []string, enableSemiSync bool, charset string) *VttabletProcess {
+func VttabletProcessInstance(port, grpcPort, tabletUID int, cell, shard, keyspace string, vtctldPort int, tabletType string, topoPort int, hostname, tmpDirectory string, extraArgs []string, charset string) *VttabletProcess {
 	vtctl := VtctlProcessInstance(topoPort, hostname)
 	vttablet := &VttabletProcess{
 		Name:                        "vttablet",
@@ -572,7 +632,6 @@ func VttabletProcessInstance(port, grpcPort, tabletUID int, cell, shard, keyspac
 		GrpcPort:                    grpcPort,
 		VtctldAddress:               fmt.Sprintf("http://%s:%d", hostname, vtctldPort),
 		ExtraArgs:                   extraArgs,
-		EnableSemiSync:              enableSemiSync,
 		SupportsBackup:              true,
 		ServingStatus:               "NOT_SERVING",
 		BackupStorageImplementation: "file",
@@ -588,6 +647,7 @@ func VttabletProcessInstance(port, grpcPort, tabletUID int, cell, shard, keyspac
 	vttablet.VerifyURL = fmt.Sprintf("http://%s:%d/debug/vars", hostname, port)
 	vttablet.QueryzURL = fmt.Sprintf("http://%s:%d/queryz", hostname, port)
 	vttablet.StatusDetailsURL = fmt.Sprintf("http://%s:%d/debug/status_details", hostname, port)
+	vttablet.ConsolidationsURL = fmt.Sprintf("http://%s:%d/debug/consolidations", hostname, port)
 
 	return vttablet
 }

@@ -53,6 +53,21 @@ func (mariadbFlavor) primaryGTIDSet(c *Conn) (GTIDSet, error) {
 	return parseMariadbGTIDSet(qr.Rows[0][0].ToString())
 }
 
+// purgedGTIDSet is part of the Flavor interface.
+func (mariadbFlavor) purgedGTIDSet(c *Conn) (GTIDSet, error) {
+	return nil, nil
+}
+
+// serverUUID is part of the Flavor interface.
+func (mariadbFlavor) serverUUID(c *Conn) (string, error) {
+	return "", nil
+}
+
+// gtidMode is part of the Flavor interface.
+func (mariadbFlavor) gtidMode(c *Conn) (string, error) {
+	return "", nil
+}
+
 func (mariadbFlavor) startReplicationUntilAfter(pos Position) string {
 	return fmt.Sprintf("START SLAVE UNTIL master_gtid_pos = \"%s\"", pos)
 }
@@ -90,7 +105,7 @@ func (mariadbFlavor) startSQLThreadCommand() string {
 }
 
 // sendBinlogDumpCommand is part of the Flavor interface.
-func (mariadbFlavor) sendBinlogDumpCommand(c *Conn, serverID uint32, startPos Position) error {
+func (mariadbFlavor) sendBinlogDumpCommand(c *Conn, serverID uint32, binlogFilename string, startPos Position) error {
 	// Tell the server that we understand GTIDs by setting
 	// mariadb_slave_capability to MARIA_SLAVE_CAPABILITY_GTID = 4 (MariaDB >= 10.0.1).
 	if _, err := c.ExecuteFetch("SET @mariadb_slave_capability=4", 0, false); err != nil {
@@ -126,6 +141,14 @@ func (mariadbFlavor) resetReplicationCommands(c *Conn) []string {
 	}
 	if c.SemiSyncExtensionLoaded() {
 		resetCommands = append(resetCommands, "SET GLOBAL rpl_semi_sync_master_enabled = false, GLOBAL rpl_semi_sync_slave_enabled = false") // semi-sync will be enabled if needed when replica is started.
+	}
+	return resetCommands
+}
+
+// resetReplicationParametersCommands is part of the Flavor interface.
+func (mariadbFlavor) resetReplicationParametersCommands(c *Conn) []string {
+	resetCommands := []string{
+		"RESET SLAVE ALL", // "ALL" makes it forget source host:port.
 	}
 	return resetCommands
 }

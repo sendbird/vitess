@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -39,6 +40,7 @@ import (
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/schema"
+	"vitess.io/vitess/go/vt/schemadiff"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
@@ -46,7 +48,9 @@ import (
 	"vitess.io/vitess/go/vt/vtctl/workflow"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/engine/opcode"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
+	"vitess.io/vitess/go/vt/vtgate/vindexes"
 	"vitess.io/vitess/go/vt/vttablet/tabletconn"
 	"vitess.io/vitess/go/vt/vttablet/tabletmanager/vreplication"
 
@@ -186,6 +190,10 @@ func (wr *Wrangler) VDiff(ctx context.Context, targetKeyspace, workflowName, sou
 		wr.Logger().Errorf("buildTrafficSwitcher: %v", err)
 		return nil, err
 	}
+	if ts.frozen {
+		return nil, fmt.Errorf("invalid VDiff run: writes have been already been switched for workflow %s.%s",
+			targetKeyspace, workflowName)
+	}
 	if err := ts.validate(ctx); err != nil {
 		ts.Logger().Errorf("validate: %v", err)
 		return nil, err
@@ -226,7 +234,8 @@ func (wr *Wrangler) VDiff(ctx context.Context, targetKeyspace, workflowName, sou
 		oneFilter = bls.Filter
 		break
 	}
-	schm, err := schematools.GetSchema(ctx, wr.ts, wr.tmc, oneTarget.GetPrimary().Alias, nil, nil, false)
+	req := &tabletmanagerdatapb.GetSchemaRequest{}
+	schm, err := schematools.GetSchema(ctx, wr.ts, wr.tmc, oneTarget.GetPrimary().Alias, req)
 	if err != nil {
 		return nil, vterrors.Wrap(err, "GetSchema")
 	}
@@ -237,17 +246,44 @@ func (wr *Wrangler) VDiff(ctx context.Context, targetKeyspace, workflowName, sou
 	if err := df.selectTablets(ctx, ts); err != nil {
 		return nil, vterrors.Wrap(err, "selectTablets")
 	}
-	defer func(ctx context.Context) {
-		if err := df.restartTargets(ctx); err != nil {
-			wr.Logger().Errorf("Could not restart workflow %s: %v, please restart it manually", workflowName, err)
+	defer func() {
+		// We use a new context as we want to reset the state even
+		// when the parent context has timed out or been canceled.
+		log.Infof("Restarting the %q VReplication workflow on target tablets in keyspace %q", df.workflow, df.targetKeyspace)
+		restartCtx, restartCancel := context.WithTimeout(context.Background(), DefaultActionTimeout)
+		defer restartCancel()
+		if err := df.restartTargets(restartCtx); err != nil {
+			wr.Logger().Errorf("Could not restart workflow %q on target tablets in keyspace %q: %v, please restart it manually",
+				df.workflow, df.targetKeyspace, err)
 		}
-	}(ctx)
+	}()
 
 	// Perform the diffs.
 	// We need a cancelable context to abort all running streams
 	// if one stream returns an error.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// Get the VSchema on the target and source keyspaces. We can
+	// then use this for handling edge cases, such as adjusting
+	// results for reference tables when the shard count is
+	// different between the source and target as then there will
+	// be a extra rows reported on the side with more shards.
+	srcTopo := wr.ts
+	if ts.ExternalTopo() != nil {
+		srcTopo = ts.ExternalTopo()
+	}
+	srcvschema, err := srcTopo.GetVSchema(ctx, ts.SourceKeyspaceName())
+	if err != nil {
+		return nil, err
+	}
+	tgtvschema, err := wr.ts.GetVSchema(ctx, ts.TargetKeyspaceName())
+	if err != nil {
+		return nil, err
+	}
+	numSourceShards := len(ts.SourceShards())
+	numTargetShards := len(ts.TargetShards())
+	numShardDiff := int(math.Abs(float64(numSourceShards - numTargetShards)))
 
 	// TODO(sougou): parallelize
 	rowsToCompare := maxRows
@@ -267,21 +303,50 @@ func (wr *Wrangler) VDiff(ctx context.Context, targetKeyspace, workflowName, sou
 			return nil, vterrors.Wrap(err, "diff")
 		}
 		dr.TableName = table
+		// This could be a reference table with a different number of shards on
+		// the source and target, so let's check and adjust if needed. In that
+		// case we should have no mismatched rows and the number of extra rows
+		// should be a multiple of the extra shards.
+		if numShardDiff > 0 && (dr.ExtraRowsSource > 0 || dr.ExtraRowsTarget > 0) && dr.MismatchedRows == 0 {
+			// Each shard should have the same number of rows for a reference table.
+			perShardRows := (dr.ProcessedRows + dr.MatchingRows) / (numSourceShards + numTargetShards)
+			if perShardRows == dr.MatchingRows { // If not then there's a legitimate mismatch
+				svt, sok := srcvschema.Tables[table]
+				tvt, tok := tgtvschema.Tables[table]
+				if numSourceShards > numTargetShards && sok && svt.Type == vindexes.TypeReference &&
+					dr.ExtraRowsSource/numShardDiff == perShardRows {
+					dr.ExtraRowsSource = 0
+					dr.ExtraRowsSourceDiffs = nil
+					dr.ProcessedRows = dr.MatchingRows
+				}
+				if numTargetShards > numSourceShards && tok && tvt.Type == vindexes.TypeReference &&
+					dr.ExtraRowsTarget/numShardDiff == perShardRows {
+					dr.ExtraRowsTarget = 0
+					dr.ExtraRowsTargetDiffs = nil
+					dr.ProcessedRows = dr.MatchingRows
+				}
+			}
+		}
 		// If the only difference is the order in which the rows were returned
 		// by MySQL on each side then we'll have the same number of extras on
 		// both sides. If that's the case, then let's see if the extra rows on
 		// both sides are actually different.
 		if (dr.ExtraRowsSource == dr.ExtraRowsTarget) && (dr.ExtraRowsSource <= maxExtraRowsToCompare) {
-			for i := range dr.ExtraRowsSourceDiffs {
+			for i := 0; i < len(dr.ExtraRowsSourceDiffs); i++ {
 				foundMatch := false
-				for j := range dr.ExtraRowsTargetDiffs {
+				for j := 0; j < len(dr.ExtraRowsTargetDiffs); j++ {
 					if reflect.DeepEqual(dr.ExtraRowsSourceDiffs[i], dr.ExtraRowsTargetDiffs[j]) {
 						dr.ExtraRowsSourceDiffs = append(dr.ExtraRowsSourceDiffs[:i], dr.ExtraRowsSourceDiffs[i+1:]...)
-						dr.ExtraRowsSource--
 						dr.ExtraRowsTargetDiffs = append(dr.ExtraRowsTargetDiffs[:j], dr.ExtraRowsTargetDiffs[j+1:]...)
+						dr.ExtraRowsSource--
 						dr.ExtraRowsTarget--
 						dr.ProcessedRows--
 						dr.MatchingRows++
+						// We've removed an element from both slices at the current index
+						// so we need to shift the counters back as well to process the
+						// new elements at the index and avoid using an index out of range.
+						i--
+						j--
 						foundMatch = true
 						break
 					}
@@ -355,12 +420,6 @@ func (df *vdiff) diffTable(ctx context.Context, wr *Wrangler, table string, td *
 		}
 	}()
 
-	defer func() {
-		log.Errorf("restarting targets for workflow %s in keyspace %s", df.workflow, df.targetKeyspace)
-		if err := df.restartTargets(ctx); err != nil {
-			log.Errorf("Error restarting targets for workflow %s in keyspace %s", df.workflow, df.targetKeyspace)
-		}
-	}()
 	// Stop the targets and record their source positions.
 	if err := df.stopTargets(ctx); err != nil {
 		return vterrors.Wrap(err, "stopTargets")
@@ -393,9 +452,9 @@ func (df *vdiff) buildVDiffPlan(ctx context.Context, filter *binlogdatapb.Filter
 			continue
 		}
 		query := rule.Filter
-		if rule.Filter == "" || key.IsKeyRange(rule.Filter) {
+		if rule.Filter == "" || key.IsValidKeyRange(rule.Filter) {
 			buf := sqlparser.NewTrackedBuffer(nil)
-			buf.Myprintf("select * from %v", sqlparser.NewTableIdent(table.Name))
+			buf.Myprintf("select * from %v", sqlparser.NewIdentifierCS(table.Name))
 			query = buf.String()
 		}
 		include := true
@@ -422,8 +481,13 @@ func (df *vdiff) buildVDiffPlan(ctx context.Context, filter *binlogdatapb.Filter
 	return nil
 }
 
-// findPKs identifies PKs and removes them from the columns to do data comparison
+// findPKs identifies PKs, determines any collations to be used for
+// them, and removes them from the columns used for data comparison.
 func findPKs(table *tabletmanagerdatapb.TableDefinition, targetSelect *sqlparser.Select, td *tableDiffer) (sqlparser.OrderBy, error) {
+	columnCollations, err := getColumnCollations(table)
+	if err != nil {
+		return nil, err
+	}
 	var orderby sqlparser.OrderBy
 	for _, pk := range table.PrimaryKeyColumns {
 		found := false
@@ -440,6 +504,7 @@ func findPKs(table *tabletmanagerdatapb.TableDefinition, targetSelect *sqlparser
 			}
 			if strings.EqualFold(pk, colname) {
 				td.compareCols[i].isPK = true
+				td.compareCols[i].collation = columnCollations[strings.ToLower(colname)]
 				td.comparePKs = append(td.comparePKs, td.compareCols[i])
 				td.selectPks = append(td.selectPks, i)
 				// We'll be comparing pks separately. So, remove them from compareCols.
@@ -453,11 +518,68 @@ func findPKs(table *tabletmanagerdatapb.TableDefinition, targetSelect *sqlparser
 			return nil, fmt.Errorf("column %v not found in table %v", pk, table.Name)
 		}
 		orderby = append(orderby, &sqlparser.Order{
-			Expr:      &sqlparser.ColName{Name: sqlparser.NewColIdent(pk)},
+			Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(pk)},
 			Direction: sqlparser.AscOrder,
 		})
 	}
 	return orderby, nil
+}
+
+// getColumnCollations determines the proper collation to use for each
+// column in the table definition leveraging MySQL's collation inheritence
+// rules.
+func getColumnCollations(table *tabletmanagerdatapb.TableDefinition) (map[string]collations.Collation, error) {
+	collationEnv := collations.Local()
+	createstmt, err := sqlparser.Parse(table.Schema)
+	if err != nil {
+		return nil, err
+	}
+	createtable, ok := createstmt.(*sqlparser.CreateTable)
+	if !ok {
+		return nil, vterrors.Wrapf(err, "invalid table schema %s for table %s", table.Schema, table.Name)
+	}
+	tableschema, err := schemadiff.NewCreateTableEntity(createtable)
+	if err != nil {
+		return nil, vterrors.Wrapf(err, "invalid table schema %s for table %s", table.Schema, table.Name)
+	}
+	tableCharset := tableschema.GetCharset()
+	tableCollation := tableschema.GetCollation()
+	// If no explicit collation is specified for the column then we need
+	// to walk the inheritence tree.
+	getColumnCollation := func(column *sqlparser.ColumnDefinition) collations.Collation {
+		// If there's an explicit collation listed then use that.
+		if column.Type.Options.Collate != "" {
+			return collationEnv.LookupByName(strings.ToLower(column.Type.Options.Collate))
+		}
+		// If the column has a charset listed then the default collation
+		// for that charset is used.
+		if column.Type.Charset.Name != "" {
+			return collationEnv.DefaultCollationForCharset(strings.ToLower(column.Type.Charset.Name))
+		}
+		// If the table has an explicit collation listed then use that.
+		if tableCollation != "" {
+			return collationEnv.LookupByName(strings.ToLower(tableCollation))
+		}
+		// If the table has a charset listed then use the default collation
+		// for that charset.
+		if tableCharset != "" {
+			return collationEnv.DefaultCollationForCharset(strings.ToLower(tableCharset))
+		}
+		// The table is using the global default charset and collation and
+		// we inherite that.
+		return collations.Default().Get()
+	}
+
+	columnCollations := make(map[string]collations.Collation)
+	for _, column := range tableschema.TableSpec.Columns {
+		// If it's not a character based type then no collation is used.
+		if !sqltypes.IsQuoted(column.Type.SQLType()) {
+			columnCollations[column.Name.Lowered()] = nil
+			continue
+		}
+		columnCollations[column.Name.Lowered()] = getColumnCollation(column)
+	}
+	return columnCollations, nil
 }
 
 // If SourceTimeZone is defined in the BinlogSource, the VReplication workflow would have converted the datetime
@@ -480,7 +602,7 @@ func (df *vdiff) adjustForSourceTimeZone(targetSelectExprs sqlparser.SelectExprs
 				fieldType := fields[colName]
 				if fieldType == querypb.Type_DATETIME {
 					convertTZFuncExpr = &sqlparser.FuncExpr{
-						Name: sqlparser.NewColIdent("convert_tz"),
+						Name: sqlparser.NewIdentifierCI("convert_tz"),
 						Exprs: sqlparser.SelectExprs{
 							expr,
 							&sqlparser.AliasedExpr{Expr: sqlparser.NewStrLiteral(df.targetTimeZone)},
@@ -542,7 +664,7 @@ func (df *vdiff) buildTablePlan(table *tabletmanagerdatapb.TableDefinition, quer
 		case *sqlparser.StarExpr:
 			// If it's a '*' expression, expand column list from the schema.
 			for _, fld := range table.Fields {
-				aliased := &sqlparser.AliasedExpr{Expr: &sqlparser.ColName{Name: sqlparser.NewColIdent(fld.Name)}}
+				aliased := &sqlparser.AliasedExpr{Expr: &sqlparser.ColName{Name: sqlparser.NewIdentifierCI(fld.Name)}}
 				sourceSelect.SelectExprs = append(sourceSelect.SelectExprs, aliased)
 				targetSelect.SelectExprs = append(targetSelect.SelectExprs, aliased)
 			}
@@ -562,18 +684,17 @@ func (df *vdiff) buildTablePlan(table *tabletmanagerdatapb.TableDefinition, quer
 			targetSelect.SelectExprs = append(targetSelect.SelectExprs, &sqlparser.AliasedExpr{Expr: targetCol})
 
 			// Check if it's an aggregate expression
-			if expr, ok := selExpr.Expr.(*sqlparser.FuncExpr); ok {
-				switch fname := expr.Name.Lowered(); fname {
+			if expr, ok := selExpr.Expr.(sqlparser.AggrFunc); ok {
+				switch fname := expr.AggrName(); fname {
 				case "count", "sum":
 					// this will only work as long as aggregates can be pushed down to tablets
 					// this won't work: "select count(*) from (select id from t limit 1)"
 					// since vreplication only handles simple tables (no joins/derived tables) this is fine for now
 					// but will need to be revisited when we add such support to vreplication
-					aggregateFuncType := "sum"
-					aggregates = append(aggregates, &engine.AggregateParams{
-						Opcode: engine.SupportedAggregates[aggregateFuncType],
-						Col:    len(sourceSelect.SelectExprs) - 1,
-					})
+					aggregates = append(aggregates, engine.NewAggregateParam(
+						/*opcode*/ opcode.AggregateSum,
+						/*offset*/ len(sourceSelect.SelectExprs)-1,
+						/*alias*/ ""))
 				}
 			}
 		default:
@@ -595,7 +716,7 @@ func (df *vdiff) buildTablePlan(table *tabletmanagerdatapb.TableDefinition, quer
 		if err != nil {
 			return nil, err
 		}
-		_, ok := fields[colname]
+		_, ok = fields[colname]
 		if !ok {
 			return nil, fmt.Errorf("column %v not found in table %v", colname, table.Name)
 		}
@@ -607,7 +728,7 @@ func (df *vdiff) buildTablePlan(table *tabletmanagerdatapb.TableDefinition, quer
 	targetSelect.From = sqlparser.TableExprs{
 		&sqlparser.AliasedTableExpr{
 			Expr: &sqlparser.TableName{
-				Name: sqlparser.NewTableIdent(table.Name),
+				Name: sqlparser.NewIdentifierCS(table.Name),
 			},
 		},
 	}
@@ -687,7 +808,7 @@ func (df *vdiff) selectTablets(ctx context.Context, ts *trafficSwitcher) error {
 			if ts.ExternalTopo() != nil {
 				sourceTopo = ts.ExternalTopo()
 			}
-			tp, err := discovery.NewTabletPicker(sourceTopo, []string{df.sourceCell}, df.ts.SourceKeyspaceName(), shard, df.tabletTypesStr)
+			tp, err := discovery.NewTabletPicker(ctx, sourceTopo, []string{df.sourceCell}, df.sourceCell, df.ts.SourceKeyspaceName(), shard, df.tabletTypesStr, discovery.TabletPickerOptions{})
 			if err != nil {
 				return err
 			}
@@ -705,7 +826,7 @@ func (df *vdiff) selectTablets(ctx context.Context, ts *trafficSwitcher) error {
 	go func() {
 		defer wg.Done()
 		err2 = df.forAll(df.targets, func(shard string, target *shardStreamer) error {
-			tp, err := discovery.NewTabletPicker(df.ts.TopoServer(), []string{df.targetCell}, df.ts.TargetKeyspaceName(), shard, df.tabletTypesStr)
+			tp, err := discovery.NewTabletPicker(ctx, df.ts.TopoServer(), []string{df.targetCell}, df.targetCell, df.ts.TargetKeyspaceName(), shard, df.tabletTypesStr, discovery.TabletPickerOptions{})
 			if err != nil {
 				return err
 			}
@@ -867,14 +988,14 @@ func (df *vdiff) streamOne(ctx context.Context, keyspace, shard string, particip
 func (df *vdiff) syncTargets(ctx context.Context, filteredReplicationWaitTime time.Duration) error {
 	waitCtx, cancel := context.WithTimeout(ctx, filteredReplicationWaitTime)
 	defer cancel()
-	err := df.ts.ForAllUIDs(func(target *workflow.MigrationTarget, uid uint32) error {
+	err := df.ts.ForAllUIDs(func(target *workflow.MigrationTarget, uid int32) error {
 		bls := target.Sources[uid]
 		pos := df.sources[bls.Shard].snapshotPosition
 		query := fmt.Sprintf("update _vt.vreplication set state='Running', stop_pos='%s', message='synchronizing for vdiff' where id=%d", pos, uid)
 		if _, err := df.ts.TabletManagerClient().VReplicationExec(ctx, target.GetPrimary().Tablet, query); err != nil {
 			return err
 		}
-		if err := df.ts.TabletManagerClient().VReplicationWaitForPos(waitCtx, target.GetPrimary().Tablet, int(uid), pos); err != nil {
+		if err := df.ts.TabletManagerClient().VReplicationWaitForPos(waitCtx, target.GetPrimary().Tablet, uid, pos); err != nil {
 			return vterrors.Wrapf(err, "VReplicationWaitForPos for tablet %v", topoproto.TabletAliasString(target.GetPrimary().Tablet.Alias))
 		}
 		return nil
@@ -901,9 +1022,19 @@ func (df *vdiff) syncTargets(ctx context.Context, filteredReplicationWaitTime ti
 // restartTargets restarts the stopped target vreplication streams.
 func (df *vdiff) restartTargets(ctx context.Context) error {
 	return df.forAll(df.targets, func(shard string, target *shardStreamer) error {
-		query := fmt.Sprintf("update _vt.vreplication set state='Running', message='', stop_pos='' where db_name=%s and workflow=%s", encodeString(target.primary.DbName()), encodeString(df.ts.WorkflowName()))
-		log.Infof("restarting target replication with %s", query)
-		_, err := df.ts.TabletManagerClient().VReplicationExec(ctx, target.primary.Tablet, query)
+		query := fmt.Sprintf("update _vt.vreplication set state='Running', message='', stop_pos='' where db_name=%s and workflow=%s",
+			encodeString(target.primary.DbName()), encodeString(df.ts.WorkflowName()))
+		log.Infof("Restarting the %q VReplication workflow on %q using %q", df.ts.WorkflowName(), target.primary.Alias, query)
+		var err error
+		// Let's retry a few times if we get a retryable error.
+		for i := 1; i <= 3; i++ {
+			_, err = df.ts.TabletManagerClient().VReplicationExec(ctx, target.primary.Tablet, query)
+			if err == nil || !mysql.IsEphemeralError(err) {
+				break
+			}
+			log.Warningf("Encountered the following error while restarting the %q VReplication workflow on %q, will retry (attempt #%d): %v",
+				df.ts.WorkflowName(), target.primary.Alias, i, err)
+		}
 		return err
 	})
 }
@@ -942,10 +1073,10 @@ func newPrimitiveExecutor(ctx context.Context, prim engine.Primitive) *primitive
 		prim:     prim,
 		resultch: make(chan *sqltypes.Result, 1),
 	}
-	vcursor := &contextVCursor{ctx: ctx}
+	vcursor := &contextVCursor{}
 	go func() {
 		defer close(pe.resultch)
-		pe.err = vcursor.StreamExecutePrimitive(pe.prim, make(map[string]*querypb.BindVariable), true, func(qr *sqltypes.Result) error {
+		pe.err = vcursor.StreamExecutePrimitive(ctx, pe.prim, make(map[string]*querypb.BindVariable), true, func(qr *sqltypes.Result) error {
 			select {
 			case pe.resultch <- qr:
 			case <-ctx.Done():
@@ -988,7 +1119,7 @@ func (pe *primitiveExecutor) drain(ctx context.Context) (int, error) {
 //-----------------------------------------------------------------
 // shardStreamer
 
-func (sm *shardStreamer) StreamExecute(vcursor engine.VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+func (sm *shardStreamer) StreamExecute(ctx context.Context, vcursor engine.VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
 	for result := range sm.result {
 		if err := callback(result); err != nil {
 			return err
@@ -1246,27 +1377,21 @@ func (td *tableDiffer) genDebugQueryDiff(sel *sqlparser.Select, row []sqltypes.V
 //-----------------------------------------------------------------
 // contextVCursor
 
-// contextVCursor satisfies VCursor, but only implements Context().
-// MergeSort only requires Context to be implemented.
+// contextVCursor satisfies VCursor interface
 type contextVCursor struct {
 	engine.VCursor
-	ctx context.Context
 }
 
 func (vc *contextVCursor) ConnCollation() collations.ID {
 	return collations.CollationBinaryID
 }
 
-func (vc *contextVCursor) ExecutePrimitive(primitive engine.Primitive, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
-	return primitive.TryExecute(vc, bindVars, wantfields)
+func (vc *contextVCursor) ExecutePrimitive(ctx context.Context, primitive engine.Primitive, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
+	return primitive.TryExecute(ctx, vc, bindVars, wantfields)
 }
 
-func (vc *contextVCursor) StreamExecutePrimitive(primitive engine.Primitive, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
-	return primitive.TryStreamExecute(vc, bindVars, wantfields, callback)
-}
-
-func (vc *contextVCursor) Context() context.Context {
-	return vc.ctx
+func (vc *contextVCursor) StreamExecutePrimitive(ctx context.Context, primitive engine.Primitive, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+	return primitive.TryStreamExecute(ctx, vc, bindVars, wantfields, callback)
 }
 
 //-----------------------------------------------------------------

@@ -54,10 +54,11 @@ func (ev mariadbBinlogEvent) IsGTID() bool {
 // GTID implements BinlogEvent.GTID().
 //
 // Expected format:
-//   # bytes   field
-//   8         sequence number
-//   4         domain ID
-//   1         flags2
+//
+//	# bytes   field
+//	8         sequence number
+//	4         domain ID
+//	1         flags2
 func (ev mariadbBinlogEvent) GTID(f BinlogFormat) (GTID, bool, error) {
 	const FLStandalone = 1
 
@@ -86,8 +87,8 @@ func (ev mariadbBinlogEvent) StripChecksum(f BinlogFormat) (BinlogEvent, []byte,
 		// Checksum is the last 4 bytes of the event buffer.
 		data := ev.Bytes()
 		length := len(data)
-		checksum := data[length-4:]
-		data = data[:length-4]
+		checksum := data[length-BinlogCRC32ChecksumLen:]
+		data = data[:length-BinlogCRC32ChecksumLen]
 		return mariadbBinlogEvent{binlogEvent: binlogEvent(data)}, checksum, nil
 	}
 }

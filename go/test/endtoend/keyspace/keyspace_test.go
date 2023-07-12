@@ -17,13 +17,14 @@ limitations under the License.
 package sequence
 
 import (
-	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"os"
 	"strings"
 	"testing"
+
+	"vitess.io/vitess/go/vt/key"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -118,9 +119,6 @@ func TestMain(m *testing.M) {
 			SchemaSQL: sqlSchema,
 		}
 		if err := clusterForKSTest.StartKeyspace(*keyspaceUnsharded, []string{keyspaceUnshardedName}, 1, false); err != nil {
-			return 1
-		}
-		if err := clusterForKSTest.VtctlclientProcess.ExecuteCommand("SetKeyspaceShardingInfo", "--", "--force", keyspaceUnshardedName, "keyspace_id", "uint64"); err != nil {
 			return 1
 		}
 		if err := clusterForKSTest.VtctlclientProcess.ExecuteCommand("RebuildKeyspaceGraph", keyspaceUnshardedName); err != nil {
@@ -226,9 +224,6 @@ func TestGetKeyspace(t *testing.T) {
 
 	err = json.Unmarshal([]byte(output), &keyspace)
 	require.Nil(t, err)
-
-	assert.Equal(t, keyspace.ShardingColumnName, "keyspace_id")
-	assert.Equal(t, keyspace.ShardingColumnType, topodata.KeyspaceIdType(1))
 }
 
 func TestDeleteKeyspace(t *testing.T) {
@@ -398,8 +393,8 @@ func TestKeyspaceToShardName(t *testing.T) {
 				shardKIDs := shardKIdMap[shardRef.Name]
 				for _, kid := range shardKIDs {
 					id = packKeyspaceID(kid)
-					assert.True(t, bytes.Compare(shardRef.KeyRange.Start, id) <= 0 &&
-						(len(shardRef.KeyRange.End) == 0 || bytes.Compare(id, shardRef.KeyRange.End) < 0))
+					assert.True(t, key.Compare(shardRef.KeyRange.Start, id) <= 0 &&
+						(key.Empty(shardRef.KeyRange.End) || key.Compare(id, shardRef.KeyRange.End) < 0))
 				}
 			}
 		}

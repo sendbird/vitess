@@ -18,12 +18,9 @@ package utils
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
-
-	"vitess.io/vitess/go/test/endtoend/cluster"
-
-	"vitess.io/vitess/go/test/utils"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
@@ -31,7 +28,16 @@ import (
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/test/endtoend/cluster"
 )
+
+// AssertContains ensures the given query result contains the expected results.
+func AssertContains(t testing.TB, conn *mysql.Conn, query, expected string) {
+	t.Helper()
+	qr := Exec(t, conn, query)
+	got := fmt.Sprintf("%v", qr.Rows)
+	assert.Contains(t, got, expected, "Query: %s", query)
+}
 
 // AssertMatches ensures the given query produces the expected results.
 func AssertMatches(t testing.TB, conn *mysql.Conn, query, expected string) {
@@ -42,6 +48,44 @@ func AssertMatches(t testing.TB, conn *mysql.Conn, query, expected string) {
 	if diff != "" {
 		t.Errorf("Query: %s (-want +got):\n%s\nGot:%s", query, diff, got)
 	}
+}
+
+// AssertMatchesContains ensures the given query produces the given substring.
+func AssertMatchesContains(t testing.TB, conn *mysql.Conn, query string, substrings ...string) {
+	t.Helper()
+	qr := Exec(t, conn, query)
+	got := fmt.Sprintf("%v", qr.Rows)
+	for _, substring := range substrings {
+		if !strings.Contains(got, substring) {
+			t.Errorf("Query: %s Got:\n%s\nLooking for substring:%s", query, got, substring)
+		}
+	}
+}
+
+// AssertMatchesNotContains ensures the given query's output doesn't have the given substring.
+func AssertMatchesNotContains(t testing.TB, conn *mysql.Conn, query string, substrings ...string) {
+	t.Helper()
+	qr := Exec(t, conn, query)
+	got := fmt.Sprintf("%v", qr.Rows)
+	for _, substring := range substrings {
+		if strings.Contains(got, substring) {
+			t.Errorf("Query: %s Got:\n%s\nFound substring:%s", query, got, substring)
+		}
+	}
+}
+
+// AssertMatchesAny ensures the given query produces any one of the expected results.
+func AssertMatchesAny(t testing.TB, conn *mysql.Conn, query string, expected ...string) {
+	t.Helper()
+	qr := Exec(t, conn, query)
+	got := fmt.Sprintf("%v", qr.Rows)
+	for _, e := range expected {
+		diff := cmp.Diff(e, got)
+		if diff == "" {
+			return
+		}
+	}
+	t.Errorf("Query: %s (-want +got):\n%v\nGot:%s", query, expected, got)
 }
 
 // AssertMatchesCompareMySQL executes the given query on both Vitess and MySQL and make sure
@@ -69,8 +113,9 @@ func AssertContainsError(t *testing.T, conn *mysql.Conn, query, expected string)
 func AssertMatchesNoOrder(t *testing.T, conn *mysql.Conn, query, expected string) {
 	t.Helper()
 	qr := Exec(t, conn, query)
-	actual := fmt.Sprintf("%v", qr.Rows)
-	assert.Equal(t, utils.SortString(expected), utils.SortString(actual), "for query: [%s] expected \n%s \nbut actual \n%s", query, expected, actual)
+	if err := sqltypes.RowsEqualsStr(expected, qr.Rows); err != nil {
+		t.Errorf("for query: [%s] %v", query, err)
+	}
 }
 
 // AssertIsEmpty ensures that the given query returns 0 row.
@@ -118,7 +163,7 @@ func ExecCompareMySQL(t *testing.T, vtConn, mysqlConn *mysql.Conn, query string)
 
 	mysqlQr, err := mysqlConn.ExecuteFetch(query, 1000, true)
 	require.NoError(t, err, "[MySQL Error] for query: "+query)
-	compareVitessAndMySQLResults(t, query, vtQr, mysqlQr, false)
+	compareVitessAndMySQLResults(t, query, vtConn, vtQr, mysqlQr, false)
 	return vtQr
 }
 
@@ -127,6 +172,12 @@ func ExecCompareMySQL(t *testing.T, vtConn, mysqlConn *mysql.Conn, query string)
 func ExecAllowError(t *testing.T, conn *mysql.Conn, query string) (*sqltypes.Result, error) {
 	t.Helper()
 	return conn.ExecuteFetch(query, 1000, true)
+}
+
+// ExecWithRowCount is similar to ExecAllowError with max row count provided.
+func ExecWithRowCount(t testing.TB, conn *mysql.Conn, query string, rowCount int) (*sqltypes.Result, error) {
+	t.Helper()
+	return conn.ExecuteFetch(query, rowCount, true)
 }
 
 // SkipIfBinaryIsBelowVersion skips the given test if the binary's major version is below majorVersion.
@@ -138,6 +189,16 @@ func SkipIfBinaryIsBelowVersion(t *testing.T, majorVersion int, binary string) {
 	if version < majorVersion {
 		t.Skip("Current version of ", binary, ": v", version, ", expected version >= v", majorVersion)
 	}
+}
+
+// BinaryIsAtVersion returns true if this binary is at or above the required version
+func BinaryIsAtVersion(majorVersion int, binary string) bool {
+	version, err := cluster.GetMajorVersion(binary)
+	if err != nil {
+		return false
+	}
+	return version >= majorVersion
+
 }
 
 // AssertMatchesWithTimeout asserts that the given query produces the expected result.
@@ -152,7 +213,11 @@ func AssertMatchesWithTimeout(t *testing.T, conn *mysql.Conn, query, expected st
 		case <-timeout:
 			require.Fail(t, failureMsg, diff)
 		case <-time.After(r):
-			qr := Exec(t, conn, query)
+			qr, err := ExecAllowError(t, conn, query)
+			if err != nil {
+				diff = err.Error()
+				break
+			}
 			diff = cmp.Diff(expected,
 				fmt.Sprintf("%v", qr.Rows))
 		}
@@ -161,7 +226,7 @@ func AssertMatchesWithTimeout(t *testing.T, conn *mysql.Conn, query, expected st
 }
 
 // WaitForAuthoritative waits for a table to become authoritative
-func WaitForAuthoritative(t *testing.T, cluster *cluster.LocalProcessCluster, ks, tbl string) error {
+func WaitForAuthoritative(t *testing.T, ks, tbl string, readVSchema func() (*interface{}, error)) error {
 	timeout := time.After(10 * time.Second)
 	for {
 		select {
@@ -169,7 +234,7 @@ func WaitForAuthoritative(t *testing.T, cluster *cluster.LocalProcessCluster, ks
 			return fmt.Errorf("schema tracking didn't mark table t2 as authoritative until timeout")
 		default:
 			time.Sleep(1 * time.Second)
-			res, err := cluster.VtgateProcess.ReadVSchema()
+			res, err := readVSchema()
 			require.NoError(t, err, res)
 			t2Map := getTableT2Map(res, ks, tbl)
 			authoritative, fieldPresent := t2Map["column_list_authoritative"]
@@ -185,6 +250,47 @@ func WaitForAuthoritative(t *testing.T, cluster *cluster.LocalProcessCluster, ks
 	}
 }
 
+// WaitForColumn waits for a table's column to be present
+func WaitForColumn(t *testing.T, vtgateProcess cluster.VtgateProcess, ks, tbl, col string) error {
+	timeout := time.After(10 * time.Second)
+	for {
+		select {
+		case <-timeout:
+			return fmt.Errorf("schema tracking did not find column '%s' in table '%s'", col, tbl)
+		default:
+			time.Sleep(1 * time.Second)
+			res, err := vtgateProcess.ReadVSchema()
+			require.NoError(t, err, res)
+			t2Map := getTableT2Map(res, ks, tbl)
+			authoritative, fieldPresent := t2Map["column_list_authoritative"]
+			if !fieldPresent {
+				break
+			}
+			authoritativeBool, isBool := authoritative.(bool)
+			if !isBool || !authoritativeBool {
+				break
+			}
+			colMap, exists := t2Map["columns"]
+			if !exists {
+				break
+			}
+			colList, isSlice := colMap.([]interface{})
+			if !isSlice {
+				break
+			}
+			for _, c := range colList {
+				colDef, isMap := c.(map[string]interface{})
+				if !isMap {
+					break
+				}
+				if colName, exists := colDef["name"]; exists && colName == col {
+					return nil
+				}
+			}
+		}
+	}
+}
+
 func getTableT2Map(res *interface{}, ks, tbl string) map[string]interface{} {
 	step1 := convertToMap(*res)["keyspaces"]
 	step2 := convertToMap(step1)[ks]
@@ -196,4 +302,41 @@ func getTableT2Map(res *interface{}, ks, tbl string) map[string]interface{} {
 func convertToMap(input interface{}) map[string]interface{} {
 	output := input.(map[string]interface{})
 	return output
+}
+
+func GetInitDBSQL(initDBSQL string, updatedPasswords string, oldAlterTableMode string) (string, error) {
+	// Since password update is DML we need to insert it before we disable
+	// super_read_only therefore doing the split below.
+	splitString := strings.Split(initDBSQL, "# {{custom_sql}}")
+	if len(splitString) != 2 {
+		return "", fmt.Errorf("missing `# {{custom_sql}}` in init_db.sql file")
+	}
+	var builder strings.Builder
+	builder.WriteString(splitString[0])
+	builder.WriteString(updatedPasswords)
+
+	// https://github.com/vitessio/vitess/issues/8315
+	if oldAlterTableMode != "" {
+		builder.WriteString(oldAlterTableMode)
+	}
+	builder.WriteString(splitString[1])
+
+	return builder.String(), nil
+}
+
+// TimeoutAction performs the action within the given timeout limit.
+// If the timeout is reached, the test is failed with errMsg.
+// If action returns false, the timeout loop continues, if it returns true, the function succeeds.
+func TimeoutAction(t *testing.T, timeout time.Duration, errMsg string, action func() bool) {
+	deadline := time.After(timeout)
+	ok := false
+	for !ok {
+		select {
+		case <-deadline:
+			t.Error(errMsg)
+			return
+		case <-time.After(1 * time.Second):
+			ok = action()
+		}
+	}
 }

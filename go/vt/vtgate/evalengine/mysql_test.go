@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Vitess Authors.
+Copyright 2023 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,13 +17,15 @@ limitations under the License.
 package evalengine
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/exp/slices"
 
 	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/vt/sqlparser"
@@ -49,11 +51,19 @@ var errKnownBadQuery = errors.New("this query is known to give bad results in My
 func convert(t *testing.T, query string, simplify bool) (Expr, error) {
 	stmt, err := sqlparser.Parse(query)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("failed to parse '%s': %v", query, err)
+	}
+
+	cfg := &Config{
+		Collation:    collations.CollationUtf8mb4ID,
+		Optimization: OptimizationLevelNone,
+	}
+	if simplify {
+		cfg.Optimization = OptimizationLevelSimplify
 	}
 
 	astExpr := stmt.(*sqlparser.Select).SelectExprs[0].(*sqlparser.AliasedExpr).Expr
-	converted, err := TranslateEx(astExpr, LookupDefaultCollation(collations.CollationUtf8mb4ID), simplify)
+	converted, err := Translate(astExpr, cfg)
 	if err == nil {
 		if knownBadQuery(converted) {
 			return nil, errKnownBadQuery
@@ -65,14 +75,20 @@ func convert(t *testing.T, query string, simplify bool) (Expr, error) {
 
 func testSingle(t *testing.T, query string) (EvalResult, error) {
 	converted, err := convert(t, query, true)
-	if err == nil {
-		return EnvWithBindVars(nil, collations.CollationUtf8mb4ID).Evaluate(converted)
+	if err != nil {
+		return EvalResult{}, err
 	}
-	return EvalResult{}, err
+	return NewExpressionEnv(context.Background(), nil, nil).Evaluate(converted)
 }
 
 func TestMySQLGolden(t *testing.T) {
+	const Target = 0
+
+	var testcount int
+
 	golden, _ := filepath.Glob("integration/testdata/*.json")
+	slices.Sort(golden)
+
 	for _, gld := range golden {
 		t.Run(filepath.Base(gld), func(t *testing.T) {
 			var testcases []struct {
@@ -93,7 +109,11 @@ func TestMySQLGolden(t *testing.T) {
 			var ok int
 
 			for _, tc := range testcases {
-				debug := fmt.Sprintf("\n// Debug\neval, err := testSingle(t, `%s`)\nt.Logf(\"eval=%%s err=%%v\", eval.Value(), err) // want value=%q\n", tc.Query, tc.Value)
+				testcount++
+				if Target != 0 && Target != testcount {
+					continue
+				}
+
 				eval, err := testSingle(t, tc.Query)
 				if err == errKnownBadQuery {
 					ok++
@@ -101,20 +121,20 @@ func TestMySQLGolden(t *testing.T) {
 				}
 				if err != nil {
 					if tc.Error == "" {
-						t.Errorf("query: %s\nmysql val: %s\nvitess err: %s\n%s", tc.Query, tc.Value, err.Error(), debug)
+						t.Errorf("query %d: %s\nmysql val:  %s\nvitess err: %s", testcount, tc.Query, tc.Value, err.Error())
 					} else if !strings.HasPrefix(tc.Error, err.Error()) {
-						t.Errorf("query: %s\nmysql err: %s\nvitess err: %s\n%s", tc.Query, tc.Error, err.Error(), debug)
+						t.Errorf("query %d: %s\nmysql err:  %s\nvitess err: %s", testcount, tc.Query, tc.Error, err.Error())
 					} else {
 						ok++
 					}
 					continue
 				}
 				if tc.Error != "" {
-					t.Errorf("query: %s\nmysql err: %s\nvitess val: %s\n%s", tc.Query, tc.Error, eval.Value(), debug)
+					t.Errorf("query %d: %s\nmysql err:  %s\nvitess val: %s", testcount, tc.Query, tc.Error, eval.Value())
 					continue
 				}
 				if eval.Value().String() != tc.Value {
-					t.Errorf("query: %s\nmysql val: %s\nvitess val: %s\n%s", tc.Query, tc.Value, eval.Value(), debug)
+					t.Errorf("query %d: %s\nmysql val:  %s\nvitess val: %s", testcount, tc.Query, tc.Value, eval.Value())
 					continue
 				}
 				ok++
@@ -126,7 +146,7 @@ func TestMySQLGolden(t *testing.T) {
 }
 
 func TestDebug1(t *testing.T) {
-	// Debu	g
-	eval, err := testSingle(t, `SELECT ('foo' collate utf8mb4_0900_as_cs) = 0xFF`)
-	t.Logf("eval=%s err=%v coll=%s", eval.String(), err, collations.Local().LookupByID(eval.Collation()).Name())
+	// Debug
+	eval, err := testSingle(t, `SELECT  _latin1 0xFF regexp _latin1 '[[:lower:]]' COLLATE latin1_bin`)
+	t.Logf("eval=%s err=%v coll=%s", eval.String(), err, eval.Collation().Get().Name())
 }

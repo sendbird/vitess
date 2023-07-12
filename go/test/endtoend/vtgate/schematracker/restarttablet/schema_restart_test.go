@@ -104,6 +104,13 @@ func TestMain(m *testing.M) {
 			clusterInstance.VtgateProcess = cluster.VtgateProcess{}
 			return 1
 		}
+
+		err := clusterInstance.WaitForVTGateAndVTTablets(5 * time.Minute)
+		if err != nil {
+			fmt.Println(err)
+			return 1
+		}
+
 		vtParams = mysql.ConnParams{
 			Host: clusterInstance.Hostname,
 			Port: clusterInstance.VtgateMySQLPort,
@@ -120,10 +127,13 @@ func TestVSchemaTrackerInit(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.Close()
 
-	qr := utils.Exec(t, conn, "SHOW VSCHEMA TABLES")
-	got := fmt.Sprintf("%v", qr.Rows)
-	want := `[[VARCHAR("dual")] [VARCHAR("main")] [VARCHAR("test_table")] [VARCHAR("vt_user")]]`
-	assert.Equal(t, want, got)
+	want := `[[VARCHAR("main")] [VARCHAR("test_table")] [VARCHAR("vt_user")]]`
+	utils.AssertMatchesWithTimeout(t, conn,
+		"SHOW VSCHEMA TABLES",
+		want,
+		100*time.Millisecond,
+		60*time.Second,
+		"initial table list not complete")
 }
 
 // TestVSchemaTrackerKeyspaceReInit tests that the vschema tracker
@@ -147,18 +157,20 @@ func TestVSchemaTrackerKeyspaceReInit(t *testing.T) {
 		require.NoError(t, err)
 		err = clusterInstance.WaitForTabletsToHealthyInVtgate()
 		require.NoError(t, err)
-		time.Sleep(time.Duration(signalInterval*2) * time.Second)
-		var newResults any
-		readVSchema(t, &clusterInstance.VtgateProcess, &newResults)
-		assert.Equal(t, originalResults, newResults)
-		newResults = nil
+
+		utils.TimeoutAction(t, 1*time.Minute, "timeout - could not find the updated vschema in VTGate", func() bool {
+			var newResults any
+			readVSchema(t, &clusterInstance.VtgateProcess, &newResults)
+			return assert.ObjectsAreEqual(originalResults, newResults)
+		})
 	}
 }
 
 func readVSchema(t *testing.T, vtgate *cluster.VtgateProcess, results *any) {
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 	resp, err := httpClient.Get(vtgate.VSchemaURL)
-	require.Nil(t, err)
+	require.NoError(t, err)
+	defer resp.Body.Close()
 	assert.Equal(t, 200, resp.StatusCode)
 	json.NewDecoder(resp.Body).Decode(results)
 }
